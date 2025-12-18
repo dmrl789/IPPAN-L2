@@ -1,0 +1,7 @@
+warn-on-all = true
+
+# Explicitly treat any float arithmetic as an error in this repo.
+deny = [
+    "clippy::float_arithmetic",
+    "clippy::float_cmp",
+]

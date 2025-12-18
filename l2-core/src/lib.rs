@@ -1,3 +1,11 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::float_arithmetic)]
+#![deny(clippy::float_cmp)]
+#![deny(clippy::cast_precision_loss)]
+#![deny(clippy::cast_possible_truncation)]
+#![deny(clippy::cast_possible_wrap)]
+#![deny(clippy::cast_sign_loss)]
+
 //! Core types and primitives for IPPAN L2 Hubs.
 //!
 //! This crate defines shared abstractions for all IPPAN Hubs
