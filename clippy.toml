@@ -1,0 +1,11 @@
+# Clippy configuration for IPPAN-L2.
+#
+# Notes:
+# - Lint *levels* (deny/warn/allow) are set in crate attributes (e.g. `#![deny(...)]`).
+# - This file configures lints that require additional parameters.
+
+# Disallow floating point types anywhere in the repository.
+disallowed-types = [
+  "f32",
+  "f64",
+]
