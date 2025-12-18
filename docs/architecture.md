@@ -46,6 +46,15 @@ Each Hub is logically distinct but shares a common settlement interface with COR
 - **IPPAN WORLD** – General applications and marketplaces
 - **IPPAN BRIDGE** – Cross-chain and interoperability
 
+### Multiple Hubs, one settlement contract
+
+IPPAN supports multiple Hubs (FIN, DATA, and later M2M/WORLD/BRIDGE) that all share:
+
+- A common settlement contract (traits and types in `l2-core`, e.g. `FixedAmount`, `L2Batch`,
+  `SettlementRequest`, and `L1SettlementClient`)
+- Separate state, logic, and storage per Hub (each Hub defines its own deterministic state machine)
+- The same deterministic rules for reproducibility and auditability (no floating point, no `unsafe`)
+
 ## 4. L1 / L2 Contract
 
 At a high level, the contract between CORE and Hubs is:

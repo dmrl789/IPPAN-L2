@@ -8,10 +8,11 @@ use hub_fin::{
     HUB_ID,
 };
 use l2_core::{
-    AccountId, AssetId, FixedAmount, L1SettlementClient, L2BatchId, SettlementError,
-    SettlementRequest, SettlementResult,
+    AccountId, AssetId, FixedAmount, L1EndpointConfig, L1SettlementClient, L2BatchId,
+    SettlementError, SettlementRequest, SettlementResult,
 };
 use std::collections::BTreeMap;
+use std::fs;
 
 /// Simple dummy IPPAN FIN Hub node.
 ///
@@ -23,6 +24,10 @@ struct Args {
     /// Batch identifier to use for the demo batch.
     #[arg(long, default_value = "demo-batch-001")]
     batch_id: String,
+
+    /// Path to a TOML config file describing the L1 endpoint (optional).
+    #[arg(long)]
+    config: Option<String>,
 
     /// Asset identifier to register and use for the transfer.
     #[arg(long, default_value = "asset-demo-eurx")]
@@ -53,6 +58,16 @@ struct Args {
     amount: i128,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct FinNodeConfig {
+    pub l1: L1EndpointConfig,
+}
+
+fn load_config(path: &str) -> Result<FinNodeConfig, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
+    toml::from_str::<FinNodeConfig>(&raw).map_err(|e| format!("failed to parse config {path}: {e}"))
+}
+
 /// Dummy L1 client that simulates successful settlement.
 struct DummyL1Client;
 
@@ -71,8 +86,68 @@ impl L1SettlementClient for DummyL1Client {
     }
 }
 
+/// HTTP-based L1 client that sends settlement requests to IPPAN CORE.
+///
+/// This is a simple, blocking implementation for early integration.
+struct HttpL1Client {
+    config: L1EndpointConfig,
+}
+
+impl HttpL1Client {
+    pub fn new(config: L1EndpointConfig) -> Self {
+        Self { config }
+    }
+
+    fn endpoint_url(&self) -> String {
+        // For now we assume a generic settlement path.
+        // Example: http://host:port/l2/settle
+        format!("{}/l2/settle", self.config.base_url.trim_end_matches('/'))
+    }
+}
+
+impl L1SettlementClient for HttpL1Client {
+    fn submit_settlement(
+        &self,
+        request: SettlementRequest,
+    ) -> Result<SettlementResult, SettlementError> {
+        // Serialize request to JSON.
+        let url = self.endpoint_url();
+        let client = reqwest::blocking::Client::new();
+
+        let mut req_builder = client.post(url).json(&request);
+
+        if let Some(ref api_key) = self.config.api_key {
+            req_builder = req_builder.header("Authorization", api_key);
+        }
+
+        let resp = req_builder
+            .send()
+            .map_err(|e| SettlementError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(SettlementError::Rejected(format!(
+                "HTTP status {}",
+                resp.status()
+            )));
+        }
+
+        let result: SettlementResult = resp
+            .json()
+            .map_err(|e| SettlementError::Internal(e.to_string()))?;
+
+        Ok(result)
+    }
+}
+
 fn main() {
     let args = Args::parse();
+
+    // NOTE: HttpL1Client is implemented but not yet wired in.
+    // This will be enabled once the L1 /l2/settle endpoint is stable.
+    let _http_client = args.config.as_ref().map(|path| {
+        let cfg = load_config(path).expect("failed to load config");
+        HttpL1Client::new(cfg.l1)
+    });
 
     let client = DummyL1Client;
     let asset = AssetId::new(args.asset_id.clone());

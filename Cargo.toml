@@ -1,3 +1,3 @@
 [workspace]
-members = [ "fin-node", "hub-fin","l2-core"]
+members = ["l2-core", "hub-fin", "fin-node", "hub-data"]
 resolver = "2"

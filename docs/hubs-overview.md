@@ -19,6 +19,14 @@ Key properties:
 - Hooks for compliance, KYC/AML and reporting
 - Support for fungible token standards (e.g., IPP20) and financial NFTs
 
+Implementation status (this repo):
+
+- `hub-fin`: reference engine + deterministic state machine, using `FixedAmount` and the shared
+  `L1SettlementClient` settlement interface.
+- `fin-node`: demo node binary that builds a batch and submits via a dummy client today.
+- State is stored in an in-memory store today; a persistent store can be added later without
+  changing the L1 settlement contract.
+
 ## IPPAN DATA – Data & AI Hub
 
 The **IPPAN DATA** Hub focuses on:
@@ -34,6 +42,12 @@ It leverages IPPAN’s deterministic timestamps for:
 - Data lineage
 - Auditability and regulatory compliance
 - Fair revenue-sharing models for data contributors and model authors
+
+Implementation status (this repo):
+
+- `hub-data`: reference engine for content attestations (hash + metadata), using `FixedAmount` and
+  the shared `L1SettlementClient` settlement interface.
+- State is stored in an in-memory store today; a persistent store can be added later.
 
 ## IPPAN M2M – Machine-to-Machine Hub
 
