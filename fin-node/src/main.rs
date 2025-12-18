@@ -3,7 +3,7 @@
 #![deny(clippy::float_cmp)]
 
 use clap::Parser;
-use hub_fin::{FinHubEngine, FinOperation, FinTransaction, HUB_ID};
+use hub_fin::{FinHubEngine, FinOperation, FinTransaction, InMemoryFinStateStore, HUB_ID};
 use l2_core::{
     AccountId, AssetId, FixedAmount, L1SettlementClient, L2BatchId, SettlementError,
     SettlementRequest, SettlementResult,
@@ -43,7 +43,10 @@ fn main() {
     let args = Args::parse();
 
     let client = DummyL1Client;
-    let engine = FinHubEngine::new(client);
+    let store = InMemoryFinStateStore::new();
+    // TODO: expose read-only state snapshots from FinHubEngine so the node
+    // can print post-batch balances for debugging.
+    let engine = FinHubEngine::new(client, store);
 
     let asset = AssetId::new("asset-demo-eurx");
     let from = AccountId::new("acc-alice");
@@ -57,6 +60,14 @@ fn main() {
                 symbol: "EURX".to_string(),
                 name: "Demo EUR Stablecoin".to_string(),
                 decimals: 6,
+            },
+        },
+        FinTransaction {
+            tx_id: "tx-mint".to_string(),
+            op: FinOperation::Mint {
+                asset_id: asset.clone(),
+                to: from.clone(),
+                amount: FixedAmount::from_units(20, 6),
             },
         },
         FinTransaction {
