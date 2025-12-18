@@ -1,7 +1,11 @@
-warn-on-all = true
+# Clippy configuration for IPPAN-L2.
+#
+# Notes:
+# - Lint *levels* (deny/warn/allow) are set in crate attributes (e.g. `#![deny(...)]`).
+# - This file configures lints that require additional parameters.
 
-# Explicitly treat any float arithmetic as an error in this repo.
-deny = [
-    "clippy::float_arithmetic",
-    "clippy::float_cmp",
+# Disallow floating point types anywhere in the repository.
+disallowed-types = [
+  "f32",
+  "f64",
 ]
