@@ -159,6 +159,15 @@ pub struct SettlementResult {
     pub finalised: bool,
 }
 
+/// Configuration for talking to an IPPAN CORE node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L1EndpointConfig {
+    /// Base URL for the L1 settlement endpoint, e.g. "http://127.0.0.1:8080".
+    pub base_url: String,
+    /// Optional API key or auth token if required by the endpoint.
+    pub api_key: Option<String>,
+}
+
 /// Abstract client interface that an L2 Hub uses to talk to IPPAN CORE.
 ///
 /// In production this will be backed by RPC calls to an L1 node;
