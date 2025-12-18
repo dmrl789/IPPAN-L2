@@ -13,8 +13,10 @@
 //! (FIN, DATA, M2M, WORLD, BRIDGE) and their interaction with
 //! the IPPAN CORE settlement layer.
 
+use serde::{Deserialize, Serialize};
+
 /// Logical identifier for an IPPAN L2 Hub.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum L2HubId {
     /// IPPAN FIN – Finance / RWA / stablecoins.
     Fin,
@@ -29,11 +31,11 @@ pub enum L2HubId {
 }
 
 /// Identifier for an L2 batch (opaque for now, typically a hash or UUID).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct L2BatchId(pub String);
 
 /// Minimal representation of a batch of L2 transactions to be settled on CORE.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2Batch {
     /// The hub this batch belongs to.
     pub hub: L2HubId,
@@ -46,7 +48,7 @@ pub struct L2Batch {
 }
 
 /// Minimal proof structure to be verified by IPPAN CORE.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2Proof {
     /// The hub this proof refers to.
     pub hub: L2HubId,
@@ -57,11 +59,15 @@ pub struct L2Proof {
 }
 
 /// Opaque identifier for an account at L2 (hub-specific semantics).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct AccountId(pub String);
 
 /// Opaque identifier for a fungible or non-fungible asset at L2.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct AssetId(pub String);
 
 /// Simple helper constructors for IDs.
@@ -81,7 +87,9 @@ impl AssetId {
 ///
 /// This is used for fees, token amounts and other quantitative values
 /// where deterministic behaviour across architectures is required.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct FixedAmount {
     /// Underlying integer representation (scaled by SCALE).
     inner: i128,
@@ -127,7 +135,7 @@ impl FixedAmount {
 }
 
 /// Request from an L2 Hub to settle a batch on IPPAN CORE.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettlementRequest {
     pub hub: L2HubId,
     pub batch: L2Batch,
@@ -136,7 +144,7 @@ pub struct SettlementRequest {
 }
 
 /// Result of L1 settlement for an L2 batch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettlementResult {
     pub hub: L2HubId,
     pub batch_id: L2BatchId,

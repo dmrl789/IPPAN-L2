@@ -11,6 +11,8 @@
 //! For now we define minimal traits and types and rely on l2-core
 //! for the shared settlement abstractions.
 
+use serde::{Deserialize, Serialize};
+
 use l2_core::{
     AccountId, AssetId, FixedAmount, L1SettlementClient, L2Batch, L2BatchId, L2HubId,
     SettlementError, SettlementRequest, SettlementResult,
@@ -23,7 +25,7 @@ pub const HUB_ID: L2HubId = L2HubId::Fin;
 ///
 /// This enum is intentionally minimal and will be expanded with
 /// richer semantics as the tokenisation layer matures.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FinOperation {
     /// Register a new fungible asset (e.g., tokenised fund, bond, stablecoin).
     RegisterFungibleAsset {
@@ -57,7 +59,7 @@ pub enum FinOperation {
 }
 
 /// Represents a FIN transaction as it will be included in a batch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinTransaction {
     /// Opaque identifier for the transaction, unique within the hub context.
     pub tx_id: String,
@@ -153,5 +155,21 @@ mod tests {
         assert_eq!(result.hub, HUB_ID);
         assert_eq!(result.batch_id.0, batch_id.0);
         assert!(result.finalised);
+    }
+
+    #[test]
+    fn fin_transaction_serializes_to_json() {
+        let asset = AssetId::new("asset-eur-stable");
+        let tx = FinTransaction {
+            tx_id: "tx-serialize".to_string(),
+            op: FinOperation::Mint {
+                asset_id: asset,
+                to: AccountId::new("acc-alice"),
+                amount: FixedAmount::from_units(5, 6),
+            },
+        };
+
+        let json = serde_json::to_string(&tx).expect("serialize");
+        assert!(json.contains("tx-serialize"));
     }
 }
