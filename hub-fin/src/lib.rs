@@ -66,6 +66,10 @@ pub trait FinStateStore {
 pub enum FinStateError {
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("asset already exists: {0}")]
+    AssetAlreadyExists(String),
+    #[error("invalid decimals: {0}")]
+    InvalidDecimals(u8),
     #[error("asset not registered: {0}")]
     UnknownAsset(String),
     #[error("insufficient balance for account: {0}")]
@@ -87,6 +91,12 @@ impl InMemoryFinStateStore {
             state: std::sync::Mutex::new(FinState::default()),
         }
     }
+
+    pub fn with_state(state: FinState) -> Self {
+        Self {
+            state: std::sync::Mutex::new(state),
+        }
+    }
 }
 
 impl FinStateStore for InMemoryFinStateStore {
@@ -95,9 +105,10 @@ impl FinStateStore for InMemoryFinStateStore {
     }
 
     fn save_state(&self, state: &FinState) -> Result<(), FinStateError> {
-        let mut guard = self.state.lock().map_err(|e| {
-            FinStateError::Storage(format!("mutex poisoned: {e}"))
-        })?;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|e| FinStateError::Storage(format!("mutex poisoned: {e}")))?;
         *guard = state.clone();
         Ok(())
     }
@@ -151,13 +162,11 @@ impl FinState {
                 name,
                 decimals,
             } => {
-                // If asset already exists, we can decide to ignore or error.
-                // For now, treat re-registration as an error.
                 if self.assets.contains_key(asset_id) {
-                    return Err(FinStateError::Storage(format!(
-                        "asset already registered: {}",
-                        asset_id.0
-                    )));
+                    return Err(FinStateError::AssetAlreadyExists(asset_id.0.clone()));
+                }
+                if *decimals > 18 {
+                    return Err(FinStateError::InvalidDecimals(*decimals));
                 }
 
                 self.assets.insert(
@@ -196,6 +205,9 @@ impl FinState {
                 from,
                 amount,
             } => {
+                if !self.assets.contains_key(asset_id) {
+                    return Err(FinStateError::UnknownAsset(asset_id.0.clone()));
+                }
                 let account = self
                     .accounts
                     .get_mut(from)
@@ -205,6 +217,9 @@ impl FinState {
                     .get_mut(asset_id)
                     .ok_or_else(|| FinStateError::InsufficientBalance(from.0.clone()))?;
 
+                if balance.into_scaled() < amount.into_scaled() {
+                    return Err(FinStateError::InsufficientBalance(from.0.clone()));
+                }
                 let new_balance = balance
                     .checked_sub(*amount)
                     .ok_or_else(|| FinStateError::InsufficientBalance(from.0.clone()))?;
@@ -217,6 +232,9 @@ impl FinState {
                 to,
                 amount,
             } => {
+                if !self.assets.contains_key(asset_id) {
+                    return Err(FinStateError::UnknownAsset(asset_id.0.clone()));
+                }
                 // Debit sender.
                 {
                     let from_account = self
@@ -228,6 +246,9 @@ impl FinState {
                         .get_mut(asset_id)
                         .ok_or_else(|| FinStateError::InsufficientBalance(from.0.clone()))?;
 
+                    if from_balance.into_scaled() < amount.into_scaled() {
+                        return Err(FinStateError::InsufficientBalance(from.0.clone()));
+                    }
                     let new_balance = from_balance
                         .checked_sub(*amount)
                         .ok_or_else(|| FinStateError::InsufficientBalance(from.0.clone()))?;
@@ -240,9 +261,9 @@ impl FinState {
                     .balances
                     .entry(asset_id.clone())
                     .or_insert_with(|| FixedAmount::from_scaled(0));
-                *to_balance = to_balance.checked_add(*amount).ok_or_else(|| {
-                    FinStateError::Storage("overflow in transfer".to_string())
-                })?;
+                *to_balance = to_balance
+                    .checked_add(*amount)
+                    .ok_or_else(|| FinStateError::Storage("overflow in transfer".to_string()))?;
                 Ok(())
             }
         }
@@ -250,6 +271,10 @@ impl FinState {
 }
 
 /// Represents a FIN transaction as it will be included in a batch.
+///
+/// Note: This is intentionally compatible with the shared envelope pattern
+/// in `l2-core`:
+/// `L2TransactionEnvelope<FinOperation> = { hub, tx_id, payload }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinTransaction {
     /// Opaque identifier for the transaction, unique within the hub context.
@@ -269,6 +294,11 @@ impl<C: L1SettlementClient, S: FinStateStore> FinHubEngine<C, S> {
     /// Create a new engine with the given settlement client and state store.
     pub fn new(client: C, store: S) -> Self {
         Self { client, store }
+    }
+
+    /// Return a deterministic, read-only snapshot of the current FIN state.
+    pub fn snapshot_state(&self) -> FinState {
+        self.store.load_state()
     }
 
     /// Apply a list of FIN transactions to the state and then submit a batch
@@ -371,6 +401,22 @@ mod tests {
         assert_eq!(result.hub, HUB_ID);
         assert_eq!(result.batch_id.0, batch_id.0);
         assert!(result.finalised);
+
+        let snapshot = engine.snapshot_state();
+        let from_balance = snapshot
+            .accounts
+            .get(&AccountId::new("acc-alice"))
+            .and_then(|acc| acc.balances.get(&AssetId::new("asset-eur-stable")))
+            .unwrap()
+            .into_scaled();
+        let to_balance = snapshot
+            .accounts
+            .get(&AccountId::new("acc-bob"))
+            .and_then(|acc| acc.balances.get(&AssetId::new("asset-eur-stable")))
+            .unwrap()
+            .into_scaled();
+        assert_eq!(from_balance, 10_000_000); // 10.000000
+        assert_eq!(to_balance, 10_000_000); // 10.000000
     }
 
     #[test]
@@ -427,6 +473,134 @@ mod tests {
 
         assert_eq!(alice_balance, 70_000_000); // 70.000000
         assert_eq!(bob_balance, 30_000_000); // 30.000000
+    }
+
+    #[test]
+    fn fin_state_rejects_duplicate_asset_registration() {
+        let mut state = FinState::default();
+
+        let asset = AssetId::new("asset-eurx");
+
+        state
+            .apply_operation(&FinOperation::RegisterFungibleAsset {
+                asset_id: asset.clone(),
+                symbol: "EURX".to_string(),
+                name: "Euro Stable".to_string(),
+                decimals: 6,
+            })
+            .unwrap();
+
+        let err = state
+            .apply_operation(&FinOperation::RegisterFungibleAsset {
+                asset_id: asset,
+                symbol: "EURX".to_string(),
+                name: "Euro Stable".to_string(),
+                decimals: 6,
+            })
+            .unwrap_err();
+
+        match err {
+            FinStateError::AssetAlreadyExists(a) => assert_eq!(a, "asset-eurx"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fin_state_rejects_mint_for_unregistered_asset() {
+        let mut state = FinState::default();
+
+        let asset = AssetId::new("asset-missing");
+        let alice = AccountId::new("acc-alice");
+        let err = state
+            .apply_operation(&FinOperation::Mint {
+                asset_id: asset,
+                to: alice,
+                amount: FixedAmount::from_units(1, 6),
+            })
+            .unwrap_err();
+
+        match err {
+            FinStateError::UnknownAsset(a) => assert_eq!(a, "asset-missing"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fin_state_rejects_burn_more_than_balance() {
+        let mut state = FinState::default();
+
+        let asset = AssetId::new("asset-eurx");
+        let alice = AccountId::new("acc-alice");
+
+        state
+            .apply_operation(&FinOperation::RegisterFungibleAsset {
+                asset_id: asset.clone(),
+                symbol: "EURX".to_string(),
+                name: "Euro Stable".to_string(),
+                decimals: 6,
+            })
+            .unwrap();
+
+        state
+            .apply_operation(&FinOperation::Mint {
+                asset_id: asset.clone(),
+                to: alice.clone(),
+                amount: FixedAmount::from_units(1, 6),
+            })
+            .unwrap();
+
+        let err = state
+            .apply_operation(&FinOperation::Burn {
+                asset_id: asset,
+                from: alice,
+                amount: FixedAmount::from_units(2, 6),
+            })
+            .unwrap_err();
+
+        match err {
+            FinStateError::InsufficientBalance(acc) => assert_eq!(acc, "acc-alice"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fin_state_rejects_transfer_more_than_balance() {
+        let mut state = FinState::default();
+
+        let asset = AssetId::new("asset-eurx");
+        let alice = AccountId::new("acc-alice");
+        let bob = AccountId::new("acc-bob");
+
+        state
+            .apply_operation(&FinOperation::RegisterFungibleAsset {
+                asset_id: asset.clone(),
+                symbol: "EURX".to_string(),
+                name: "Euro Stable".to_string(),
+                decimals: 6,
+            })
+            .unwrap();
+
+        state
+            .apply_operation(&FinOperation::Mint {
+                asset_id: asset.clone(),
+                to: alice.clone(),
+                amount: FixedAmount::from_units(1, 6),
+            })
+            .unwrap();
+
+        let err = state
+            .apply_operation(&FinOperation::Transfer {
+                asset_id: asset,
+                from: alice,
+                to: bob,
+                amount: FixedAmount::from_units(2, 6),
+            })
+            .unwrap_err();
+
+        match err {
+            FinStateError::InsufficientBalance(acc) => assert_eq!(acc, "acc-alice"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
