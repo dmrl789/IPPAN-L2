@@ -101,10 +101,7 @@ impl HttpL1Client {
     fn endpoint_url(&self) -> String {
         // For now we assume a generic settlement path.
         // Example: http://host:port/l2/settle
-        format!(
-            "{}/l2/settle",
-            self.config.base_url.trim_end_matches('/')
-        )
+        format!("{}/l2/settle", self.config.base_url.trim_end_matches('/'))
     }
 }
 

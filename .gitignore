@@ -1,5 +1,4 @@
 /target/
 **/target/
 
-# Workspace is currently library-only
-Cargo.lock
+# Cargo.lock is committed for reproducible builds (workspace includes binaries).
