@@ -15,6 +15,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Generic transaction envelope shared by all IPPAN L2 hubs.
+///
+/// This structure provides a deterministic wrapper around a hub identifier,
+/// a transaction id, and the hub-specific payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2TransactionEnvelope<T> {
+    pub hub: L2HubId,
+    pub tx_id: String,
+    pub payload: T,
+}
+
 /// Logical identifier for an IPPAN L2 Hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum L2HubId {
@@ -59,15 +70,11 @@ pub struct L2Proof {
 }
 
 /// Opaque identifier for an account at L2 (hub-specific semantics).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AccountId(pub String);
 
 /// Opaque identifier for a fungible or non-fungible asset at L2.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AssetId(pub String);
 
 /// Simple helper constructors for IDs.
@@ -87,9 +94,7 @@ impl AssetId {
 ///
 /// This is used for fees, token amounts and other quantitative values
 /// where deterministic behaviour across architectures is required.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FixedAmount {
     /// Underlying integer representation (scaled by SCALE).
     inner: i128,

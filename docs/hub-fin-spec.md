@@ -23,6 +23,8 @@ Implemented in `hub-fin` and `l2-core`:
   - `Burn`
   - `Transfer`
 - `FinTransaction` – wraps a `tx_id` and a `FinOperation`.
+  - This matches the shared envelope pattern in `l2-core`:
+    `L2TransactionEnvelope<FinOperation> = { hub, tx_id, payload }`.
 
 ## 2. State Model
 
