@@ -56,6 +56,27 @@ pub struct L2Proof {
     pub state_root: String,
 }
 
+/// Opaque identifier for an account at L2 (hub-specific semantics).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccountId(pub String);
+
+/// Opaque identifier for a fungible or non-fungible asset at L2.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AssetId(pub String);
+
+/// Simple helper constructors for IDs.
+impl AccountId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl AssetId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
 /// Fixed-point amount type for L2, scaled by 1_000_000 (6 decimal places).
 ///
 /// This is used for fees, token amounts and other quantitative values
@@ -187,5 +208,13 @@ mod tests {
         let b = FixedAmount::from_units(2, 6); // 2.000000
         let sum = a.checked_add(b).expect("overflow");
         assert_eq!(sum.into_scaled(), 3_000_000);
+    }
+
+    #[test]
+    fn account_and_asset_ids_are_opaque() {
+        let acc = AccountId::new("acc-001");
+        let asset = AssetId::new("asset-xyz");
+        assert_eq!(acc.0, "acc-001");
+        assert_eq!(asset.0, "asset-xyz");
     }
 }
