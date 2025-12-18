@@ -11,21 +11,60 @@
 //! For now we define minimal traits and types and rely on l2-core
 //! for the shared settlement abstractions.
 
+use serde::{Deserialize, Serialize};
+
 use l2_core::{
-    FixedAmount, L1SettlementClient, L2Batch, L2BatchId, L2HubId, SettlementError,
-    SettlementRequest, SettlementResult,
+    AccountId, AssetId, FixedAmount, L1SettlementClient, L2Batch, L2BatchId, L2HubId,
+    SettlementError, SettlementRequest, SettlementResult,
 };
 
 /// Logical identifier used for IPPAN FIN batches.
 pub const HUB_ID: L2HubId = L2HubId::Fin;
 
-/// Represents a high-level financial transaction in the FIN Hub.
-/// This is a placeholder for now and will be expanded with
-/// token operations, RWA actions, etc.
-#[derive(Debug, Clone)]
+/// High-level financial operation supported by the FIN Hub.
+///
+/// This enum is intentionally minimal and will be expanded with
+/// richer semantics as the tokenisation layer matures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FinOperation {
+    /// Register a new fungible asset (e.g., tokenised fund, bond, stablecoin).
+    RegisterFungibleAsset {
+        asset_id: AssetId,
+        symbol: String,
+        name: String,
+        decimals: u8,
+    },
+
+    /// Mint new units of a fungible asset to a target account.
+    Mint {
+        asset_id: AssetId,
+        to: AccountId,
+        amount: FixedAmount,
+    },
+
+    /// Burn units of a fungible asset from a target account.
+    Burn {
+        asset_id: AssetId,
+        from: AccountId,
+        amount: FixedAmount,
+    },
+
+    /// Transfer units of a fungible asset between two accounts.
+    Transfer {
+        asset_id: AssetId,
+        from: AccountId,
+        to: AccountId,
+        amount: FixedAmount,
+    },
+}
+
+/// Represents a FIN transaction as it will be included in a batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinTransaction {
-    /// Opaque transaction payload (to be defined).
-    pub payload: Vec<u8>,
+    /// Opaque identifier for the transaction, unique within the hub context.
+    pub tx_id: String,
+    /// The operation to be executed.
+    pub op: FinOperation,
 }
 
 /// Engine responsible for building L2 batches from FIN transactions
@@ -83,12 +122,29 @@ mod tests {
     fn fin_hub_engine_submits_batch() {
         let client = DummyClient;
         let engine = FinHubEngine::new(client);
+
+        let asset = AssetId::new("asset-eur-stable");
+        let from = AccountId::new("acc-alice");
+        let to = AccountId::new("acc-bob");
+
         let txs = vec![
             FinTransaction {
-                payload: vec![1, 2, 3],
+                tx_id: "tx-1".to_string(),
+                op: FinOperation::RegisterFungibleAsset {
+                    asset_id: asset.clone(),
+                    symbol: "EURX".to_string(),
+                    name: "Example Euro Stablecoin".to_string(),
+                    decimals: 6,
+                },
             },
             FinTransaction {
-                payload: vec![4, 5, 6],
+                tx_id: "tx-2".to_string(),
+                op: FinOperation::Transfer {
+                    asset_id: asset.clone(),
+                    from,
+                    to,
+                    amount: FixedAmount::from_units(10, 6), // 10.000000
+                },
             },
         ];
 
@@ -99,5 +155,21 @@ mod tests {
         assert_eq!(result.hub, HUB_ID);
         assert_eq!(result.batch_id.0, batch_id.0);
         assert!(result.finalised);
+    }
+
+    #[test]
+    fn fin_transaction_serializes_to_json() {
+        let asset = AssetId::new("asset-eur-stable");
+        let tx = FinTransaction {
+            tx_id: "tx-serialize".to_string(),
+            op: FinOperation::Mint {
+                asset_id: asset,
+                to: AccountId::new("acc-alice"),
+                amount: FixedAmount::from_units(5, 6),
+            },
+        };
+
+        let json = serde_json::to_string(&tx).expect("serialize");
+        assert!(json.contains("tx-serialize"));
     }
 }

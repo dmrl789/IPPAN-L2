@@ -1,13 +1,12 @@
 [package]
-name = "hub-fin"
+name = "fin-node"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-path = "src/lib.rs"
-
 [dependencies]
+hub-fin = { path = "../hub-fin" }
 l2-core = { path = "../l2-core" }
-thiserror = "1"
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "1"
