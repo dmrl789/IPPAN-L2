@@ -1,3 +1,9 @@
 [workspace]
-members = ["l2-core", "hub-fin", "fin-node", "hub-data"]
+members = [
+  "l2-core",
+  "hub-fin",
+  "fin-node",
+  "hub-data",
+  "integrations/eth-oracle/daemon",
+]
 resolver = "2"
