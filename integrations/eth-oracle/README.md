@@ -34,10 +34,31 @@ Expected JSON shape (subset):
 
 Mapping to oracle subjects:
 
-- **subject_id**: `blake3(address)` (32 bytes)
+- **label**: a human-readable identifier such as `@alice.ipn` (if available) or a validator public key / address string.
+- **subject_id**: `blake3(label)` (32 bytes)
 - **score**: `voting_power * security.score_scale` (clamped to `u64::MAX`)
 
 Returned scores are **sorted by `subject_id`** for deterministic behaviour.
+
+### Example subject mapping
+
+Internally, each subject is represented by:
+
+- `label`: a human-readable identifier such as `@alice.ipn` or a validator public key.
+- `subject_id`: `blake3(label)` truncated to 32 bytes, exposed on-chain as `bytes32`.
+- `score`: a scaled integer (e.g. uptime ratio × 1_000_000).
+
+Example (from `Dump` CLI):
+
+```text
+subject_id=0xa3f7... label=@alice.ipn eth_address=<none> score=987654
+```
+
+On Ethereum, the dApp can query:
+
+```solidity
+uint256 score = oracle.getScore(0xa3f7...);
+```
 
 ## Quick start
 
@@ -82,7 +103,14 @@ export ETH_RPC_URL=...
 export ETH_PRIVATE_KEY=...
 
 cargo run -p ippan_eth_oracle_daemon -- \
-  --config integrations/eth-oracle/configs/devnet_sepolia.toml
+  watch --config integrations/eth-oracle/configs/devnet_sepolia.toml
+```
+
+To inspect the subject mapping and scores without pushing to Ethereum:
+
+```bash
+cargo run -p ippan_eth_oracle_daemon -- \
+  dump --config integrations/eth-oracle/configs/devnet_sepolia.toml
 ```
 
 If `oracle_contract_address` is still zero, the daemon will run but skip Ethereum writes (so you can validate the loop/logging first).

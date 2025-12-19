@@ -73,6 +73,9 @@ struct RawValidatorsResult {
 struct RawValidator {
     /// Validator identifier (Tendermint "address", hex-like string).
     address: String,
+    /// Optional human handle / moniker (if an IPPAN node exposes it).
+    #[serde(default)]
+    handle: Option<String>,
     /// Voting power (integer-like string).
     voting_power: String,
 }
@@ -87,6 +90,16 @@ fn parse_validators_response(body: &str, score_scale: u64) -> Result<Vec<Subject
             continue;
         }
 
+        // Prefer a human handle if present; otherwise fall back to a stable textual ID.
+        // (Today the CometBFT-style `/validators` endpoint always includes `address`.)
+        let label = v
+            .handle
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| addr.to_string());
+
         let voting_power: u64 = match v.voting_power.trim().parse() {
             Ok(v) => v,
             Err(_) => continue,
@@ -95,9 +108,16 @@ fn parse_validators_response(body: &str, score_scale: u64) -> Result<Vec<Subject
         // Scale deterministically (avoid overflow).
         let scaled = (u128::from(voting_power) * u128::from(score_scale)).min(u128::from(u64::MAX));
 
+        // Subject IDs are derived deterministically from a stable human-readable label.
+        let hash = blake3::hash(label.as_bytes());
+        let mut subject_id = [0u8; 32];
+        subject_id.copy_from_slice(hash.as_bytes());
+
         out.push(SubjectScore {
-            subject_id: *blake3::hash(addr.as_bytes()).as_bytes(),
+            subject_id,
             score: scaled as u64,
+            label,
+            eth_address: None,
         });
     }
 
@@ -128,13 +148,20 @@ mod tests {
         let mut scores = parse_validators_response(json, 1_000_000).unwrap();
         scores.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
 
+        let expected_label_a = "AABBCC".to_string();
+        let expected_label_b = "BEEF01".to_string();
+
         let expected_a = SubjectScore {
-            subject_id: *blake3::hash(b"AABBCC").as_bytes(),
+            subject_id: *blake3::hash(expected_label_a.as_bytes()).as_bytes(),
             score: 2_000_000,
+            label: expected_label_a,
+            eth_address: None,
         };
         let expected_b = SubjectScore {
-            subject_id: *blake3::hash(b"BEEF01").as_bytes(),
+            subject_id: *blake3::hash(expected_label_b.as_bytes()).as_bytes(),
             score: 10_000_000,
+            label: expected_label_b,
+            eth_address: None,
         };
 
         assert_eq!(scores, vec![expected_a, expected_b]);
