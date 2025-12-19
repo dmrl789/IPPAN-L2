@@ -6,15 +6,7 @@ use std::sync::Arc;
 
 abigen!(
     IppanAiOracle,
-    r#"[
-      {"inputs":[{"internalType":"address","name":"_updater","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},
-      {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"subject","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"score","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"ScoreUpdated","type":"event"},
-      {"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint256","name":"count","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"}],"name":"BatchScoreUpdated","type":"event"},
-      {"inputs":[{"internalType":"bytes32","name":"subject","type":"bytes32"}],"name":"getScore","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-      {"inputs":[],"name":"updater","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
-      {"inputs":[{"internalType":"bytes32","name":"subject","type":"bytes32"},{"internalType":"uint256","name":"score","type":"uint256"}],"name":"updateScore","outputs":[],"stateMutability":"nonpayable","type":"function"},
-      {"inputs":[{"internalType":"bytes32[]","name":"subjects","type":"bytes32[]"},{"internalType":"uint256[]","name":"newScores","type":"uint256[]"}],"name":"updateScores","outputs":[],"stateMutability":"nonpayable","type":"function"}
-    ]"#
+    "../contracts/out/IppanAiOracle.sol/IppanAiOracle.json"
 );
 
 type SignerClient = SignerMiddleware<Provider<Http>, LocalWallet>;

@@ -11,6 +11,18 @@ pub fn select_changed_scores(
         .collect()
 }
 
+pub fn diff_scores(
+    last_sent: &HashMap<[u8; 32], u64>,
+    latest: Vec<SubjectScore>,
+    max_updates_per_round: usize,
+) -> Vec<SubjectScore> {
+    let mut changed = select_changed_scores(last_sent, latest);
+    if changed.len() > max_updates_per_round {
+        changed.truncate(max_updates_per_round);
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

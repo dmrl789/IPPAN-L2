@@ -7,14 +7,14 @@ mod model;
 use anyhow::Result;
 use clap::Parser;
 use config::AppConfig;
-use diff::select_changed_scores;
+use diff::diff_scores;
 use eth_oracle::EthOracleClient;
 use ippan_client::IppanClient;
 use ethers::types::Address;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -75,14 +75,20 @@ async fn main() -> Result<()> {
             }
         };
 
-        let mut changed = select_changed_scores(&last_sent, scores);
+        info!(count = scores.len(), "fetched IPPAN scores");
+        debug!(
+            sample = ?scores
+                .iter()
+                .take(10)
+                .map(|s| (hex::encode(s.subject_id), s.score))
+                .collect::<Vec<_>>(),
+            "ippan score sample"
+        );
+
+        let changed = diff_scores(&last_sent, scores, cfg.security.max_updates_per_round);
         if changed.is_empty() {
             sleep(poll).await;
             continue;
-        }
-
-        if changed.len() > cfg.security.max_updates_per_round {
-            changed.truncate(cfg.security.max_updates_per_round);
         }
 
         if let Some(eth) = &eth {
