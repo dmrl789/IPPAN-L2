@@ -1,13 +1,13 @@
 [ippan]
-rpc_url = "http://127.0.0.1:8080"   # placeholder DevNet RPC for IPPAN L1
-poll_interval_ms = 10000           # 10 seconds
-subject_type = "validator"         # or "handle"
+rpc_url = "env:IPPAN_RPC_URL"
+poll_interval_ms = 10000
+subject_type = "validator"
 
 [ethereum]
-rpc_url = "env:ETH_RPC_URL"        # allow override via env
-chain_id = 11155111                # Sepolia
-oracle_contract_address = "0x0000000000000000000000000000000000000000" # to be updated after deploy
+rpc_url = "env:ETH_RPC_URL"
+chain_id = 11155111
+oracle_contract_address = "0x0000000000000000000000000000000000000000"
 
 [security]
-score_scale = 1000000              # fixed-point scale for scores if needed
+score_scale = 1000000
 max_updates_per_round = 100

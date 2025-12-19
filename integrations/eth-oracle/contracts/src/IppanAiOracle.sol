@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/// @title IppanAiOracle
+/// @notice Stores deterministic scores for IPPAN-related subjects (validators, handles, datasets, etc.).
 contract IppanAiOracle {
     address public updater;
 
@@ -10,12 +12,12 @@ contract IppanAiOracle {
     event BatchScoreUpdated(uint256 count, uint256 timestamp);
 
     modifier onlyUpdater() {
-        require(msg.sender == updater, "not updater");
+        require(msg.sender == updater, "IppanAiOracle: not updater");
         _;
     }
 
     constructor(address _updater) {
-        require(_updater != address(0), "invalid updater");
+        require(_updater != address(0), "IppanAiOracle: updater is zero address");
         updater = _updater;
     }
 
@@ -25,14 +27,14 @@ contract IppanAiOracle {
     }
 
     function updateScores(bytes32[] calldata subjects, uint256[] calldata newScores) external onlyUpdater {
-        require(subjects.length == newScores.length, "length mismatch");
+        uint256 len = subjects.length;
+        require(len == newScores.length, "IppanAiOracle: length mismatch");
 
-        for (uint256 i = 0; i < subjects.length; i++) {
+        for (uint256 i = 0; i < len; i++) {
             scores[subjects[i]] = newScores[i];
-            emit ScoreUpdated(subjects[i], newScores[i], block.timestamp);
         }
 
-        emit BatchScoreUpdated(subjects.length, block.timestamp);
+        emit BatchScoreUpdated(len, block.timestamp);
     }
 
     function getScore(bytes32 subject) external view returns (uint256) {
