@@ -58,33 +58,36 @@ impl EthOracleClient {
             return Err(anyhow!("push_scores called with empty score list"));
         }
 
-        let pending = if scores.len() == 1 {
+        if scores.len() == 1 {
             let s = &scores[0];
-            self.contract
-                .update_score(H256::from(s.subject_id), U256::from(s.score))
-                .send()
-                .await
-                .context("failed sending updateScore tx")?
-        } else {
-            let mut subjects = Vec::with_capacity(scores.len());
-            let mut new_scores = Vec::with_capacity(scores.len());
-            for s in scores {
-                subjects.push(H256::from(s.subject_id));
-                new_scores.push(U256::from(s.score));
-            }
+            let call = self
+                .contract
+                .update_score(s.subject_id, U256::from(s.score));
+            let pending = call.send().await;
+            let pending = pending.context("failed sending updateScore tx")?;
 
-            self.contract
-                .update_scores(subjects, new_scores)
-                .send()
+            let receipt = pending
                 .await
-                .context("failed sending updateScores tx")?
-        };
+                .context("failed waiting for tx confirmation")?
+                .ok_or_else(|| anyhow!("tx dropped from mempool"))?;
+            return Ok(receipt.transaction_hash);
+        }
+
+        let mut subjects = Vec::with_capacity(scores.len());
+        let mut new_scores = Vec::with_capacity(scores.len());
+        for s in scores {
+            subjects.push(s.subject_id);
+            new_scores.push(U256::from(s.score));
+        }
+
+        let call = self.contract.update_scores(subjects, new_scores);
+        let pending = call.send().await;
+        let pending = pending.context("failed sending updateScores tx")?;
 
         let receipt = pending
             .await
             .context("failed waiting for tx confirmation")?
             .ok_or_else(|| anyhow!("tx dropped from mempool"))?;
-
         Ok(receipt.transaction_hash)
     }
 }
