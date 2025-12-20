@@ -8,7 +8,12 @@ pub fn select_changed_scores(
 ) -> Vec<SubjectScore> {
     latest
         .into_iter()
-        .filter(|s| last_sent.get(&s.subject_id).map(|m| m.score) != Some(s.score))
+        // v1: trigger updates on score changes; additionally, propagate label changes so the
+        // on-chain mapping stays in sync for dApps.
+        .filter(|s| match last_sent.get(&s.subject_id) {
+            Some(prev) => prev.score != s.score || prev.label != s.label,
+            None => true,
+        })
         .collect()
 }
 
@@ -87,6 +92,29 @@ mod tests {
         );
 
         let changed = diff_scores(&last, vec![s.clone()], 100);
+        assert_eq!(changed, vec![s]);
+    }
+
+    #[test]
+    fn selects_label_only_changes() {
+        let s = SubjectScore {
+            subject_id: [1u8; 32],
+            score: 100,
+            label: "new".to_string(),
+            eth_address: None,
+        };
+
+        let mut last = HashMap::new();
+        last.insert(
+            s.subject_id,
+            SubjectMeta {
+                score: 100,
+                label: "old".to_string(),
+                eth_address: None,
+            },
+        );
+
+        let changed = select_changed_scores(&last, vec![s.clone()]);
         assert_eq!(changed, vec![s]);
     }
 

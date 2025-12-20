@@ -13,7 +13,7 @@ pub struct SubjectScore {
 /// Local mapping cache value for subject_id -> subject metadata.
 ///
 /// Note: this is currently used by the daemon to preserve a local mapping even though only scores
-/// are pushed on-chain. `eth_address` is reserved for future integration.
+/// were pushed on-chain in earlier versions. `eth_address` is reserved for future integration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubjectMeta {
     pub score: u64,
