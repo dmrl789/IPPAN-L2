@@ -18,7 +18,7 @@ echo "   integrations/eth-oracle/configs/devnet_sepolia.toml -> ethereum.oracle_
 echo ""
 echo "5) From repo root, run:"
 echo "   ETH_PRIVATE_KEY=\\$ETH_PRIVATE_KEY ETH_RPC_URL=\\$ETH_RPC_URL IPPAN_RPC_URL=\\$IPPAN_RPC_URL \\"
-echo "   cargo run -p ippan_eth_oracle_daemon -- --config integrations/eth-oracle/configs/devnet_sepolia.toml"
+echo "   cargo run -p ippan_eth_oracle_daemon -- watch --config integrations/eth-oracle/configs/devnet_sepolia.toml"
 echo ""
 echo "6) Use cast to verify scores on-chain. Example:"
 echo "   cast call <oracle_address> \"getScore(bytes32)\" 0x<subject_id_hex>"
