@@ -6,6 +6,7 @@ subject_type = "validator"
 [ethereum]
 rpc_url = "env:ETH_RPC_URL"
 chain_id = 11155111
+# ABI-breaking changes require redeploy; set this after deploying the updated oracle.
 oracle_contract_address = "0x0000000000000000000000000000000000000000"
 
 [security]

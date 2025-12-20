@@ -126,10 +126,10 @@ async fn run_watch(config_path: PathBuf) -> Result<()> {
 
         for s in &changed {
             let id_hex = hex::encode(s.subject_id);
-            let eth = s.eth_address.as_deref().unwrap_or("<none>");
+            let eth_addr = s.eth_address.as_deref().unwrap_or("<none>");
             info!(
                 "Will update subject: label={} subject_id=0x{} eth_address={} score={}",
-                s.label, id_hex, eth, s.score
+                s.label, id_hex, eth_addr, s.score
             );
         }
 
@@ -158,7 +158,10 @@ async fn run_watch(config_path: PathBuf) -> Result<()> {
                 }
             }
         } else {
-            info!(count = changed.len(), "ethereum disabled; skipping push (mocked scores still produced)");
+            info!(
+                count = changed.len(),
+                "ethereum disabled; skipping push (mocked scores still produced)"
+            );
             for s in changed {
                 last_scores.insert(
                     s.subject_id,

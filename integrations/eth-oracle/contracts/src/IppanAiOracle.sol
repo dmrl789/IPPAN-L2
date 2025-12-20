@@ -7,9 +7,11 @@ contract IppanAiOracle {
     address public updater;
 
     mapping(bytes32 => uint256) public scores;
+    mapping(bytes32 => string) public labels;
 
     event ScoreUpdated(bytes32 indexed subject, uint256 score, uint256 timestamp);
     event BatchScoreUpdated(uint256 count, uint256 timestamp);
+    event LabelUpdated(bytes32 indexed subject, string label);
 
     modifier onlyUpdater() {
         require(msg.sender == updater, "IppanAiOracle: not updater");
@@ -21,17 +23,31 @@ contract IppanAiOracle {
         updater = _updater;
     }
 
-    function updateScore(bytes32 subject, uint256 score) external onlyUpdater {
+    function updateScore(bytes32 subject, uint256 score, string calldata label) external onlyUpdater {
+        labels[subject] = label;
         scores[subject] = score;
+        emit LabelUpdated(subject, label);
         emit ScoreUpdated(subject, score, block.timestamp);
     }
 
-    function updateScores(bytes32[] calldata subjects, uint256[] calldata newScores) external onlyUpdater {
+    function updateScores(bytes32[] calldata subjects, uint256[] calldata newScores, string[] calldata newLabels)
+        external
+        onlyUpdater
+    {
         uint256 len = subjects.length;
         require(len == newScores.length, "IppanAiOracle: length mismatch");
+        require(len == newLabels.length, "IppanAiOracle: labels length mismatch");
 
         for (uint256 i = 0; i < len; i++) {
-            scores[subjects[i]] = newScores[i];
+            bytes32 subject = subjects[i];
+            uint256 score = newScores[i];
+            string calldata label = newLabels[i];
+
+            labels[subject] = label;
+            scores[subject] = score;
+
+            emit LabelUpdated(subject, label);
+            emit ScoreUpdated(subject, score, block.timestamp);
         }
 
         emit BatchScoreUpdated(len, block.timestamp);
@@ -39,5 +55,9 @@ contract IppanAiOracle {
 
     function getScore(bytes32 subject) external view returns (uint256) {
         return scores[subject];
+    }
+
+    function getSubject(bytes32 subject) external view returns (string memory label, uint256 score) {
+        return (labels[subject], scores[subject]);
     }
 }

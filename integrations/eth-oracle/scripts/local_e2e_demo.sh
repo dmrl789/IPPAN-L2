@@ -22,3 +22,6 @@ echo "   cargo run -p ippan_eth_oracle_daemon -- watch --config integrations/eth
 echo ""
 echo "6) Use cast to verify scores on-chain. Example:"
 echo "   cast call <oracle_address> \"getScore(bytes32)\" 0x<subject_id_hex>"
+echo ""
+echo "7) Example on-chain query (label + score):"
+echo "   cast call <oracle_address> \"getSubject(bytes32)\" 0x<subject_id_hex>"

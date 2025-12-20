@@ -37,6 +37,7 @@ Mapping to oracle subjects:
 - **label**: a human-readable identifier such as `@alice.ipn` (if available) or a validator public key / address string.
 - **subject_id**: `blake3(label)` (32 bytes)
 - **score**: `voting_power * security.score_scale` (clamped to `u64::MAX`)
+- **label**: the validator `address` string (v1; pushed on-chain alongside score)
 
 Returned scores are **sorted by `subject_id`** for deterministic behaviour.
 
@@ -94,6 +95,27 @@ Then copy the deployed address into `integrations/eth-oracle/configs/devnet_sepo
 - `integrations/eth-oracle/contracts/out/IppanAiOracle.sol/IppanAiOracle.json`
 
 If you modify the Solidity contract, run `forge build` to regenerate this artifact before building/running the daemon.
+
+### On-chain label API
+
+The oracle stores both:
+
+- `scores(subject_id) -> uint256`
+- `labels(subject_id) -> string`
+
+And provides a convenience helper:
+
+- `getSubject(bytes32) -> (string label, uint256 score)`
+
+Example `cast` calls:
+
+```bash
+# Get score:
+cast call $ORACLE "getScore(bytes32)" 0x<subject_id_hex>
+
+# Get label and score together:
+cast call $ORACLE "getSubject(bytes32)" 0x<subject_id_hex>
+```
 
 ### Daemon
 
