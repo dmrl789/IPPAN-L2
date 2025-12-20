@@ -22,7 +22,10 @@ contract IppanAiOracleTest is Test {
         oracle.updateScore(subject, score, label);
 
         assertEq(oracle.scores(subject), score);
-        assertEq(keccak256(bytes(oracle.labels(subject))), keccak256(bytes(label)));
+        assertEq(
+            uint256(keccak256(bytes(oracle.labels(subject)))),
+            uint256(keccak256(bytes(label)))
+        );
     }
 
     function testStrangerCannotUpdateScore() public {
@@ -48,9 +51,15 @@ contract IppanAiOracleTest is Test {
         oracle.updateScores(subjects, values, labels);
 
         assertEq(oracle.scores(subjects[0]), 10);
-        assertEq(keccak256(bytes(oracle.labels(subjects[0]))), keccak256(bytes("@v1.ipn")));
+        assertEq(
+            uint256(keccak256(bytes(oracle.labels(subjects[0])))),
+            uint256(keccak256(bytes("@v1.ipn")))
+        );
         assertEq(oracle.scores(subjects[1]), 20);
-        assertEq(keccak256(bytes(oracle.labels(subjects[1]))), keccak256(bytes("@v2.ipn")));
+        assertEq(
+            uint256(keccak256(bytes(oracle.labels(subjects[1])))),
+            uint256(keccak256(bytes("@v2.ipn")))
+        );
     }
 
     function testBatchLengthMismatchReverts() public {
@@ -82,7 +91,7 @@ contract IppanAiOracleTest is Test {
         oracle.updateScore(subject, score, label);
 
         (string memory gotLabel, uint256 gotScore) = oracle.getSubject(subject);
-        assertEq(keccak256(bytes(gotLabel)), keccak256(bytes(label)));
+        assertEq(uint256(keccak256(bytes(gotLabel))), uint256(keccak256(bytes(label))));
         assertEq(gotScore, score);
     }
 }

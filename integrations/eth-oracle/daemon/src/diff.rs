@@ -53,7 +53,7 @@ mod tests {
             s1.subject_id,
             SubjectMeta {
                 score: 100,
-                label: "old".to_string(),
+                label: "@alice.ipn".to_string(),
                 eth_address: None,
             },
         );
@@ -61,7 +61,7 @@ mod tests {
             s2.subject_id,
             SubjectMeta {
                 score: 150,
-                label: "old".to_string(),
+                label: "@bob.ipn".to_string(),
                 eth_address: None,
             },
         );
