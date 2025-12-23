@@ -21,6 +21,7 @@ blake3 = "1"
 base64 = "0.22"
 tracing = "0.1"
 hex = "0.4"
+ed25519-dalek = { version = "2", optional = true }
 
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"], optional = true }
 
@@ -28,6 +29,8 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 default = []
 ## Enable the HTTP transport adapter for the L1 contract client.
 l1-http = ["dep:reqwest"]
+## Enable signed envelope types and signing helpers (v1).
+signed-envelopes = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 serde_json = "1"
