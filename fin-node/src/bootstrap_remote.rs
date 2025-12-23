@@ -1,12 +1,16 @@
 #![forbid(unsafe_code)]
+// Prometheus histograms require `f64` observations.
+#![allow(clippy::float_arithmetic)]
+#![allow(clippy::float_cmp)]
+#![allow(clippy::disallowed_types)]
 
 use crate::bootstrap::source::{
     BootstrapSource as _, BootstrapSourceError, HttpSource, PeerSource,
 };
 use crate::bootstrap::{BootstrapIndexV1, BootstrapSetV1};
 use crate::bootstrap_mirror_health::MirrorHealthStore;
-use crate::config::{BootstrapArtifactQuorumMode, BootstrapSourcesMode};
 use crate::config::FinNodeConfig;
+use crate::config::{BootstrapArtifactQuorumMode, BootstrapSourcesMode};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -224,26 +228,18 @@ fn fetch_remote_bootstrap_inner(
     // 1) Fetch index.json (single/mirrors/mirrors_quorum).
     let primary = build_primary_source(cfg)?;
     let peers = build_peer_sources(cfg)?;
-    let (index_bytes, index_fetched_from, index_quorum_sources, index_hash) = match cfg.bootstrap.sources.mode {
-        BootstrapSourcesMode::MirrorsQuorum => {
-            fetch_index_with_quorum(cfg, index_path)?
-        }
-        _ => {
-            // Backward-compatible single-source fetch with fallback.
-            let (b, from) = fetch_index_with_fallback(cfg, &primary, peers.as_slice())?;
-            // Optional signature verification for the chosen source.
-            verify_index_signature(
-                cfg,
-                &primary,
-                index_path,
-                &b,
-                &from,
-                peers.as_slice(),
-            )?;
-            let h = blake3::hash(b.as_ref()).to_hex().to_string();
-            (b, from, Vec::new(), h)
-        }
-    };
+    let (index_bytes, index_fetched_from, index_quorum_sources, index_hash) =
+        match cfg.bootstrap.sources.mode {
+            BootstrapSourcesMode::MirrorsQuorum => fetch_index_with_quorum(cfg, index_path)?,
+            _ => {
+                // Backward-compatible single-source fetch with fallback.
+                let (b, from) = fetch_index_with_fallback(cfg, &primary, peers.as_slice())?;
+                // Optional signature verification for the chosen source.
+                verify_index_signature(cfg, &primary, index_path, &b, &from, peers.as_slice())?;
+                let h = blake3::hash(b.as_ref()).to_hex().to_string();
+                (b, from, Vec::new(), h)
+            }
+        };
     let index: BootstrapIndexV1 = parse_and_validate_index(index_bytes.as_ref())?;
 
     // 2) Select base + required deltas (latest set)
@@ -432,7 +428,7 @@ fn fetch_index_with_quorum(
     index_path: &str,
 ) -> Result<(bytes::Bytes, String, Vec<String>, String), BootstrapRemoteError> {
     let sources = build_index_sources(cfg)?;
-    let max_sources = cfg.bootstrap.sources.max_sources.max(1).min(10);
+    let max_sources = cfg.bootstrap.sources.max_sources.clamp(1, 10);
     let quorum = cfg.bootstrap.sources.quorum.max(1);
     let mut sources = sources;
     sources.truncate(max_sources);
@@ -463,13 +459,19 @@ fn fetch_index_with_quorum(
         let Ok((name, base_url, latency_ms, r)) = rx.recv() else {
             break;
         };
+        let latency_ms_u32 =
+            u32::try_from(latency_ms.min(u128::from(u32::MAX))).unwrap_or(u32::MAX);
         crate::metrics::BOOTSTRAP_MIRROR_LATENCY_MS
             .with_label_values(&[base_url.as_str()])
-            .observe(latency_ms as f64);
+            .observe(f64::from(latency_ms_u32));
         match r {
             Ok(bytes) => {
                 if let Some(mh) = mh.as_ref() {
-                    let _ = mh.record_success(&base_url, u64::try_from(latency_ms).unwrap_or(u64::MAX), now_ms);
+                    let _ = mh.record_success(
+                        &base_url,
+                        u64::try_from(latency_ms).unwrap_or(u64::MAX),
+                        now_ms,
+                    );
                 }
                 if let Some(src) = sources.iter().find(|s| s.base_url == base_url) {
                     results.push((src.clone(), latency_ms, bytes));
@@ -544,10 +546,7 @@ fn fetch_index_with_quorum(
     }
 
     // Winner: pick the lowest base_url among sources that match (deterministic).
-    let mut winners = by_hash
-        .get(&winning_hash)
-        .cloned()
-        .unwrap_or_default();
+    let mut winners = by_hash.get(&winning_hash).cloned().unwrap_or_default();
     winners.sort_by(|a, b| a.0.base_url.cmp(&b.0.base_url));
     let quorum_sources = winners.iter().map(|(s, _)| s.base_url.clone()).collect();
     let (winner_src, winner_bytes) = winners.into_iter().next().expect("non-empty");
@@ -1059,7 +1058,9 @@ fn build_http_sources_for_artifacts(
     let mode = cfg.bootstrap.sources.mode;
     if matches!(
         mode,
-        BootstrapSourcesMode::Mirrors | BootstrapSourcesMode::MirrorsQuorum | BootstrapSourcesMode::Pinned
+        BootstrapSourcesMode::Mirrors
+            | BootstrapSourcesMode::MirrorsQuorum
+            | BootstrapSourcesMode::Pinned
     ) {
         for (i, m) in cfg.bootstrap.sources.mirrors.iter().enumerate() {
             let url = m.trim();
@@ -1097,8 +1098,8 @@ fn build_http_sources_for_artifacts(
         // Drop recently mismatching sources unless that would remove all sources.
         let filtered: Vec<HttpSource> = dedup
             .iter()
-            .cloned()
             .filter(|s| !mh.quarantined_recent_mismatch(s.base_url(), now_ms, QUARANTINE_MS))
+            .cloned()
             .collect();
         if !filtered.is_empty() {
             return Ok(filtered);
@@ -2107,7 +2108,10 @@ fn download_http_to_temp_and_verify(
         }
     }
 
-    Ok((tmp_path.to_path_buf(), hasher.finalize().to_hex().to_string()))
+    Ok((
+        tmp_path.to_path_buf(),
+        hasher.finalize().to_hex().to_string(),
+    ))
 }
 
 fn update_download_entry(

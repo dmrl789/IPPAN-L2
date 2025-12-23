@@ -200,7 +200,8 @@ fn start_file_server(
 
             let mut resp = Response::from_data(bytes).with_status_code(StatusCode(200));
             resp.add_header(
-                Header::from_bytes(&b"Content-Length"[..], total_len.to_string().as_bytes()).unwrap(),
+                Header::from_bytes(&b"Content-Length"[..], total_len.to_string().as_bytes())
+                    .unwrap(),
             );
             let _ = req.respond(resp);
         }
@@ -219,7 +220,13 @@ fn mirrors_quorum_two_sources_agree() {
 
     let cfg_path = tmp.path().join("node.toml");
     let download_dir = tmp.path().join("cache");
-    write_minimal_config_mirrors_quorum(&cfg_path, &url1, &[url2.clone()], &download_dir, 2);
+    write_minimal_config_mirrors_quorum(
+        &cfg_path,
+        &url1,
+        std::slice::from_ref(&url2),
+        &download_dir,
+        2,
+    );
 
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("fin-node"));
     cmd.args([
@@ -289,4 +296,3 @@ fn mirrors_quorum_majority_wins_when_one_differs() {
     stop_good2.store(true, std::sync::atomic::Ordering::Relaxed);
     stop_bad.store(true, std::sync::atomic::Ordering::Relaxed);
 }
-

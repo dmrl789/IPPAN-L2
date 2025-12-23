@@ -393,7 +393,9 @@ pub static BOOTSTRAP_MIRROR_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
         "bootstrap_mirror_latency_ms",
         "Bootstrap mirror request latency (ms)",
     )
-    .buckets(vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]);
+    .buckets(vec![
+        5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    ]);
     let h = HistogramVec::new(opts, &["source"]).expect("metric");
     REGISTRY.register(Box::new(h.clone())).expect("register");
     h

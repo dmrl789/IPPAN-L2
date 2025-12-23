@@ -998,7 +998,7 @@ impl Default for BootstrapSourcesConfig {
 }
 
 /// Pinned trusted snapshot set.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct BootstrapPinnedConfig {
     /// Base snapshot manifest hash (required in pinned mode).
     #[serde(default)]
@@ -1009,16 +1009,6 @@ pub struct BootstrapPinnedConfig {
     /// Optional pinned index.json hash (blake3(index_bytes)) for extra auditing.
     #[serde(default)]
     pub index_hash: Option<String>,
-}
-
-impl Default for BootstrapPinnedConfig {
-    fn default() -> Self {
-        Self {
-            base_hash: String::new(),
-            delta_hashes: Vec::new(),
-            index_hash: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1244,8 +1234,9 @@ impl BootstrapSourcesConfig {
         if matches!(self.mode, BootstrapSourcesMode::Pinned) {
             // Pinned mode does not require any specific remote URLs (may still be used to fetch).
             if pinned.base_hash.trim().is_empty() {
-                return Err("[bootstrap.pinned].base_hash is empty (required for pinned mode)"
-                    .to_string());
+                return Err(
+                    "[bootstrap.pinned].base_hash is empty (required for pinned mode)".to_string(),
+                );
             }
             return Ok(());
         }
@@ -1302,12 +1293,17 @@ impl BootstrapSourcesConfig {
             }
         }
 
-        if matches!(self.artifact_quorum_mode, BootstrapArtifactQuorumMode::BytesQuorum) {
+        if matches!(
+            self.artifact_quorum_mode,
+            BootstrapArtifactQuorumMode::BytesQuorum
+        ) {
             if self.artifact_quorum == 0 {
                 return Err("[bootstrap.sources].artifact_quorum must be >= 1".to_string());
             }
             if self.artifact_quorum > self.max_sources {
-                return Err("[bootstrap.sources].artifact_quorum must be <= max_sources".to_string());
+                return Err(
+                    "[bootstrap.sources].artifact_quorum must be <= max_sources".to_string()
+                );
             }
         }
 

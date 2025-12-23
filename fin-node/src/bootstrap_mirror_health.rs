@@ -58,8 +58,8 @@ impl MirrorHealthStore {
         let mut out = Vec::new();
         for r in self.tree.iter() {
             let (_k, v) = r?;
-            let rec: MirrorHealthV1 = serde_json::from_slice(&v)
-                .map_err(|e| MirrorHealthError::Decode(e.to_string()))?;
+            let rec: MirrorHealthV1 =
+                serde_json::from_slice(&v).map_err(|e| MirrorHealthError::Decode(e.to_string()))?;
             out.push(rec);
         }
         out.sort_by(|a, b| b.score.cmp(&a.score).then(a.source.cmp(&b.source)));
@@ -71,13 +71,20 @@ impl MirrorHealthStore {
         Ok(())
     }
 
-    pub fn record_success(&self, source: &str, latency_ms: u64, now_ms: u64) -> Result<(), MirrorHealthError> {
+    pub fn record_success(
+        &self,
+        source: &str,
+        latency_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), MirrorHealthError> {
         let mut rec = self.get_or_default(source)?;
         rec.successes = rec.successes.saturating_add(1);
         rec.avg_latency_ms = ewma_u64(rec.avg_latency_ms, latency_ms, 8);
         rec.score = rec.score.saturating_add(10);
         // Small latency penalty (integer).
-        rec.score = rec.score.saturating_sub(i64::try_from(rec.avg_latency_ms / 250).unwrap_or(i64::MAX));
+        rec.score = rec
+            .score
+            .saturating_sub(i64::try_from(rec.avg_latency_ms / 250).unwrap_or(i64::MAX));
         rec.last_updated_ms = now_ms;
         self.put(&rec)?;
         Ok(())
@@ -103,7 +110,11 @@ impl MirrorHealthStore {
     }
 
     pub fn score_for(&self, source: &str) -> i64 {
-        self.get(source).ok().flatten().map(|r| r.score).unwrap_or(0)
+        self.get(source)
+            .ok()
+            .flatten()
+            .map(|r| r.score)
+            .unwrap_or(0)
     }
 
     pub fn quarantined_recent_mismatch(&self, source: &str, now_ms: u64, window_ms: u64) -> bool {
@@ -116,9 +127,11 @@ impl MirrorHealthStore {
 
     fn get(&self, source: &str) -> Result<Option<MirrorHealthV1>, MirrorHealthError> {
         let k = key_for_source(source);
-        let Some(v) = self.tree.get(k)? else { return Ok(None) };
-        let rec: MirrorHealthV1 = serde_json::from_slice(&v)
-            .map_err(|e| MirrorHealthError::Decode(e.to_string()))?;
+        let Some(v) = self.tree.get(k)? else {
+            return Ok(None);
+        };
+        let rec: MirrorHealthV1 =
+            serde_json::from_slice(&v).map_err(|e| MirrorHealthError::Decode(e.to_string()))?;
         Ok(Some(rec))
     }
 
@@ -131,7 +144,8 @@ impl MirrorHealthStore {
 
     fn put(&self, rec: &MirrorHealthV1) -> Result<(), MirrorHealthError> {
         let k = key_for_source(&rec.source);
-        let bytes = serde_json::to_vec(rec).map_err(|e| MirrorHealthError::Decode(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(rec).map_err(|e| MirrorHealthError::Decode(e.to_string()))?;
         self.tree.insert(k, bytes)?;
         Ok(())
     }
@@ -151,4 +165,3 @@ fn ewma_u64(prev: u64, cur: u64, alpha_den: u64) -> u64 {
         .saturating_div(alpha_den)
         .saturating_add(cur.saturating_div(alpha_den))
 }
-
