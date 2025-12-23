@@ -39,8 +39,7 @@ pub fn plan_prune_receipts_dir(
     for p in &files {
         scanned_files += 1;
         let meta = fs::metadata(p).map_err(|e| format!("metadata failed {}: {e}", p.display()))?;
-        let max_receipt_bytes_u64 =
-            u64::try_from(limits.max_receipt_bytes).unwrap_or(u64::MAX);
+        let max_receipt_bytes_u64 = u64::try_from(limits.max_receipt_bytes).unwrap_or(u64::MAX);
         if meta.len() > max_receipt_bytes_u64 {
             skipped_too_large += 1;
             continue;

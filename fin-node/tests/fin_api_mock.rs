@@ -59,7 +59,9 @@ fn fin_api_submit_create_asset_and_mint_updates_state_and_writes_receipts() {
         "memo": "genesis allocation"
     });
     let mint_req: FinActionRequestV1 = serde_json::from_value(mint_body.clone()).expect("mint req");
-    let mint = api.submit_action_obj(mint_req.into_action()).expect("submit mint");
+    let mint = api
+        .submit_action_obj(mint_req.into_action())
+        .expect("submit mint");
     assert!(PathBuf::from(&mint.receipt_path).exists());
     assert_eq!(mint.local_apply_outcome, hub_fin::ApplyOutcome::Applied);
 
