@@ -1,0 +1,6 @@
+{
+  "hub_payload_envelope_v1_canonical_blake3_b64url": "FlLO2xghHuOMJ7ooEJAZYvTM5xSmqZF-m9evahhQr30",
+  "l2_batch_envelope_v1_canonical_blake3_b64url": "OccWaSeopcU945FvGjwqL2MPzsVVih-poVVRGh6mmN0",
+  "l2_batch_envelope_v1_idempotency_key_b64url": "Xiii74zil-899z8QwBF8uLHv7fumyEPcT1Gf23UPzlQ"
+}
+

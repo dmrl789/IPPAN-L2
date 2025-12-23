@@ -12,6 +12,16 @@
 base_url = "http://127.0.0.1:8080"
 # Optional API key (leave empty for local dev)
 api_key = ""
+# HTTP timeout for L1 calls
+timeout_ms = 10000
+
+# IMPORTANT: endpoint paths are intentionally NOT defaulted in code.
+# This repo cannot invent IPPAN CORE endpoints; you must supply the mapping.
+[l1.endpoints]
+chain_status = ""
+submit_batch = ""
+get_inclusion = ""
+get_finality = ""
 
 [server]
 # HTTP bind address for health/metrics endpoints

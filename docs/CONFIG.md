@@ -27,14 +27,27 @@ cargo run -p fin-node
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `base_url` | String | Yes | IPPAN CORE settlement endpoint URL |
-| `api_key` | String | No | API key for authentication |
+| `base_url` | String | Yes | IPPAN CORE base URL (e.g. `http://127.0.0.1:8080`) |
+| `api_key` | String | No | API key / auth token (never log this) |
+| `timeout_ms` | Integer | No | HTTP timeout in milliseconds (default: 10000) |
+| `endpoints.chain_status` | String | **Yes (HTTP mode)** | L1 chain status path (no default) |
+| `endpoints.submit_batch` | String | **Yes (HTTP mode)** | L2 batch submit path (no default) |
+| `endpoints.get_inclusion` | String | **Yes (HTTP mode)** | Inclusion lookup path (supports `{id}` placeholder) |
+| `endpoints.get_finality` | String | **Yes (HTTP mode)** | Finality lookup path (supports `{l1_tx_id}` placeholder) |
 
 **Example:**
 ```toml
 [l1]
 base_url = "http://127.0.0.1:8080"
 api_key = "env:L1_API_KEY"  # Load from environment
+
+# IMPORTANT: endpoint paths are intentionally NOT defaulted in code.
+# This repo cannot invent IPPAN CORE endpoints; you must supply the mapping.
+[l1.endpoints]
+chain_status = ""          # REQUIRED in HTTP mode (set to actual CORE path)
+submit_batch = ""          # REQUIRED in HTTP mode (set to actual CORE path)
+get_inclusion = ""         # REQUIRED in HTTP mode (supports "{id}")
+get_finality = ""          # REQUIRED in HTTP mode (supports "{l1_tx_id}")
 ```
 
 ### Server (`[server]`)
@@ -125,6 +138,11 @@ Any configuration value can be overridden by setting an environment variable:
 |-------------|---------------------|
 | `l1.base_url` | `L1_BASE_URL` |
 | `l1.api_key` | `L1_API_KEY` |
+| `l1.timeout_ms` | `L1_TIMEOUT_MS` |
+| `l1.endpoints.chain_status` | `L1_ENDPOINT_CHAIN_STATUS` |
+| `l1.endpoints.submit_batch` | `L1_ENDPOINT_SUBMIT_BATCH` |
+| `l1.endpoints.get_inclusion` | `L1_ENDPOINT_GET_INCLUSION` |
+| `l1.endpoints.get_finality` | `L1_ENDPOINT_GET_FINALITY` |
 | `server.bind_address` | `SERVER_BIND_ADDRESS` |
 | `logging.level` | `RUST_LOG` or `LOG_LEVEL` |
 

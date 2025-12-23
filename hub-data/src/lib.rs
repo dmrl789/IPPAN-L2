@@ -7,15 +7,15 @@
 //! Handles content attestations for videos, articles, posts, datasets, and
 //! other digital artefacts. Does NOT store content, only hashes + metadata.
 
-use l2_core::{
-    AccountId, FixedAmount, L1SettlementClient, L2Batch, L2BatchId, L2HubId, SettlementError,
-    SettlementRequest, SettlementResult,
-};
+use l2_core::{AccountId, FixedAmount, L2BatchId, L2HubId, SettlementError};
+use l2_core::l1_contract::{Base64Bytes, FixedAmountV1, HubPayloadEnvelopeV1, L2BatchEnvelopeV1};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Logical identifier for the DATA Hub.
 pub const HUB_ID: L2HubId = L2HubId::Data;
+pub const DATA_PAYLOAD_SCHEMA_V1: &str = "hub-data.payload.v1";
+pub const DATA_PAYLOAD_CONTENT_TYPE_V1: &str = "application/json";
 
 /// Hash of the content (e.g., BLAKE3 or SHA256 in hex).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -102,23 +102,38 @@ impl DataState {
     }
 }
 
+/// Build a hub payload envelope (v1) from DATA transactions.
+pub fn to_hub_payload_envelope_v1(
+    txs: &[DataTransaction],
+) -> Result<HubPayloadEnvelopeV1, SettlementError> {
+    let payload = serde_json::to_vec(txs)
+        .map_err(|e| SettlementError::Internal(format!("failed to serialize data payload: {e}")))?;
+    Ok(HubPayloadEnvelopeV1 {
+        contract_version: l2_core::l1_contract::ContractVersion::V1,
+        hub: HUB_ID,
+        schema_version: DATA_PAYLOAD_SCHEMA_V1.to_string(),
+        content_type: DATA_PAYLOAD_CONTENT_TYPE_V1.to_string(),
+        payload: Base64Bytes(payload),
+    })
+}
+
 /// DATA Hub engine: applies attestations, persists state, and submits batches to CORE.
-pub struct DataHubEngine<C: L1SettlementClient, S: DataStateStore> {
-    client: C,
+pub struct DataHubEngine<S: DataStateStore> {
     store: S,
 }
 
-impl<C: L1SettlementClient, S: DataStateStore> DataHubEngine<C, S> {
-    pub fn new(client: C, store: S) -> Self {
-        Self { client, store }
+impl<S: DataStateStore> DataHubEngine<S> {
+    pub fn new(store: S) -> Self {
+        Self { store }
     }
 
-    pub fn submit_attestations(
+    pub fn build_batch_envelope_v1(
         &self,
         batch_id: L2BatchId,
+        sequence: u64,
         txs: &[DataTransaction],
         fee: FixedAmount,
-    ) -> Result<SettlementResult, SettlementError> {
+    ) -> Result<L2BatchEnvelopeV1, SettlementError> {
         // Load state
         let mut state = self.store.load_state();
 
@@ -134,15 +149,18 @@ impl<C: L1SettlementClient, S: DataStateStore> DataHubEngine<C, S> {
             .save_state(&state)
             .map_err(|e| SettlementError::Internal(format!("save error: {e}")))?;
 
-        // Build batch and submit to CORE
-        let batch = L2Batch::new(HUB_ID, batch_id, txs.len() as u64);
-        let request = SettlementRequest {
-            hub: HUB_ID,
-            batch,
-            fee,
-        };
-
-        self.client.submit_settlement(request)
+        let payload = to_hub_payload_envelope_v1(txs)?;
+        let fee_v1 = FixedAmountV1(fee.into_scaled());
+        L2BatchEnvelopeV1::new(
+            HUB_ID,
+            batch_id.0,
+            sequence,
+            txs.len() as u64,
+            None,
+            fee_v1,
+            payload,
+        )
+        .map_err(|e| SettlementError::Internal(format!("contract error: {e}")))
     }
 
     /// Read-only snapshot for inspection (e.g., for APIs or tests).
@@ -154,29 +172,11 @@ impl<C: L1SettlementClient, S: DataStateStore> DataHubEngine<C, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use l2_core::{L2BatchId, SettlementError};
-
-    struct DummyClient;
-
-    impl L1SettlementClient for DummyClient {
-        fn submit_settlement(
-            &self,
-            request: SettlementRequest,
-        ) -> Result<SettlementResult, SettlementError> {
-            Ok(SettlementResult {
-                hub: request.hub,
-                batch_id: request.batch.batch_id,
-                l1_reference: "dummy".to_string(),
-                finalised: true,
-            })
-        }
-    }
 
     #[test]
     fn data_hub_engine_records_attestations() {
-        let client = DummyClient;
         let store = InMemoryDataStateStore::new();
-        let engine = DataHubEngine::new(client, store);
+        let engine = DataHubEngine::new(store);
 
         let hash = ContentHash("hash-123".to_string());
         let issuer = AccountId::new("acc-alice");
@@ -195,15 +195,33 @@ mod tests {
         let batch_id = L2BatchId("batch-001".to_string());
         let fee = FixedAmount::from_units(1, 6);
 
-        let result = engine
-            .submit_attestations(batch_id.clone(), &txs, fee)
+        let env = engine
+            .build_batch_envelope_v1(batch_id.clone(), 0, &txs, fee)
             .unwrap();
-        assert_eq!(result.hub, HUB_ID);
-        assert_eq!(result.batch_id.0, batch_id.0);
+        assert_eq!(env.hub, HUB_ID);
+        assert_eq!(env.batch_id, batch_id.0);
 
         let snapshot = engine.snapshot_state();
         let list = snapshot.by_hash.get(&hash).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].issuer.0, issuer.0);
+    }
+
+    #[test]
+    fn data_payload_canonical_hash_is_stable_for_identical_inputs() {
+        let txs = vec![DataTransaction {
+            tx_id: "tx-1".to_string(),
+            attestation: Attestation {
+                content_hash: ContentHash("hash-123".to_string()),
+                issuer: AccountId::new("acc-alice"),
+                claim_type: "authorship".to_string(),
+                url: None,
+                platform: None,
+            },
+        }];
+
+        let a = to_hub_payload_envelope_v1(&txs).unwrap();
+        let b = to_hub_payload_envelope_v1(&txs).unwrap();
+        assert_eq!(a.canonical_hash_blake3().unwrap(), b.canonical_hash_blake3().unwrap());
     }
 }

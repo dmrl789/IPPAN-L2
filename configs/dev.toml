@@ -13,6 +13,13 @@
 base_url = "env:L1_BASE_URL"
 # API key from environment
 api_key = "env:L1_API_KEY"
+timeout_ms = 10000
+
+[l1.endpoints]
+chain_status = "env:L1_ENDPOINT_CHAIN_STATUS"
+submit_batch = "env:L1_ENDPOINT_SUBMIT_BATCH"
+get_inclusion = "env:L1_ENDPOINT_GET_INCLUSION"
+get_finality = "env:L1_ENDPOINT_GET_FINALITY"
 
 [server]
 # HTTP bind address for health/metrics endpoints
