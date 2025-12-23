@@ -374,8 +374,8 @@ fn main() {
             }
             policy.store = Some(policy_store);
 
-            let store =
-                hub_fin::FinStore::open(fin_db_dir.as_str()).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let store = hub_fin::FinStore::open(fin_db_dir.as_str())
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_fin(&store);
             let limits_cfg = cfg.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
             let fin_limits = hub_fin::validation::ValidationLimits {
@@ -411,8 +411,8 @@ fn main() {
                 fin_limits,
             );
 
-            let data_store =
-                hub_data::DataStore::open(data_db_dir.as_str()).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let data_store = hub_data::DataStore::open(data_db_dir.as_str())
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_data(&data_store);
             let data_api = data_api::DataApi::new_with_policy_recon_and_limits(
                 l1.clone(),
