@@ -497,6 +497,9 @@ pub struct HaConfig {
     /// Directory used for the Sled-based leader lock (must be shared across nodes).
     #[serde(default = "default_ha_lock_db_dir")]
     pub lock_db_dir: String,
+    /// Optional external lock provider configuration. Defaults to the built-in sled lock.
+    #[serde(default)]
+    pub lock: HaLockConfig,
     /// Write policy when HA is enabled.
     #[serde(default)]
     pub write_mode: HaWriteMode,
@@ -521,6 +524,94 @@ fn default_ha_lock_db_dir() -> String {
     "ha_db".to_string()
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HaLockConfig {
+    #[serde(default)]
+    pub provider: HaLockProvider,
+    #[serde(default)]
+    pub redis: HaRedisLockConfig,
+    #[serde(default)]
+    pub consul: HaConsulLockConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HaLockProvider {
+    /// Built-in sled-based TTL lease under `[ha].lock_db_dir` (default).
+    #[default]
+    Sled,
+    /// Redis-based distributed TTL lock (feature: `ha-redis`).
+    Redis,
+    /// Consul session lock (feature: `ha-consul`).
+    Consul,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HaRedisLockConfig {
+    /// Redis connection URL (e.g. `redis://host:6379`).
+    #[serde(default)]
+    pub url: String,
+    /// Redis key to coordinate leadership (single key for the cluster).
+    #[serde(default = "default_ha_redis_key")]
+    pub key: String,
+    /// Optional override for the lease duration (ms). Defaults to `[ha].lease_ms`.
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+    /// Best-effort connect/IO timeout (ms).
+    #[serde(default = "default_ha_redis_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+fn default_ha_redis_key() -> String {
+    "ippan:l2:leader".to_string()
+}
+
+fn default_ha_redis_connect_timeout_ms() -> u64 {
+    2_000
+}
+
+impl Default for HaRedisLockConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            key: default_ha_redis_key(),
+            lease_ms: None,
+            connect_timeout_ms: default_ha_redis_connect_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HaConsulLockConfig {
+    /// Consul HTTP address (e.g. `http://consul:8500`).
+    #[serde(default)]
+    pub address: String,
+    /// KV key used for leadership coordination.
+    #[serde(default = "default_ha_consul_key")]
+    pub key: String,
+    /// Session TTL string (e.g. `"15s"`). Defaults to `15s` if empty.
+    #[serde(default = "default_ha_consul_session_ttl")]
+    pub session_ttl: String,
+}
+
+fn default_ha_consul_key() -> String {
+    "ippan/l2/leader".to_string()
+}
+
+fn default_ha_consul_session_ttl() -> String {
+    "15s".to_string()
+}
+
+impl Default for HaConsulLockConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            key: default_ha_consul_key(),
+            session_ttl: default_ha_consul_session_ttl(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HaWriteMode {
@@ -538,9 +629,72 @@ impl Default for HaConfig {
             node_id: default_ha_node_id(),
             lease_ms: default_ha_lease_ms(),
             lock_db_dir: default_ha_lock_db_dir(),
+            lock: HaLockConfig::default(),
             write_mode: HaWriteMode::LeaderOnly,
             leader_urls: BTreeMap::new(),
         }
+    }
+}
+
+impl HaConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.node_id.trim().is_empty() {
+            return Err("[ha].node_id is empty".to_string());
+        }
+        if self.lease_ms == 0 {
+            return Err("[ha].lease_ms must be >= 1".to_string());
+        }
+
+        match self.lock.provider {
+            HaLockProvider::Sled => {
+                if self.lock_db_dir.trim().is_empty() {
+                    return Err("[ha].lock_db_dir is empty".to_string());
+                }
+            }
+            HaLockProvider::Redis => {
+                if !cfg!(feature = "ha-redis") {
+                    return Err(
+                        "ha.lock.provider=redis requires building fin-node with feature ha-redis"
+                            .to_string(),
+                    );
+                }
+                if self.lock.redis.url.trim().is_empty() {
+                    return Err("[ha.lock.redis].url is empty".to_string());
+                }
+                if self.lock.redis.key.trim().is_empty() {
+                    return Err("[ha.lock.redis].key is empty".to_string());
+                }
+                let lease_ms = self.lock.redis.lease_ms.unwrap_or(self.lease_ms);
+                if lease_ms == 0 {
+                    return Err("[ha.lock.redis].lease_ms must be >= 1".to_string());
+                }
+                if self.lock.redis.connect_timeout_ms == 0 {
+                    return Err("[ha.lock.redis].connect_timeout_ms must be >= 1".to_string());
+                }
+            }
+            HaLockProvider::Consul => {
+                if !cfg!(feature = "ha-consul") {
+                    return Err(
+                        "ha.lock.provider=consul requires building fin-node with feature ha-consul"
+                            .to_string(),
+                    );
+                }
+                if self.lock.consul.address.trim().is_empty() {
+                    return Err("[ha.lock.consul].address is empty".to_string());
+                }
+                if self.lock.consul.key.trim().is_empty() {
+                    return Err("[ha.lock.consul].key is empty".to_string());
+                }
+                if self.lock.consul.session_ttl.trim().is_empty() {
+                    return Err("[ha.lock.consul].session_ttl is empty".to_string());
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -620,6 +774,10 @@ impl FinNodeConfig {
         if self.l1.rpc.retry.max_attempts == 0 {
             return Err("l1.retry.max_attempts must be >= 1".to_string());
         }
+
+        self.ha
+            .validate()
+            .map_err(|e| format!("invalid [ha] config: {e}"))?;
 
         Ok(())
     }

@@ -473,18 +473,15 @@ fn main() {
             let mut supervisor_handle: Option<std::thread::JoinHandle<()>> = None;
             let mut direct_bg_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
             if ha_cfg.enabled {
-                if ha_cfg.node_id.trim().is_empty() {
-                    exit_err("[ha].node_id is empty");
-                }
-                let lock = ha::leader_lock::LeaderLock::open(
-                    &ha_cfg.lock_db_dir,
-                    ha_cfg.node_id.clone(),
-                    ha_cfg.lease_ms,
-                )
-                .unwrap_or_else(|e| exit_err(&format!("failed to open ha lock db: {e}")));
+                ha_cfg
+                    .validate()
+                    .unwrap_or_else(|e| exit_err(&format!("invalid [ha] config: {e}")));
+
+                let lock = ha::build_lock_provider(&ha_cfg)
+                    .unwrap_or_else(|e| exit_err(&format!("failed to init HA lock provider: {e}")));
 
                 let supervisor =
-                    ha::supervisor::HaSupervisor::new(ha_state.clone(), Some(lock), stop.clone());
+                    ha::supervisor::HaSupervisor::new(ha_state.clone(), lock, stop.clone());
 
                 supervisor_handle = Some(supervisor.spawn(move |leader_stop| {
                     let mut hs = Vec::new();

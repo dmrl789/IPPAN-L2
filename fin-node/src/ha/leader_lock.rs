@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::ha::lock_provider::{LeaderInfo, LeaderLockProvider, LockProviderError, LockState};
+
 const TREE_NAME: &str = "fin-node-ha";
 const LOCK_KEY: &[u8] = b"ha:leader_lock";
 
@@ -14,6 +16,13 @@ pub enum LeaderLockError {
     Db(#[from] sled::Error),
     #[error("serde error: {0}")]
     Serde(String),
+}
+
+impl From<LeaderLockError> for LockProviderError {
+    fn from(e: LeaderLockError) -> Self {
+        // Sled/serde errors are backend errors; callers should rely on logs + metrics.
+        LockProviderError::Backend(e.to_string())
+    }
 }
 
 pub trait Clock: Send + Sync + 'static {
@@ -58,6 +67,15 @@ pub struct LeaderLock {
     clock: Arc<dyn Clock>,
 }
 
+impl std::fmt::Debug for LeaderLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaderLock")
+            .field("holder_id", &self.holder_id)
+            .field("lease_ms", &self.lease_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     Leader,
@@ -87,10 +105,6 @@ impl LeaderLock {
             lease_ms: lease_ms.max(1),
             clock,
         })
-    }
-
-    pub fn holder_id(&self) -> &str {
-        &self.holder_id
     }
 
     pub fn read_lease(&self) -> Result<Option<LeaderLease>, LeaderLockError> {
@@ -175,6 +189,102 @@ impl LeaderLock {
         };
         let lease = decode_lease(&v)?;
         Ok(lease.holder_id == self.holder_id && !lease.is_expired(now))
+    }
+}
+
+impl LeaderLockProvider for LeaderLock {
+    fn provider_type(&self) -> &'static str {
+        "sled"
+    }
+
+    fn try_acquire(&self, node_id: &str) -> crate::ha::lock_provider::Result<LockState> {
+        if node_id != self.holder_id {
+            return Err(LockProviderError::Misconfigured(format!(
+                "node_id mismatch: provider holder_id={} but requested node_id={}",
+                self.holder_id, node_id
+            )));
+        }
+        let role = LeaderLock::try_acquire(self)?;
+        Ok(match role {
+            Role::Leader => LockState::Acquired,
+            Role::Follower => LockState::NotLeader,
+        })
+    }
+
+    fn renew(&self, node_id: &str) -> crate::ha::lock_provider::Result<LockState> {
+        if node_id != self.holder_id {
+            return Err(LockProviderError::Misconfigured(format!(
+                "node_id mismatch: provider holder_id={} but requested node_id={}",
+                self.holder_id, node_id
+            )));
+        }
+
+        let now = self.clock.now_ms();
+        let lease = self.read_lease()?;
+        let Some(lease) = lease else {
+            return Ok(LockState::Expired);
+        };
+        if lease.holder_id != node_id {
+            return Ok(LockState::NotLeader);
+        }
+        if lease.is_expired(now) {
+            return Ok(LockState::Expired);
+        }
+
+        let ok = LeaderLock::renew(self)?;
+        if ok {
+            return Ok(LockState::Acquired);
+        }
+
+        // Lost CAS / ownership: re-read to disambiguate.
+        let after = self.read_lease()?;
+        match after {
+            None => Ok(LockState::Expired),
+            Some(l) if l.holder_id != node_id => Ok(LockState::NotLeader),
+            Some(l) if l.is_expired(now) => Ok(LockState::Expired),
+            Some(_) => Ok(LockState::NotLeader),
+        }
+    }
+
+    fn release(&self, node_id: &str) -> crate::ha::lock_provider::Result<()> {
+        if node_id != self.holder_id {
+            return Err(LockProviderError::Misconfigured(format!(
+                "node_id mismatch: provider holder_id={} but requested node_id={}",
+                self.holder_id, node_id
+            )));
+        }
+        let cur = self.tree.get(LOCK_KEY).map_err(LeaderLockError::Db)?;
+        let Some(cur_bytes) = cur else {
+            return Ok(());
+        };
+        let cur_lease = decode_lease(&cur_bytes)?;
+        if cur_lease.holder_id != node_id {
+            return Ok(());
+        }
+        let _ = self
+            .tree
+            .compare_and_swap(
+                LOCK_KEY,
+                Some(cur_bytes.as_ref()),
+                Option::<sled::IVec>::None,
+            )
+            .map_err(LeaderLockError::Db)?;
+        Ok(())
+    }
+
+    fn current_holder(&self) -> crate::ha::lock_provider::Result<Option<LeaderInfo>> {
+        let now = self.clock.now_ms();
+        let lease = self.read_lease()?;
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        if lease.is_expired(now) {
+            return Ok(None);
+        }
+        Ok(Some(LeaderInfo {
+            node_id: lease.holder_id,
+            expires_at_ms: lease.expires_at_ms,
+        }))
     }
 }
 
