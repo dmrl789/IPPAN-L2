@@ -92,11 +92,11 @@ impl L1Client for MockL1Client {
     fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError> {
         batch
             .validate()
-            .map_err(|ContractError::Invalid(s)| L1ClientError::Protocol(s))?;
+            .map_err(|ContractError::Invalid(s)| L1ClientError::DecodeError(s))?;
 
         let envelope_hash = batch
             .canonical_hash_blake3()
-            .map_err(|e| L1ClientError::Serialization(e.to_string()))?;
+            .map_err(|e| L1ClientError::DecodeError(e.to_string()))?;
 
         let mut submitted = self.submitted.lock().expect("mutex poisoned");
 

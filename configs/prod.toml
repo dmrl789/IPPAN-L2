@@ -11,6 +11,9 @@
 #
 # All sensitive values should come from environment variables.
 
+[node]
+label = "prod-fin-node"
+
 [l1]
 # IPPAN CORE settlement endpoint
 # REQUIRED: Set via L1_BASE_URL environment variable
@@ -18,7 +21,13 @@ base_url = "env:L1_BASE_URL"
 # API key for authentication
 # REQUIRED: Set via L1_API_KEY environment variable
 api_key = "env:L1_API_KEY"
-timeout_ms = 10000
+connect_timeout_ms = 3000
+request_timeout_ms = 10000
+
+[l1.retry]
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 3000
 
 [l1.endpoints]
 chain_status = "env:L1_ENDPOINT_CHAIN_STATUS"

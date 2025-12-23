@@ -7,13 +7,22 @@
 #
 # Environment variables can override TOML values.
 
+[node]
+label = "local-fin-node"
+
 [l1]
 # IPPAN CORE settlement endpoint
 base_url = "http://127.0.0.1:8080"
 # Optional API key (leave empty for local dev)
 api_key = ""
-# HTTP timeout for L1 calls
-timeout_ms = 10000
+# Timeouts (ms)
+connect_timeout_ms = 3000
+request_timeout_ms = 10000
+
+[l1.retry]
+max_attempts = 3
+base_delay_ms = 250
+max_delay_ms = 2000
 
 # IMPORTANT: endpoint paths are intentionally NOT defaulted in code.
 # This repo cannot invent IPPAN CORE endpoints; you must supply the mapping.

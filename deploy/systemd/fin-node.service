@@ -1,0 +1,23 @@
+[Unit]
+Description=IPPAN-L2 fin-node
+After=network.target
+
+[Service]
+Type=simple
+User=ippan
+Group=ippan
+WorkingDirectory=/opt/ippan-l2
+
+# Path to the L2 config file (do not embed secrets in the file).
+Environment=IPPAN_L2_CONFIG=/etc/ippan-l2/config.toml
+
+# Run in real L1 HTTP mode
+ExecStart=/opt/ippan-l2/fin-node --l1-mode http run
+
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+

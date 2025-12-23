@@ -8,12 +8,21 @@
 #
 # Environment variables can override TOML values.
 
+[node]
+label = "dev-fin-node"
+
 [l1]
 # IPPAN CORE settlement endpoint (dev environment)
 base_url = "env:L1_BASE_URL"
 # API key from environment
 api_key = "env:L1_API_KEY"
-timeout_ms = 10000
+connect_timeout_ms = 3000
+request_timeout_ms = 10000
+
+[l1.retry]
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 3000
 
 [l1.endpoints]
 chain_status = "env:L1_ENDPOINT_CHAIN_STATUS"

@@ -1,0 +1,22 @@
+[Unit]
+Description=IPPAN Ethereum Oracle Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ippan
+Group=ippan
+WorkingDirectory=/opt/ippan-l2
+
+# Example: store non-secret env in /etc/ippan-l2/env and load via EnvironmentFile=
+# EnvironmentFile=/etc/ippan-l2/env
+
+ExecStart=/opt/ippan-l2/ippan_eth_oracle_daemon watch --config /etc/ippan-l2/oracle.toml
+
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+

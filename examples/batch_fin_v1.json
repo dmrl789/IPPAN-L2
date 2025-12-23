@@ -1,0 +1,16 @@
+{
+  "contract_version": "v1",
+  "hub": "Fin",
+  "batch_id": "batch-fin-example-v1",
+  "sequence": 1,
+  "tx_count": 1,
+  "fee": 1000000,
+  "payload": {
+    "contract_version": "v1",
+    "hub": "Fin",
+    "schema_version": "hub-fin.payload.v1",
+    "content_type": "application/json",
+    "payload": "eyJ0eHMiOlt7ImtpbmQiOiJkZW1vIiwidHhfaWQiOiJ0eC0wMDEifV19"
+  },
+  "idempotency_key": "dIRGvepG4et67dEjTXZ6QWLxw-VPOcOMXvxtvLA8fgM"
+}

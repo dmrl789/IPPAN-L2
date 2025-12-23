@@ -20,6 +20,7 @@ Thumbs.db
 
 # Local data
 /data/
+/receipts/
 
 # Foundry
 integrations/eth-oracle/contracts/cache/
@@ -27,3 +28,11 @@ integrations/eth-oracle/contracts/out/
 
 # Build artifacts
 *.pdb
+
+# Key material (never commit)
+*.key
+*.pem
+*.p12
+*.pfx
+*.seed
+*.secret
