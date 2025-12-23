@@ -101,13 +101,18 @@ export RUST_LOG_FORMAT=json
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/healthz` | GET | Liveness check (always returns 200 if running) |
-| `/readyz` | GET | Readiness check (requires L1 `chain_status`; optional network id match) |
-| `/metrics` | GET | Prometheus metrics (if enabled) |
-| `/recon/pending` | GET | Snapshot of pending reconciliation items (bounded) |
-| `/fin/receipts/:action_id` | GET | FIN action receipt JSON (includes `submit_state`) |
-| `/data/receipts/:action_id` | GET | DATA action receipt JSON (includes `submit_state`) |
-| `/linkage/purchase/:purchase_id` | GET | Linkage purchase receipt JSON (includes `*_submit_state` + `overall_status`) |
+| `/api/v1/healthz` | GET | Liveness check (always returns 200 if running) |
+| `/api/v1/readyz` | GET | Readiness check (requires L1 `chain_status`; optional network id match) |
+| `/api/v1/metrics` | GET | Prometheus metrics (if enabled) |
+| `/api/v1/openapi.json` | GET | OpenAPI 3.1 spec (production integration contract) |
+| `/api/v1/recon/pending` | GET | Snapshot of pending reconciliation items (bounded) |
+| `/api/v1/fin/receipts/:action_id` | GET | FIN action receipt JSON (includes `submit_state`) |
+| `/api/v1/data/receipts/:action_id` | GET | DATA action receipt JSON (includes `submit_state`) |
+| `/api/v1/linkage/purchase/:purchase_id` | GET | Linkage purchase receipt JSON (includes `*_submit_state` + `overall_status`) |
+
+Notes:
+- Legacy unversioned paths (e.g. `/healthz`, `/fin/receipts/:action_id`) may still work for backward compatibility, but new integrations should use `/api/v1/...`.
+- All responses include `X-Request-Id` and `X-Api-Version: v1`.
 
 ## Rate limiting (fin-node HTTP)
 
@@ -173,12 +178,12 @@ Safety notes:
 
 ```bash
 # Liveness (is the process running?)
-curl http://localhost:3000/healthz
+curl http://localhost:3000/api/v1/healthz
 # Response: {"status": "ok"}
 
 # Readiness (is the service ready to handle requests?)
-curl http://localhost:3000/readyz
-# Response: {"status": "ready", "checks": {"l1_rpc": "ok", "storage": "ok"}}
+curl http://localhost:3000/api/v1/readyz
+# Response (ready): {"status":"ready","l1":{"ok":true,"network_id":"...","height":123}}
 ```
 
 ## Metrics

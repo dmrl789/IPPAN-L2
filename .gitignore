@@ -22,6 +22,9 @@ Thumbs.db
 /data/
 /receipts/
 
+# Generated OpenAPI clients (not committed)
+/clients/
+
 # Foundry
 integrations/eth-oracle/contracts/cache/
 integrations/eth-oracle/contracts/out/

@@ -1,0 +1,1674 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "IPPAN fin-node API",
+    "version": "v1",
+    "description": "Production integration surface for IPPAN fin-node. All endpoints are served under `/api/v1/*` (legacy unversioned paths may exist for backward compatibility)."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000"
+    }
+  ],
+  "tags": [
+    { "name": "Health" },
+    { "name": "FIN" },
+    { "name": "DATA" },
+    { "name": "Linkage" },
+    { "name": "Recon" },
+    { "name": "Receipts" }
+  ],
+  "paths": {
+    "/api/v1/healthz": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Liveness check",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/readyz": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Readiness check (L1 connectivity)",
+        "responses": {
+          "200": {
+            "description": "Ready",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadyResponse" }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadyResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/metrics": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Prometheus metrics (if enabled)",
+        "responses": {
+          "200": {
+            "description": "Prometheus text format",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "404": {
+            "description": "Metrics disabled",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Fetch OpenAPI 3.1 spec",
+        "responses": {
+          "200": {
+            "description": "OpenAPI JSON",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/recon/pending": {
+      "get": {
+        "tags": ["Recon"],
+        "summary": "List pending reconciliation items (cursor pagination)",
+        "parameters": [
+          { "$ref": "#/components/parameters/LimitParam" },
+          { "$ref": "#/components/parameters/CursorParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending items",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReconPendingResponse" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/fin/actions": {
+      "post": {
+        "tags": ["FIN"],
+        "summary": "Submit a FIN action (create asset / mint / transfer)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FinActionRequestV1" },
+              "examples": {
+                "create_asset": {
+                  "summary": "Create asset",
+                  "value": {
+                    "type": "create_asset_v1",
+                    "name": "Example USD",
+                    "symbol": "xUSD",
+                    "issuer": "acc-alice",
+                    "decimals": 6,
+                    "metadata_uri": "https://example.com/assets/xusd.json",
+                    "mint_policy": "issuer_only",
+                    "transfer_policy": "free"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted (local apply + L1 submission attempted)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubmitFinActionResponseV1" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/fin/assets/{asset_id}": {
+      "get": {
+        "tags": ["FIN"],
+        "summary": "Get FIN asset definition",
+        "parameters": [
+          {
+            "name": "asset_id",
+            "in": "path",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/Hex32" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Asset",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GetFinAssetResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/fin/balances": {
+      "get": {
+        "tags": ["FIN"],
+        "summary": "Get FIN balance for an account + asset",
+        "parameters": [
+          {
+            "name": "asset_id",
+            "in": "query",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/Hex32" }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/AccountId" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Balance",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FinBalanceResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/fin/receipts/{action_id}": {
+      "get": {
+        "tags": ["Receipts"],
+        "summary": "Fetch FIN action receipt JSON",
+        "parameters": [
+          {
+            "name": "action_id",
+            "in": "path",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/Hex32" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "FIN receipt",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FinReceipt" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/receipts/fin/{action_id}": {
+      "get": {
+        "tags": ["Receipts"],
+        "summary": "Fetch FIN action receipt JSON (legacy alias)",
+        "deprecated": true,
+        "parameters": [
+          {
+            "name": "action_id",
+            "in": "path",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/Hex32" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "FIN receipt",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FinReceipt" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/datasets": {
+      "post": {
+        "tags": ["DATA"],
+        "summary": "Register dataset",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RegisterDatasetRequestV1" },
+              "examples": {
+                "register_dataset": {
+                  "summary": "Register dataset",
+                  "value": {
+                    "owner": "acc-alice",
+                    "name": "Example Dataset v1",
+                    "description": "Demo dataset",
+                    "content_hash": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                    "pointer_uri": "ipfs://bafy.../dataset.json",
+                    "mime_type": "application/json",
+                    "tags": ["example", "dataset"],
+                    "schema_version": 1,
+                    "attestation_policy": "anyone"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted (local apply + L1 submission attempted)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubmitDataActionResponseV1" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/licenses": {
+      "post": {
+        "tags": ["DATA"],
+        "summary": "Issue license",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IssueLicenseRequestV1" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted (local apply + L1 submission attempted)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubmitDataActionResponseV1" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/attestations": {
+      "post": {
+        "tags": ["DATA"],
+        "summary": "Append attestation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AppendAttestationRequestV1" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted (local apply + L1 submission attempted)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubmitDataActionResponseV1" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/listings": {
+      "post": {
+        "tags": ["DATA"],
+        "summary": "Create listing",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateListingRequestV1" },
+              "examples": {
+                "create_listing": {
+                  "summary": "Create listing",
+                  "value": {
+                    "dataset_id": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                    "licensor": "acc-alice",
+                    "rights": "use",
+                    "price_microunits": "1000000",
+                    "currency_asset_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "terms_uri": "https://example.com/terms/v1"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted (local apply + L1 submission attempted)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubmitDataActionResponseV1" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/allowlist/licensors": {
+      "post": {
+        "tags": ["DATA"],
+        "summary": "Allowlist licensor for dataset",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddLicensorRequestV1" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitDataActionResponseV1" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/allowlist/attestors": {
+      "post": {
+        "tags": ["DATA"],
+        "summary": "Allowlist attestor for dataset",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddAttestorRequestV1" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitDataActionResponseV1" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "403": { "$ref": "#/components/responses/PolicyDeniedError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/datasets/{dataset_id}": {
+      "get": {
+        "tags": ["DATA"],
+        "summary": "Get dataset definition",
+        "parameters": [
+          { "name": "dataset_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dataset",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GetDatasetResponse" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/datasets/{dataset_id}/licenses": {
+      "get": {
+        "tags": ["DATA"],
+        "summary": "List licenses by dataset (cursor pagination)",
+        "parameters": [
+          { "name": "dataset_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } },
+          { "$ref": "#/components/parameters/LimitParam" },
+          { "$ref": "#/components/parameters/CursorParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of licenses",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListDatasetLicensesResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/datasets/{dataset_id}/attestations": {
+      "get": {
+        "tags": ["DATA"],
+        "summary": "List attestations by dataset (cursor pagination)",
+        "parameters": [
+          { "name": "dataset_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } },
+          { "$ref": "#/components/parameters/LimitParam" },
+          { "$ref": "#/components/parameters/CursorParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of attestations",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListDatasetAttestationsResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/listings": {
+      "get": {
+        "tags": ["DATA"],
+        "summary": "List listings by dataset (cursor pagination)",
+        "parameters": [
+          { "name": "dataset_id", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } },
+          { "$ref": "#/components/parameters/LimitParam" },
+          { "$ref": "#/components/parameters/CursorParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of listings",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListListingsResponse" },
+                "examples": {
+                  "pagination": {
+                    "summary": "Cursor pagination response",
+                    "value": {
+                      "schema_version": 1,
+                      "dataset_id": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                      "items": [],
+                      "next_cursor": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/entitlements": {
+      "get": {
+        "tags": ["DATA"],
+        "summary": "List entitlements by dataset or by licensee",
+        "description": "Exactly one of `dataset_id` or `licensee` must be provided. Cursor pagination is preferred; legacy `offset` paging is supported when `cursor` is omitted.",
+        "parameters": [
+          { "name": "dataset_id", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/Hex32" } },
+          { "name": "licensee", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/AccountId" } },
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0 } },
+          { "$ref": "#/components/parameters/LimitParam" },
+          { "$ref": "#/components/parameters/CursorParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entitlements (enriched view)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListEntitlementsResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/licenses/{license_id}": {
+      "get": {
+        "tags": ["DATA"],
+        "summary": "Get license definition",
+        "parameters": [
+          { "name": "license_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "License",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GetLicenseResponse" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/data/receipts/{action_id}": {
+      "get": {
+        "tags": ["Receipts"],
+        "summary": "Fetch DATA action receipt JSON",
+        "parameters": [
+          { "name": "action_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "DATA receipt",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DataReceipt" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/receipts/data/{action_id}": {
+      "get": {
+        "tags": ["Receipts"],
+        "summary": "Fetch DATA action receipt JSON (legacy alias)",
+        "deprecated": true,
+        "parameters": [
+          { "name": "action_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "DATA receipt",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DataReceipt" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/linkage/buy-license": {
+      "post": {
+        "tags": ["Linkage"],
+        "summary": "Buy a license (FIN payment + DATA entitlement)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BuyLicenseRequestV1" },
+              "examples": {
+                "buy_license": {
+                  "summary": "Buy license",
+                  "value": {
+                    "dataset_id": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                    "listing_id": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "buyer_account": "acc-bob",
+                    "nonce": "purchase-001",
+                    "memo": "dataset purchase"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Linkage receipt (resume-safe workflow state)",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LinkageReceiptResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "413": { "$ref": "#/components/responses/PayloadTooLargeError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    },
+    "/api/v1/linkage/purchase/{purchase_id}": {
+      "get": {
+        "tags": ["Linkage"],
+        "summary": "Get linkage purchase receipt",
+        "parameters": [
+          { "name": "purchase_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Hex32" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Receipt",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LinkageReceiptResponse" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequestError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "429": { "$ref": "#/components/responses/RateLimitedError" },
+          "503": { "$ref": "#/components/responses/OverloadedError" }
+        }
+      }
+    }
+  },
+  "components": {
+    "headers": {
+      "X-Request-Id": {
+        "description": "Request correlation id generated by fin-node.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 64 }
+      },
+      "X-Api-Version": {
+        "description": "API version string for the response.",
+        "schema": { "type": "string", "enum": ["v1"] }
+      },
+      "Retry-After": {
+        "description": "Seconds to wait before retrying (rate limiting).",
+        "schema": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "parameters": {
+      "LimitParam": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Max number of items to return (bounded by server config).",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+      },
+      "CursorParam": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque cursor string for pagination (exclusive).",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "responses": {
+      "BadRequestError": {
+        "description": "Bad request / validation error",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+          "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "NotFoundError": {
+        "description": "Not found",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+          "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "PayloadTooLargeError": {
+        "description": "Payload too large",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+          "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "PolicyDeniedError": {
+        "description": "Policy denied (when policy/compliance is enabled)",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+          "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "RateLimitedError": {
+        "description": "Rate limited",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+          "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" },
+          "Retry-After": { "$ref": "#/components/headers/Retry-After" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RateLimitedErrorResponse" }
+          }
+        }
+      },
+      "OverloadedError": {
+        "description": "Overloaded / not ready",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+          "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Hex32": {
+        "type": "string",
+        "description": "32-byte identifier encoded as lowercase hex.",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "AccountId": {
+        "type": "string",
+        "description": "Account identifier (current fin-node config enforces max 128 bytes).",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "U128String": {
+        "type": "string",
+        "pattern": "^[0-9]+$",
+        "description": "Unsigned integer serialized as a decimal string (to avoid JS precision loss)."
+      },
+      "Error": {
+        "type": "object",
+        "required": ["code", "message", "request_id"],
+        "properties": {
+          "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "request_id": { "type": "string", "minLength": 1, "maxLength": 64 }
+        },
+        "additionalProperties": false
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "$ref": "#/components/schemas/Error" }
+        },
+        "additionalProperties": false
+      },
+      "RateLimitedErrorResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ErrorResponse" },
+          {
+            "type": "object",
+            "properties": {
+              "retry_after_secs": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok"] }
+        },
+        "additionalProperties": false
+      },
+      "L1StatusSummary": {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "network_id": { "type": "string" },
+          "height": { "type": "integer", "minimum": 0 },
+          "error": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ready", "not_ready"] },
+          "l1": { "anyOf": [{ "$ref": "#/components/schemas/L1StatusSummary" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "SubmitState": {
+        "oneOf": [
+          { "type": "object", "required": ["state"], "properties": { "state": { "const": "not_submitted" } }, "additionalProperties": false },
+          {
+            "type": "object",
+            "required": ["state", "idempotency_key"],
+            "properties": {
+              "state": { "const": "submitted" },
+              "idempotency_key": { "type": "string", "description": "Base64url (no padding) 32-byte idempotency key." },
+              "l1_tx_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["state", "proof_hash"],
+            "properties": {
+              "state": { "const": "included" },
+              "proof_hash": { "type": "string" },
+              "l1_tx_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["state", "proof_hash"],
+            "properties": {
+              "state": { "const": "finalized" },
+              "proof_hash": { "type": "string" },
+              "l1_tx_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["state", "error_code"],
+            "properties": {
+              "state": { "const": "failed" },
+              "error_code": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "L1SubmitResult": {
+        "type": "object",
+        "required": ["accepted"],
+        "properties": {
+          "accepted": { "type": "boolean" },
+          "already_known": { "type": "boolean", "default": false },
+          "l1_tx_id": {
+            "anyOf": [
+              { "type": "string" },
+              { "type": "null" }
+            ]
+          },
+          "error_code": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "message": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "ApplyOutcome": {
+        "type": "string",
+        "enum": ["applied", "already_applied"]
+      },
+      "MintPolicyV1": {
+        "type": "string",
+        "enum": ["issuer_only", "issuer_or_operator", "admin_only"]
+      },
+      "TransferPolicyV1": {
+        "type": "string",
+        "enum": ["free", "allowlist_only", "denylist_only"]
+      },
+      "FinAssetDef": {
+        "type": "object",
+        "required": ["asset_id", "name", "symbol", "issuer", "decimals", "mint_policy", "transfer_policy"],
+        "properties": {
+          "asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "symbol": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "issuer": { "$ref": "#/components/schemas/AccountId" },
+          "decimals": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "metadata_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "mint_policy": { "$ref": "#/components/schemas/MintPolicyV1" },
+          "transfer_policy": { "$ref": "#/components/schemas/TransferPolicyV1" }
+        },
+        "additionalProperties": false
+      },
+      "GetFinAssetResponse": {
+        "type": "object",
+        "required": ["schema_version", "asset"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "asset": { "$ref": "#/components/schemas/FinAssetDef" }
+        },
+        "additionalProperties": false
+      },
+      "FinBalanceResponse": {
+        "type": "object",
+        "required": ["schema_version", "asset_id", "account", "amount_scaled_u128"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "account": { "$ref": "#/components/schemas/AccountId" },
+          "amount_scaled_u128": { "$ref": "#/components/schemas/U128String" }
+        },
+        "additionalProperties": false
+      },
+      "CreateAssetRequestV1": {
+        "type": "object",
+        "required": ["name", "symbol", "issuer", "decimals"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "symbol": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "issuer": { "$ref": "#/components/schemas/AccountId" },
+          "decimals": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "metadata_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "mint_policy": { "$ref": "#/components/schemas/MintPolicyV1" },
+          "transfer_policy": { "$ref": "#/components/schemas/TransferPolicyV1" }
+        },
+        "additionalProperties": false
+      },
+      "MintUnitsV1": {
+        "type": "object",
+        "required": ["asset_id", "to_account", "amount", "client_tx_id"],
+        "properties": {
+          "asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "to_account": { "$ref": "#/components/schemas/AccountId" },
+          "amount": { "$ref": "#/components/schemas/U128String" },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "client_tx_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "memo": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "TransferUnitsV1": {
+        "type": "object",
+        "required": ["asset_id", "from_account", "to_account", "amount", "client_tx_id"],
+        "properties": {
+          "asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "from_account": { "$ref": "#/components/schemas/AccountId" },
+          "to_account": { "$ref": "#/components/schemas/AccountId" },
+          "amount": { "$ref": "#/components/schemas/U128String" },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "client_tx_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "memo": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "purchase_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "FinCreateAssetRequestEnvelopeV1": {
+        "type": "object",
+        "required": ["type", "name", "symbol", "issuer", "decimals"],
+        "properties": {
+          "type": { "const": "create_asset_v1" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "symbol": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "issuer": { "$ref": "#/components/schemas/AccountId" },
+          "decimals": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "metadata_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "mint_policy": { "$ref": "#/components/schemas/MintPolicyV1" },
+          "transfer_policy": { "$ref": "#/components/schemas/TransferPolicyV1" }
+        },
+        "additionalProperties": false
+      },
+      "FinMintUnitsRequestEnvelopeV1": {
+        "type": "object",
+        "required": ["type", "asset_id", "to_account", "amount", "client_tx_id"],
+        "properties": {
+          "type": { "const": "mint_units_v1" },
+          "asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "to_account": { "$ref": "#/components/schemas/AccountId" },
+          "amount": { "$ref": "#/components/schemas/U128String" },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "client_tx_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "memo": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "FinTransferUnitsRequestEnvelopeV1": {
+        "type": "object",
+        "required": ["type", "asset_id", "from_account", "to_account", "amount", "client_tx_id"],
+        "properties": {
+          "type": { "const": "transfer_units_v1" },
+          "asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "from_account": { "$ref": "#/components/schemas/AccountId" },
+          "to_account": { "$ref": "#/components/schemas/AccountId" },
+          "amount": { "$ref": "#/components/schemas/U128String" },
+          "actor": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "client_tx_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "memo": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "purchase_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "FinActionRequestV1": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/FinCreateAssetRequestEnvelopeV1" },
+          { "$ref": "#/components/schemas/FinMintUnitsRequestEnvelopeV1" },
+          { "$ref": "#/components/schemas/FinTransferUnitsRequestEnvelopeV1" }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "create_asset_v1": "#/components/schemas/FinCreateAssetRequestEnvelopeV1",
+            "mint_units_v1": "#/components/schemas/FinMintUnitsRequestEnvelopeV1",
+            "transfer_units_v1": "#/components/schemas/FinTransferUnitsRequestEnvelopeV1"
+          }
+        }
+      },
+      "SubmitFinActionResponseV1": {
+        "type": "object",
+        "required": ["schema_version", "action_id", "local_apply_outcome", "batch_id", "idempotency_key", "l1_submit_result", "receipt_path"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "action_id": { "$ref": "#/components/schemas/Hex32" },
+          "local_apply_outcome": { "$ref": "#/components/schemas/ApplyOutcome" },
+          "asset_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "from_account": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "to_account": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "amount": { "anyOf": [{ "$ref": "#/components/schemas/U128String" }, { "type": "null" }] },
+          "purchase_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "batch_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "l1_submit_result": { "$ref": "#/components/schemas/L1SubmitResult" },
+          "receipt_path": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "additionalProperties": false
+      },
+      "FinReceipt": {
+        "type": "object",
+        "required": ["schema_version", "action_id", "local_apply_outcome", "batch_id", "idempotency_key", "batch_canonical_hash", "l1_submit_result", "submit_state", "written_at"],
+        "properties": {
+          "schema_version": { "type": "integer" },
+          "action_id": { "$ref": "#/components/schemas/Hex32" },
+          "local_apply_outcome": { "$ref": "#/components/schemas/ApplyOutcome" },
+          "asset_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "from_account": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "to_account": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "amount": { "anyOf": [{ "$ref": "#/components/schemas/U128String" }, { "type": "null" }] },
+          "purchase_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "batch_id": { "type": "string" },
+          "idempotency_key": { "type": "string" },
+          "batch_canonical_hash": { "type": "string" },
+          "l1_submit_result": { "$ref": "#/components/schemas/L1SubmitResult" },
+          "submit_state": { "$ref": "#/components/schemas/SubmitState" },
+          "written_at": { "type": "string" },
+          "written_at_unix_secs": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "AttestationPolicyV1": {
+        "type": "string",
+        "enum": ["anyone", "allowlist_only"]
+      },
+      "LicenseRightsV1": {
+        "type": "string",
+        "enum": ["view", "use", "commercial_use", "derivative_use"]
+      },
+      "DataDatasetDef": {
+        "type": "object",
+        "required": ["dataset_id", "owner", "name", "content_hash", "tags", "schema_version", "attestation_policy"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "owner": { "$ref": "#/components/schemas/AccountId" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "description": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "content_hash": { "$ref": "#/components/schemas/Hex32" },
+          "pointer_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "mime_type": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "tags": {
+            "type": "array",
+            "maxItems": 32,
+            "items": { "type": "string", "maxLength": 48 }
+          },
+          "schema_version": { "type": "integer", "minimum": 0 },
+          "attestation_policy": { "$ref": "#/components/schemas/AttestationPolicyV1" }
+        },
+        "additionalProperties": false
+      },
+      "RegisterDatasetRequestV1": {
+        "type": "object",
+        "required": ["owner", "name", "content_hash", "tags", "schema_version"],
+        "properties": {
+          "owner": { "$ref": "#/components/schemas/AccountId" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "description": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "content_hash": { "$ref": "#/components/schemas/Hex32" },
+          "pointer_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "mime_type": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "tags": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 48 } },
+          "schema_version": { "type": "integer", "minimum": 0 },
+          "attestation_policy": { "$ref": "#/components/schemas/AttestationPolicyV1" }
+        },
+        "additionalProperties": false
+      },
+      "IssueLicenseRequestV1": {
+        "type": "object",
+        "required": ["dataset_id", "licensor", "licensee", "rights", "nonce"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensor": { "$ref": "#/components/schemas/AccountId" },
+          "licensee": { "$ref": "#/components/schemas/AccountId" },
+          "rights": { "$ref": "#/components/schemas/LicenseRightsV1" },
+          "terms_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "terms_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "expires_at": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+          "price_microunits": { "anyOf": [{ "$ref": "#/components/schemas/U128String" }, { "type": "null" }] },
+          "nonce": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "additionalProperties": false
+      },
+      "AppendAttestationRequestV1": {
+        "type": "object",
+        "required": ["dataset_id", "attestor", "nonce"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "attestor": { "$ref": "#/components/schemas/AccountId" },
+          "statement": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "statement_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "ref_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "ref_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "nonce": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "additionalProperties": false
+      },
+      "CreateListingRequestV1": {
+        "type": "object",
+        "required": ["dataset_id", "licensor", "rights", "price_microunits", "currency_asset_id"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensor": { "$ref": "#/components/schemas/AccountId" },
+          "rights": { "$ref": "#/components/schemas/LicenseRightsV1" },
+          "price_microunits": { "$ref": "#/components/schemas/U128String" },
+          "currency_asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "terms_uri": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "terms_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "AddLicensorRequestV1": {
+        "type": "object",
+        "required": ["dataset_id", "licensor", "actor"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensor": { "$ref": "#/components/schemas/AccountId" },
+          "actor": { "$ref": "#/components/schemas/AccountId" }
+        },
+        "additionalProperties": false
+      },
+      "AddAttestorRequestV1": {
+        "type": "object",
+        "required": ["dataset_id", "attestor", "actor"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "attestor": { "$ref": "#/components/schemas/AccountId" },
+          "actor": { "$ref": "#/components/schemas/AccountId" }
+        },
+        "additionalProperties": false
+      },
+      "SubmitDataActionResponseV1": {
+        "type": "object",
+        "required": ["schema_version", "action_id", "local_apply_outcome", "batch_id", "idempotency_key", "l1_submit_result", "receipt_path"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "action_id": { "$ref": "#/components/schemas/Hex32" },
+          "local_apply_outcome": { "$ref": "#/components/schemas/ApplyOutcome" },
+          "dataset_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "license_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "attestation_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "listing_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "purchase_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "batch_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "l1_submit_result": { "$ref": "#/components/schemas/L1SubmitResult" },
+          "receipt_path": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "additionalProperties": false
+      },
+      "DataReceipt": {
+        "type": "object",
+        "required": ["schema_version", "action_id", "local_apply_outcome", "batch_id", "idempotency_key", "batch_canonical_hash", "l1_submit_result", "submit_state", "written_at"],
+        "properties": {
+          "schema_version": { "type": "integer" },
+          "action_id": { "$ref": "#/components/schemas/Hex32" },
+          "local_apply_outcome": { "$ref": "#/components/schemas/ApplyOutcome" },
+          "dataset_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "license_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "attestation_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "listing_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "purchase_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "batch_id": { "type": "string" },
+          "idempotency_key": { "type": "string" },
+          "batch_canonical_hash": { "type": "string" },
+          "l1_submit_result": { "$ref": "#/components/schemas/L1SubmitResult" },
+          "submit_state": { "$ref": "#/components/schemas/SubmitState" },
+          "written_at": { "type": "string" },
+          "written_at_unix_secs": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "GetDatasetResponse": {
+        "type": "object",
+        "required": ["schema_version", "dataset"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "dataset": { "$ref": "#/components/schemas/DataDatasetDef" }
+        },
+        "additionalProperties": false
+      },
+      "DataLicenseDef": {
+        "type": "object",
+        "required": ["dataset_id", "license_id", "licensor", "licensee", "rights", "nonce"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "license_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensor": { "$ref": "#/components/schemas/AccountId" },
+          "licensee": { "$ref": "#/components/schemas/AccountId" },
+          "rights": { "$ref": "#/components/schemas/LicenseRightsV1" },
+          "terms_uri": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "terms_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "expires_at": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+          "price_microunits": { "anyOf": [{ "$ref": "#/components/schemas/U128String" }, { "type": "null" }] },
+          "nonce": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "GetLicenseResponse": {
+        "type": "object",
+        "required": ["schema_version", "license"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "license": { "$ref": "#/components/schemas/DataLicenseDef" }
+        },
+        "additionalProperties": false
+      },
+      "DataAttestationDef": {
+        "type": "object",
+        "required": ["dataset_id", "attestation_id", "attestor", "statement_hash", "nonce"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "attestation_id": { "$ref": "#/components/schemas/Hex32" },
+          "attestor": { "$ref": "#/components/schemas/AccountId" },
+          "statement": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "statement_hash": { "$ref": "#/components/schemas/Hex32" },
+          "ref_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "ref_uri": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "nonce": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "DataListingDef": {
+        "type": "object",
+        "required": ["dataset_id", "listing_id", "licensor", "rights", "price_microunits", "currency_asset_id"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "listing_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensor": { "$ref": "#/components/schemas/AccountId" },
+          "rights": { "$ref": "#/components/schemas/LicenseRightsV1" },
+          "price_microunits": { "$ref": "#/components/schemas/U128String" },
+          "currency_asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "terms_uri": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "terms_hash": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "ListDatasetLicensesResponse": {
+        "type": "object",
+        "required": ["schema_version", "dataset_id", "items", "next_cursor"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/DataLicenseDef" } },
+          "next_cursor": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "ListDatasetAttestationsResponse": {
+        "type": "object",
+        "required": ["schema_version", "dataset_id", "items", "next_cursor"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/DataAttestationDef" } },
+          "next_cursor": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "ListListingsResponse": {
+        "type": "object",
+        "required": ["schema_version", "dataset_id", "items", "next_cursor"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/DataListingDef" } },
+          "next_cursor": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "DataEntitlementView": {
+        "type": "object",
+        "required": ["purchase_id", "dataset_id", "listing_id", "licensee", "status", "references"],
+        "properties": {
+          "purchase_id": { "$ref": "#/components/schemas/Hex32" },
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "listing_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensee": { "$ref": "#/components/schemas/AccountId" },
+          "price_microunits": { "anyOf": [{ "$ref": "#/components/schemas/U128String" }, { "type": "null" }] },
+          "currency_asset_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "status": { "type": "string", "enum": ["entitled"] },
+          "references": {
+            "type": "object",
+            "required": ["fin_action_id", "fin_receipt_hash", "data_action_id", "license_id"],
+            "properties": {
+              "fin_action_id": { "$ref": "#/components/schemas/Hex32" },
+              "fin_receipt_hash": { "$ref": "#/components/schemas/Hex32" },
+              "data_action_id": { "type": "string", "minLength": 1 },
+              "license_id": { "$ref": "#/components/schemas/Hex32" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "ListEntitlementsResponse": {
+        "type": "object",
+        "required": ["schema_version", "items"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "dataset_id": { "anyOf": [{ "$ref": "#/components/schemas/Hex32" }, { "type": "null" }] },
+          "licensee": { "anyOf": [{ "$ref": "#/components/schemas/AccountId" }, { "type": "null" }] },
+          "offset": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+          "limit": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/DataEntitlementView" } },
+          "next_cursor": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "BuyLicenseRequestV1": {
+        "type": "object",
+        "required": ["dataset_id", "listing_id", "buyer_account"],
+        "properties": {
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "listing_id": { "$ref": "#/components/schemas/Hex32" },
+          "buyer_account": { "$ref": "#/components/schemas/AccountId" },
+          "nonce": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] },
+          "memo": { "anyOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "LinkageStatus": { "type": "string", "enum": ["created", "paid", "entitled", "failed_recoverable"] },
+      "LinkageOverallStatus": {
+        "type": "string",
+        "enum": [
+          "created",
+          "payment_pending_finality",
+          "paid_final",
+          "entitlement_pending_finality",
+          "entitled_final",
+          "failed_recoverable"
+        ]
+      },
+      "EntitlementPolicy": { "type": "string", "enum": ["optimistic", "finality_required"] },
+      "PaymentRef": {
+        "type": "object",
+        "required": ["fin_action_id", "fin_receipt_hash"],
+        "properties": {
+          "fin_action_id": { "$ref": "#/components/schemas/Hex32" },
+          "fin_receipt_hash": { "$ref": "#/components/schemas/Hex32" }
+        },
+        "additionalProperties": false
+      },
+      "EntitlementRef": {
+        "type": "object",
+        "required": ["data_action_id", "license_id"],
+        "properties": {
+          "data_action_id": { "$ref": "#/components/schemas/Hex32" },
+          "license_id": { "$ref": "#/components/schemas/Hex32" }
+        },
+        "additionalProperties": false
+      },
+      "LinkageReceipt": {
+        "type": "object",
+        "required": [
+          "purchase_id",
+          "dataset_id",
+          "listing_id",
+          "licensee",
+          "price_microunits",
+          "currency_asset_id",
+          "policy",
+          "payment_submit_state",
+          "entitlement_submit_state",
+          "overall_status",
+          "status"
+        ],
+        "properties": {
+          "purchase_id": { "$ref": "#/components/schemas/Hex32" },
+          "dataset_id": { "$ref": "#/components/schemas/Hex32" },
+          "listing_id": { "$ref": "#/components/schemas/Hex32" },
+          "licensee": { "$ref": "#/components/schemas/AccountId" },
+          "price_microunits": { "type": "integer", "minimum": 0 },
+          "currency_asset_id": { "$ref": "#/components/schemas/Hex32" },
+          "payment_ref": { "anyOf": [{ "$ref": "#/components/schemas/PaymentRef" }, { "type": "null" }] },
+          "entitlement_ref": { "anyOf": [{ "$ref": "#/components/schemas/EntitlementRef" }, { "type": "null" }] },
+          "policy": { "$ref": "#/components/schemas/EntitlementPolicy" },
+          "payment_submit_state": { "$ref": "#/components/schemas/SubmitState" },
+          "entitlement_submit_state": { "$ref": "#/components/schemas/SubmitState" },
+          "overall_status": { "$ref": "#/components/schemas/LinkageOverallStatus" },
+          "status": { "$ref": "#/components/schemas/LinkageStatus" },
+          "last_error": { "anyOf": [{ "type": "string", "maxLength": 256 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "LinkageReceiptResponse": {
+        "type": "object",
+        "required": ["schema_version", "receipt"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "receipt": { "$ref": "#/components/schemas/LinkageReceipt" }
+        },
+        "additionalProperties": false
+      },
+      "ReconKind": { "type": "string", "enum": ["fin_action", "data_action", "linkage_purchase"] },
+      "ReconMetadata": {
+        "type": "object",
+        "required": ["next_check_at", "attempts"],
+        "properties": {
+          "next_check_at": { "type": "integer", "minimum": 0 },
+          "attempts": { "type": "integer", "minimum": 0 },
+          "last_error": { "type": "string", "maxLength": 256 }
+        },
+        "additionalProperties": false
+      },
+      "ReconItem": {
+        "type": "object",
+        "required": ["kind", "id", "meta"],
+        "properties": {
+          "kind": { "$ref": "#/components/schemas/ReconKind" },
+          "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "meta": { "$ref": "#/components/schemas/ReconMetadata" }
+        },
+        "additionalProperties": false
+      },
+      "ReconPendingResponse": {
+        "type": "object",
+        "required": ["schema_version", "pending", "next_cursor"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "pending": { "type": "array", "items": { "$ref": "#/components/schemas/ReconItem" } },
+          "next_cursor": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}
+

@@ -44,6 +44,14 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
+  openapi-drift:
+    name: OpenAPI Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check OpenAPI drift
+        run: bash scripts/check_openapi_drift.sh
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -94,7 +102,7 @@ jobs:
   # Summary job that depends on all checks
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, test, build, audit, deny, solidity]
+    needs: [fmt, clippy, test, openapi-drift, build, audit, deny, solidity]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -103,6 +111,7 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.openapi-drift.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]] || \
              [[ "${{ needs.audit.result }}" != "success" ]] || \
              [[ "${{ needs.deny.result }}" != "success" ]] || \

@@ -20,6 +20,8 @@ use tiny_http::{Header, Response, Server};
 use tracing::{info, warn};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+const API_VERSION: &str = "v1";
+static OPENAPI_SPEC_V1: &str = include_str!("../../docs/openapi/fin-node.openapi.json");
 
 #[derive(Debug, Serialize)]
 struct HealthResponse<'a> {
@@ -105,6 +107,7 @@ pub fn serve(
         let url = req.url().to_string();
         let method = req.method().as_str().to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+        let (path, is_versioned) = strip_api_v1_prefix(path);
         let route = route_label(method.as_str(), path);
         let ip = req
             .remote_addr()
@@ -160,6 +163,13 @@ pub fn serve(
             }
             ("GET", "/metrics") => {
                 Response::from_string("metrics disabled\n").with_status_code(404)
+            }
+            // OpenAPI (v1): served only under the versioned prefix.
+            ("GET", "/openapi.json") if is_versioned => {
+                let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+                Response::from_string(OPENAPI_SPEC_V1)
+                    .with_status_code(200)
+                    .with_header(h)
             }
             ("GET", "/recon/pending") => {
                 if let Some(store) = recon.as_ref() {
@@ -840,6 +850,8 @@ fn with_common_headers(
     let mut resp =
         resp.with_header(Header::from_bytes(&b"X-Request-Id"[..], request_id.as_bytes()).unwrap());
     resp = resp
+        .with_header(Header::from_bytes(&b"X-Api-Version"[..], API_VERSION.as_bytes()).unwrap());
+    resp = resp
         .with_header(Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap());
     if cors.enabled {
         if let Some(origin) = origin {
@@ -1167,6 +1179,7 @@ fn route_label(method: &str, path: &str) -> &'static str {
         ("GET", "/healthz") => "GET /healthz",
         ("GET", "/readyz") => "GET /readyz",
         ("GET", "/metrics") => "GET /metrics",
+        ("GET", "/openapi.json") => "GET /openapi.json",
         ("GET", "/recon/pending") => "GET /recon/pending",
         ("POST", "/fin/actions") => "POST /fin/actions",
         ("POST", "/data/datasets") => "POST /data/datasets",
@@ -1208,6 +1221,27 @@ fn route_label(method: &str, path: &str) -> &'static str {
             }
         }
     }
+}
+
+/// Strip `/api/v1` prefix from the path, if present.
+///
+/// This enables `/api/v1/...` routing while keeping legacy (unversioned) paths working.
+fn strip_api_v1_prefix(path: &str) -> (&str, bool) {
+    const PREFIX: &str = "/api/v1";
+    if path == PREFIX {
+        return ("/", true);
+    }
+    if let Some(rest) = path.strip_prefix(PREFIX) {
+        if rest.is_empty() {
+            return ("/", true);
+        }
+        if rest.starts_with('/') {
+            return (rest, true);
+        }
+        // Defensive: only treat it as a prefix when it splits on `/`.
+        return (path, false);
+    }
+    (path, false)
 }
 
 fn readiness_body(l1: &dyn L1Client, expected_network_id: Option<&str>) -> (u16, String) {
