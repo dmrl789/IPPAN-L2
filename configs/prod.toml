@@ -53,6 +53,29 @@ data_enabled = true
 # IMPORTANT: Must be on persistent volume in containerized deployments
 path = "/var/lib/ippan-l2/prod"
 
+# fin-node storage roots (used by this repo's fin-node config loader).
+# Note: `path` above is not consumed by fin-node; prefer explicit dirs below.
+receipts_dir = "/var/lib/ippan-l2/prod/receipts"
+fin_db_dir = "/var/lib/ippan-l2/prod/fin_db"
+data_db_dir = "/var/lib/ippan-l2/prod/data_db"
+policy_db_dir = "/var/lib/ippan-l2/prod/policy_db"
+recon_db_dir = "/var/lib/ippan-l2/prod/recon_db"
+
+[recon]
+# Production recommendation: slower polling, bounded backoff.
+enabled = true
+interval_secs = 30
+batch_limit = 50
+max_scan = 20000
+max_attempts = 200
+base_delay_secs = 2
+max_delay_secs = 300
+
+[linkage]
+# For strict settlement semantics, set:
+# entitlement_policy = "finality_required"
+entitlement_policy = "optimistic"
+
 [logging]
 # Log level: trace, debug, info, warn, error
 # Use "info" or "warn" in production

@@ -14,6 +14,23 @@ receipts_dir = "receipts"
 fin_db_dir = "fin_db"
 data_db_dir = "data_db"
 policy_db_dir = "policy_db"
+recon_db_dir = "recon_db"
+
+[recon]
+# Enable the persistent reconciliation loop (recommended).
+enabled = true
+# Base tick interval; per-item scheduling is controlled via `next_check_at` in the recon DB.
+interval_secs = 30
+batch_limit = 50
+max_scan = 5000
+max_attempts = 50
+base_delay_secs = 2
+max_delay_secs = 300
+
+[linkage]
+# "optimistic" (MVP): grant entitlement immediately after payment submit.
+# "finality_required": do not grant entitlement until payment is finalized on L1.
+entitlement_policy = "optimistic"
 
 [policy]
 mode = "permissive"

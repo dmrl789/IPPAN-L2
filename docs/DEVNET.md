@@ -42,6 +42,25 @@ Endpoints:
 - `GET /healthz`
 - `GET /readyz` (requires L1 status reachability; optionally network id match)
 - `GET /metrics` (Prometheus)
+- `GET /recon/pending` (reconciliation queue snapshot)
+
+### Linkage policy: finality-required entitlements
+
+To require **L1 finality** of the FIN payment before the DATA entitlement is granted:
+
+1) Set in config:
+
+```toml
+[linkage]
+entitlement_policy = "finality_required"
+```
+
+2) Ensure reconciliation is enabled (required for progress):
+
+```toml
+[recon]
+enabled = true
+```
 
 ## Manual smoke (optional, uses real devnet)
 

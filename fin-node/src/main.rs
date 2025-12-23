@@ -10,6 +10,8 @@ mod linkage;
 mod metrics;
 mod policy_runtime;
 mod policy_store;
+mod recon;
+mod recon_store;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
@@ -287,6 +289,20 @@ fn main() {
                 .as_ref()
                 .map(|c| c.storage.policy_db_dir.as_str())
                 .unwrap_or("policy_db");
+            let recon_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.recon_db_dir.as_str())
+                .unwrap_or("recon_db");
+
+            let recon_cfg = cfg.as_ref().map(|c| c.recon.clone());
+            let recon_store = if recon_cfg.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                Some(
+                    recon_store::ReconStore::open(recon_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string())),
+                )
+            } else {
+                None
+            };
 
             let policy_store = policy_store::PolicyStore::open(policy_db_dir)
                 .unwrap_or_else(|e| exit_err(&e.to_string()));
@@ -316,28 +332,82 @@ fn main() {
             let store =
                 hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_fin(&store);
-            let fin_api = fin_api::FinApi::new_with_policy(
+            let fin_api = fin_api::FinApi::new_with_policy_and_recon(
                 l1.clone(),
                 store,
                 PathBuf::from(receipts_dir),
                 policy.clone(),
+                recon_store.clone(),
             );
 
             let data_store =
                 hub_data::DataStore::open(data_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_data(&data_store);
-            let data_api = data_api::DataApi::new_with_policy(
+            let data_api = data_api::DataApi::new_with_policy_and_recon(
                 l1.clone(),
                 data_store,
                 PathBuf::from(receipts_dir),
                 policy,
+                recon_store.clone(),
             );
 
-            let linkage_api = linkage::LinkageApi::new(
+            let linkage_policy = cfg
+                .as_ref()
+                .map(|c| c.linkage.entitlement_policy)
+                .unwrap_or(config::LinkageEntitlementPolicy::Optimistic);
+            let linkage_policy = match linkage_policy {
+                config::LinkageEntitlementPolicy::Optimistic => {
+                    l2_core::hub_linkage::EntitlementPolicy::Optimistic
+                }
+                config::LinkageEntitlementPolicy::FinalityRequired => {
+                    l2_core::hub_linkage::EntitlementPolicy::FinalityRequired
+                }
+            };
+
+            let linkage_api = linkage::LinkageApi::new_with_policy_and_recon(
                 fin_api.clone(),
                 data_api.clone(),
                 PathBuf::from(receipts_dir),
+                linkage_policy,
+                recon_store.clone(),
             );
+
+            // Start the reconciliation loop (bounded, persistent, restart-safe).
+            if let (Some(store), Some(rcfg)) = (recon_store.clone(), recon_cfg.clone()) {
+                if rcfg.enabled {
+                    let reconciler = recon::Reconciler::new(
+                        l1.clone(),
+                        fin_api.clone(),
+                        data_api.clone(),
+                        linkage_api.clone(),
+                        store,
+                        recon::ReconLoopConfig {
+                            interval_secs: rcfg.interval_secs,
+                            batch_limit: rcfg.batch_limit,
+                            max_scan: rcfg.max_scan,
+                            max_attempts: rcfg.max_attempts,
+                            base_delay_secs: rcfg.base_delay_secs,
+                            max_delay_secs: rcfg.max_delay_secs,
+                        },
+                    );
+                    std::thread::spawn(move || {
+                        info!(
+                            event = "recon_loop_started",
+                            interval_secs = rcfg.interval_secs
+                        );
+                        let interval =
+                            std::time::Duration::from_secs(u64::max(1, rcfg.interval_secs));
+                        loop {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            reconciler.tick(now);
+                            std::thread::sleep(interval);
+                        }
+                    });
+                }
+            }
 
             http_server::serve(
                 bind,
@@ -347,6 +417,7 @@ fn main() {
                 fin_api,
                 data_api,
                 linkage_api,
+                recon_store,
             )
             .unwrap_or_else(|e| exit_err(&e));
         }

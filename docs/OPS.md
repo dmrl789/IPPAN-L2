@@ -104,6 +104,10 @@ export RUST_LOG_FORMAT=json
 | `/healthz` | GET | Liveness check (always returns 200 if running) |
 | `/readyz` | GET | Readiness check (requires L1 `chain_status`; optional network id match) |
 | `/metrics` | GET | Prometheus metrics (if enabled) |
+| `/recon/pending` | GET | Snapshot of pending reconciliation items (bounded) |
+| `/fin/receipts/:action_id` | GET | FIN action receipt JSON (includes `submit_state`) |
+| `/data/receipts/:action_id` | GET | DATA action receipt JSON (includes `submit_state`) |
+| `/linkage/purchase/:purchase_id` | GET | Linkage purchase receipt JSON (includes `*_submit_state` + `overall_status`) |
 
 ### Health Check Examples
 
@@ -129,6 +133,9 @@ When metrics are enabled, the following metrics are exposed:
 | `l1_requests_total{method,status}` | Counter | L1 requests (status includes `ok`, http code, or error class) |
 | `l1_request_failures_total{reason}` | Counter | L1 request failures by reason |
 | `submit_batches_total{result}` | Counter | Batch submits (`accepted`,`already_known`,`rejected`) |
+| `recon_pending_total{kind}` | Gauge | Pending reconciliation items |
+| `recon_checks_total{kind,result}` | Counter | Recon checks (`checked`,`included`,`finalized`, etc.) |
+| `recon_failures_total{kind,reason}` | Counter | Recon failures by reason |
 | `ippan_oracle_poll_total` | Counter | Oracle poll iterations |
 | `ippan_oracle_push_total` | Counter | Scores pushed to Ethereum |
 

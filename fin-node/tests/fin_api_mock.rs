@@ -75,7 +75,7 @@ fn fin_api_submit_create_asset_and_mint_updates_state_and_writes_receipts() {
         .expect("get receipt")
         .expect("receipt exists");
     let receipt: serde_json::Value = serde_json::from_slice(&receipt_raw).expect("receipt json");
-    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["schema_version"], 2);
     assert_eq!(receipt["action_id"], mint.action_id);
 
     // L1 submit was called (mock inclusion exists).

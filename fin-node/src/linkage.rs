@@ -5,27 +5,60 @@ use crate::fin_api::ApiError as FinApiError;
 use crate::{data_api::DataApi, fin_api::FinApi};
 use hub_fin::{AmountU128, FinActionV1, FinEnvelopeV1, TransferUnitsV1};
 use l2_core::hub_linkage::{
-    derive_purchase_id_v1, EntitlementRef, Hex32 as LinkHex32, LinkageReceiptV1, LinkageStatus,
-    PaymentRef,
+    derive_purchase_id_v1, EntitlementPolicy, EntitlementRef, Hex32 as LinkHex32,
+    LinkageOverallStatus, LinkageReceiptV1, LinkageStatus, PaymentRef,
 };
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
+
 #[derive(Clone)]
 pub struct LinkageApi {
     fin: FinApi,
     data: DataApi,
     receipts_dir: PathBuf,
+    entitlement_policy: EntitlementPolicy,
+    recon: Option<ReconStore>,
 }
 
 impl LinkageApi {
+    #[allow(dead_code)]
     pub fn new(fin: FinApi, data: DataApi, receipts_dir: PathBuf) -> Self {
+        Self::new_with_policy_and_recon(
+            fin,
+            data,
+            receipts_dir,
+            EntitlementPolicy::Optimistic,
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn new_with_policy(
+        fin: FinApi,
+        data: DataApi,
+        receipts_dir: PathBuf,
+        entitlement_policy: EntitlementPolicy,
+    ) -> Self {
+        Self::new_with_policy_and_recon(fin, data, receipts_dir, entitlement_policy, None)
+    }
+
+    pub fn new_with_policy_and_recon(
+        fin: FinApi,
+        data: DataApi,
+        receipts_dir: PathBuf,
+        entitlement_policy: EntitlementPolicy,
+        recon: Option<ReconStore>,
+    ) -> Self {
         Self {
             fin,
             data,
             receipts_dir,
+            entitlement_policy,
+            recon,
         }
     }
 
@@ -68,6 +101,13 @@ impl LinkageApi {
             currency_asset_id_link,
         )?;
 
+        // Persist the policy choice at creation time (do not silently change existing purchases).
+        if receipt.overall_status == LinkageOverallStatus::Created
+            && receipt.policy == EntitlementPolicy::Optimistic
+        {
+            receipt.policy = self.entitlement_policy;
+        }
+
         // If already entitled, return immediately (idempotent).
         if receipt.status == LinkageStatus::Entitled && receipt.entitlement_ref.is_some() {
             return Ok(receipt);
@@ -76,14 +116,34 @@ impl LinkageApi {
         // Step 1: payment (FIN transfer).
         if receipt.payment_ref.is_none() {
             match self.execute_payment(&listing, &receipt, req.memo.as_deref()) {
-                Ok((payment_ref, status)) => {
+                Ok((payment_ref, submit_state, status)) => {
                     receipt.payment_ref = Some(payment_ref);
                     receipt.status = status;
+                    receipt.payment_submit_state = submit_state;
+                    receipt.overall_status = match receipt.policy {
+                        EntitlementPolicy::Optimistic => LinkageOverallStatus::PaidFinal,
+                        EntitlementPolicy::FinalityRequired => {
+                            LinkageOverallStatus::PaymentPendingFinality
+                        }
+                    };
                     receipt.last_error = None;
                     self.persist_receipt(&receipt)?;
+
+                    if receipt.policy == EntitlementPolicy::FinalityRequired {
+                        if let Some(recon) = self.recon.as_ref() {
+                            let now = unix_now_secs();
+                            let meta = ReconMetadata::new(now);
+                            let _ = recon.enqueue(
+                                ReconKind::LinkagePurchase,
+                                &receipt.purchase_id.to_hex(),
+                                &meta,
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     receipt.status = LinkageStatus::FailedRecoverable;
+                    receipt.overall_status = LinkageOverallStatus::FailedRecoverable;
                     receipt.last_error = Some(sanitize_error(&e.to_string()));
                     self.persist_receipt(&receipt)?;
                     return Err(e);
@@ -92,12 +152,26 @@ impl LinkageApi {
         } else if receipt.status == LinkageStatus::Created {
             // Recover from partial state where `payment_ref` was written but status was not.
             receipt.status = LinkageStatus::Paid;
+            if receipt.overall_status == LinkageOverallStatus::Created {
+                receipt.overall_status = match receipt.policy {
+                    EntitlementPolicy::Optimistic => LinkageOverallStatus::PaidFinal,
+                    EntitlementPolicy::FinalityRequired => {
+                        LinkageOverallStatus::PaymentPendingFinality
+                    }
+                };
+            }
             self.persist_receipt(&receipt)?;
+        }
+
+        // Finality-gated mode stops here; the reconciliation loop will continue once payment is final.
+        if receipt.policy == EntitlementPolicy::FinalityRequired {
+            return Ok(receipt);
         }
 
         // Step 2: entitlement (DATA grant).
         if receipt.entitlement_ref.is_none() && self.failpoint_after_payment_exists() {
             receipt.status = LinkageStatus::FailedRecoverable;
+            receipt.overall_status = LinkageOverallStatus::FailedRecoverable;
             receipt.last_error = Some("failpoint:after_payment".to_string());
             self.persist_receipt(&receipt)?;
             return Err(ApiError::Internal("failpoint after_payment".to_string()));
@@ -108,14 +182,17 @@ impl LinkageApi {
                 ApiError::Internal("missing payment_ref after payment step".to_string())
             })?;
             match self.execute_entitlement(&listing, &receipt, payment_ref) {
-                Ok(ent_ref) => {
+                Ok((ent_ref, submit_state)) => {
                     receipt.entitlement_ref = Some(ent_ref);
                     receipt.status = LinkageStatus::Entitled;
+                    receipt.entitlement_submit_state = submit_state;
+                    receipt.overall_status = LinkageOverallStatus::EntitledFinal;
                     receipt.last_error = None;
                     self.persist_receipt(&receipt)?;
                 }
                 Err(e) => {
                     receipt.status = LinkageStatus::FailedRecoverable;
+                    receipt.overall_status = LinkageOverallStatus::FailedRecoverable;
                     receipt.last_error = Some(sanitize_error(&e.to_string()));
                     self.persist_receipt(&receipt)?;
                     return Err(e);
@@ -142,12 +219,37 @@ impl LinkageApi {
         Ok(Some(v))
     }
 
+    pub fn persist_purchase_receipt(&self, receipt: &LinkageReceiptV1) -> Result<(), ApiError> {
+        self.persist_receipt(receipt)
+    }
+
+    /// Continue the workflow by submitting the DATA entitlement grant.
+    ///
+    /// This is intended for the reconciliation loop (resume-safe continuation).
+    pub fn submit_entitlement_for_receipt(
+        &self,
+        receipt: &LinkageReceiptV1,
+    ) -> Result<(EntitlementRef, l2_core::finality::SubmitState), ApiError> {
+        let listing_id = hub_data::Hex32(receipt.listing_id.0);
+        let listing = self
+            .data
+            .get_listing_typed(listing_id)
+            .map_err(ApiError::from_data_api)?
+            .ok_or_else(|| ApiError::BadRequest("listing_id not found".to_string()))?;
+
+        let payment_ref = receipt.payment_ref.ok_or_else(|| {
+            ApiError::Internal("missing payment_ref while continuing entitlement".to_string())
+        })?;
+
+        self.execute_entitlement(&listing, receipt, payment_ref)
+    }
+
     fn execute_payment(
         &self,
         listing: &hub_data::CreateListingV1,
         receipt: &LinkageReceiptV1,
         memo: Option<&str>,
-    ) -> Result<(PaymentRef, LinkageStatus), ApiError> {
+    ) -> Result<(PaymentRef, l2_core::finality::SubmitState, LinkageStatus), ApiError> {
         let asset_id = hub_fin::Hex32(listing.currency_asset_id.0);
         let amount = AmountU128(listing.price_microunits.0);
 
@@ -175,16 +277,26 @@ impl LinkageApi {
         env_hash.copy_from_slice(blake3::hash(&env_bytes).as_bytes());
 
         // Submit via fin api (apply + L1 submit + receipt persistence).
-        let _ = self
+        let submit = self
             .fin
             .submit_action_obj(action)
             .map_err(ApiError::from_fin_api)?;
+
+        let submit_state = l2_core::finality::SubmitState::Submitted {
+            idempotency_key: submit.idempotency_key.clone(),
+            l1_tx_id: submit
+                .l1_submit_result
+                .l1_tx_id
+                .as_ref()
+                .map(|x| x.0.clone()),
+        };
 
         Ok((
             PaymentRef {
                 fin_action_id: LinkHex32(action_id.0),
                 fin_receipt_hash: LinkHex32(env_hash),
             },
+            submit_state,
             LinkageStatus::Paid,
         ))
     }
@@ -194,7 +306,7 @@ impl LinkageApi {
         listing: &hub_data::CreateListingV1,
         receipt: &LinkageReceiptV1,
         payment_ref: PaymentRef,
-    ) -> Result<EntitlementRef, ApiError> {
+    ) -> Result<(EntitlementRef, l2_core::finality::SubmitState), ApiError> {
         let req = hub_data::GrantEntitlementRequestV1 {
             purchase_id: receipt.purchase_id,
             listing_id: listing.listing_id,
@@ -217,15 +329,27 @@ impl LinkageApi {
             }
         };
 
-        let _ = self
+        let submit = self
             .data
             .submit_action_obj(env.action)
             .map_err(ApiError::from_data_api)?;
 
-        Ok(EntitlementRef {
-            data_action_id,
-            license_id,
-        })
+        let submit_state = l2_core::finality::SubmitState::Submitted {
+            idempotency_key: submit.idempotency_key.clone(),
+            l1_tx_id: submit
+                .l1_submit_result
+                .l1_tx_id
+                .as_ref()
+                .map(|x| x.0.clone()),
+        };
+
+        Ok((
+            EntitlementRef {
+                data_action_id,
+                license_id,
+            },
+            submit_state,
+        ))
     }
 
     fn load_or_init_receipt(
@@ -254,6 +378,10 @@ impl LinkageApi {
             currency_asset_id,
             payment_ref: None,
             entitlement_ref: None,
+            policy: self.entitlement_policy,
+            payment_submit_state: l2_core::finality::SubmitState::NotSubmitted,
+            entitlement_submit_state: l2_core::finality::SubmitState::NotSubmitted,
+            overall_status: LinkageOverallStatus::Created,
             status: LinkageStatus::Created,
             last_error: None,
         };
@@ -339,4 +467,11 @@ fn sanitize_error(s: &str) -> String {
         out.truncate(MAX);
     }
     out
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

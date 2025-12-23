@@ -16,12 +16,23 @@ pub struct MockL1Client {
     finalized_height: Mutex<u64>,
     time_micros: Mutex<u64>,
     submitted: Mutex<HashMap<IdempotencyKey, StoredSubmission>>,
+    staged: Mutex<HashMap<IdempotencyKey, StagedDelays>>,
 }
 
 #[derive(Debug, Clone)]
 struct StoredSubmission {
     l1_tx_id: L1TxId,
     envelope_hash: [u8; 32],
+    inclusion_none_before_some: u32,
+    finality_none_before_some: u32,
+    inclusion_checks: u32,
+    finality_checks: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StagedDelays {
+    inclusion_none_before_some: u32,
+    finality_none_before_some: u32,
 }
 
 impl MockL1Client {
@@ -32,7 +43,55 @@ impl MockL1Client {
             finalized_height: Mutex::new(0),
             time_micros: Mutex::new(1_700_000_000_000_000), // deterministic default
             submitted: Mutex::new(HashMap::new()),
+            staged: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure staged inclusion/finality responses for a given idempotency key.
+    ///
+    /// - `inclusion_none_before_some = N`: the first N inclusion checks return None, then Some.
+    /// - `finality_none_before_some = N`: the first N finality checks return None, then Some.
+    pub fn set_staged_delays(
+        &self,
+        idempotency_key: &IdempotencyKey,
+        inclusion_none_before_some: u32,
+        finality_none_before_some: u32,
+    ) {
+        let mut staged = self.staged.lock().expect("mutex poisoned");
+        staged.insert(
+            *idempotency_key,
+            StagedDelays {
+                inclusion_none_before_some,
+                finality_none_before_some,
+            },
+        );
+
+        // If already submitted, update the stored thresholds too (so tests can configure after submit).
+        let mut submitted = self.submitted.lock().expect("mutex poisoned");
+        if let Some(s) = submitted.get_mut(idempotency_key) {
+            s.inclusion_none_before_some = inclusion_none_before_some;
+            s.finality_none_before_some = finality_none_before_some;
+        }
+    }
+
+    /// Convenience helper to configure staged responses using base64url key string.
+    pub fn set_staged_delays_b64(
+        &self,
+        idempotency_key_b64: &str,
+        inclusion_none_before_some: u32,
+        finality_none_before_some: u32,
+    ) -> Result<(), String> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(idempotency_key_b64.as_bytes())
+            .map_err(|e| format!("invalid base64url idempotency_key: {e}"))?;
+        if bytes.len() != 32 {
+            return Err(format!("expected 32 bytes, got {}", bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        let key = IdempotencyKey(out);
+        self.set_staged_delays(&key, inclusion_none_before_some, finality_none_before_some);
+        Ok(())
     }
 
     fn next_height(&self) -> u64 {
@@ -115,11 +174,23 @@ impl L1Client for MockL1Client {
         self.maybe_finalize(new_height);
 
         let l1_tx_id = Self::make_tx_id(&batch.idempotency_key);
+        let staged = self.staged.lock().expect("mutex poisoned");
+        let delays = staged
+            .get(&batch.idempotency_key)
+            .copied()
+            .unwrap_or(StagedDelays {
+                inclusion_none_before_some: 0,
+                finality_none_before_some: 0,
+            });
         submitted.insert(
             batch.idempotency_key,
             StoredSubmission {
                 l1_tx_id: l1_tx_id.clone(),
                 envelope_hash,
+                inclusion_none_before_some: delays.inclusion_none_before_some,
+                finality_none_before_some: delays.finality_none_before_some,
+                inclusion_checks: 0,
+                finality_checks: 0,
             },
         );
 
@@ -136,15 +207,20 @@ impl L1Client for MockL1Client {
         &self,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Option<L1InclusionProof>, L1ClientError> {
-        let submitted = self.submitted.lock().expect("mutex poisoned");
-        let stored = match submitted.get(idempotency_key) {
-            Some(s) => s.clone(),
+        let mut submitted = self.submitted.lock().expect("mutex poisoned");
+        let stored = match submitted.get_mut(idempotency_key) {
+            Some(s) => s,
             None => return Ok(None),
         };
 
+        stored.inclusion_checks = stored.inclusion_checks.saturating_add(1);
+        if stored.inclusion_checks <= stored.inclusion_none_before_some {
+            return Ok(None);
+        }
+
         let height = *self.height.lock().expect("mutex poisoned");
         Ok(Some(L1InclusionProof {
-            l1_tx_id: stored.l1_tx_id,
+            l1_tx_id: stored.l1_tx_id.clone(),
             height: L1Height(height),
             finalized: false,
             proof: Base64Bytes(Self::make_proof(idempotency_key, &stored.envelope_hash)),
@@ -152,11 +228,12 @@ impl L1Client for MockL1Client {
     }
 
     fn get_finality(&self, l1_tx_id: &L1TxId) -> Result<Option<L1InclusionProof>, L1ClientError> {
-        let submitted = self.submitted.lock().expect("mutex poisoned");
-        let mut found: Option<(IdempotencyKey, StoredSubmission)> = None;
-        for (k, v) in submitted.iter() {
+        let mut submitted = self.submitted.lock().expect("mutex poisoned");
+        // O(n) lookup is fine for test mock.
+        let mut found: Option<(IdempotencyKey, &mut StoredSubmission)> = None;
+        for (k, v) in submitted.iter_mut() {
             if &v.l1_tx_id == l1_tx_id {
-                found = Some((*k, v.clone()));
+                found = Some((*k, v));
                 break;
             }
         }
@@ -165,9 +242,14 @@ impl L1Client for MockL1Client {
             None => return Ok(None),
         };
 
+        stored.finality_checks = stored.finality_checks.saturating_add(1);
+        if stored.finality_checks <= stored.finality_none_before_some {
+            return Ok(None);
+        }
+
         let finalized = *self.finalized_height.lock().expect("mutex poisoned");
         Ok(Some(L1InclusionProof {
-            l1_tx_id: stored.l1_tx_id,
+            l1_tx_id: stored.l1_tx_id.clone(),
             height: L1Height(finalized),
             finalized: true,
             proof: Base64Bytes(Self::make_proof(&key, &stored.envelope_hash)),
