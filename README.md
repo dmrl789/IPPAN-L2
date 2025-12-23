@@ -66,6 +66,7 @@ IPPAN-L2/
 - [OPS.md](docs/OPS.md) - Operations guide
 - [LOCAL_RUN.md](docs/LOCAL_RUN.md) - Running locally
 - [API.md](docs/API.md) - API reference
+- [OpenAPI (fin-node)](docs/openapi/README.md) - Production API contract + SDK stub generation
 - [HUB-FIN MVP](docs/hub-fin/README.md) - Finance hub MVP v1 docs (actions + API)
 - [HUB-DATA MVP](docs/hub-data/README.md) - Data hub MVP v1 docs (datasets + licenses + attestations)
 - [HUB linkage](docs/hubs/LINKAGE.md) - Cross-hub IDs and invariants
