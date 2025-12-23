@@ -3,6 +3,7 @@
 #![deny(clippy::float_cmp)]
 
 mod bootstrap;
+mod bootstrap_remote;
 mod bootstrap_store;
 mod config;
 mod data_api;
@@ -175,6 +176,29 @@ enum BootstrapCommand {
     /// Print bootstrap restore status (from the progress file).
     Status {
         /// Progress file path (default: ./bootstrap_progress.json)
+        #[arg(long, default_value = "bootstrap_progress.json")]
+        progress: PathBuf,
+    },
+
+    /// Fetch bootstrap artifacts from a remote snapshot repository into the local cache.
+    Fetch {
+        /// Remote name (must match `[bootstrap.remote].name`).
+        #[arg(long)]
+        remote: String,
+        /// Plan only; do not download files.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Fetch remote artifacts, verify them, then restore base + apply deltas.
+    FetchAndRestore {
+        /// Remote name (must match `[bootstrap.remote].name`).
+        #[arg(long)]
+        remote: String,
+        /// Overwrite existing local state (dangerous).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Progress file path (for resume). Default: ./bootstrap_progress.json
         #[arg(long, default_value = "bootstrap_progress.json")]
         progress: PathBuf,
     },
@@ -975,6 +999,8 @@ fn main() {
 
             match cmd {
                 BootstrapCommand::Status { progress } => {
+                    // Best-effort include remote bootstrap status (if configured).
+                    let remote_status = crate::bootstrap_remote::read_bootstrap_status(cfg).ok();
                     let p = crate::bootstrap::read_progress(&progress)
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                     println!(
@@ -982,10 +1008,23 @@ fn main() {
                         serde_json::to_string_pretty(&serde_json::json!({
                             "schema_version": 1,
                             "progress_file": progress.display().to_string(),
-                            "progress": p
+                            "progress": p,
+                            "remote_status": remote_status
                         }))
                         .unwrap()
                     );
+                }
+                BootstrapCommand::Fetch { remote, dry_run } => {
+                    crate::bootstrap_remote::fetch_remote_bootstrap(cfg, &remote, dry_run)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                }
+                BootstrapCommand::FetchAndRestore {
+                    remote,
+                    force,
+                    progress,
+                } => {
+                    crate::bootstrap_remote::fetch_and_restore(cfg, &remote, &progress, force)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
                 }
                 BootstrapCommand::Restore {
                     base,
