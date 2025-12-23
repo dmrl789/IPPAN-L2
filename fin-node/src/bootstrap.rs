@@ -13,6 +13,8 @@ use crate::bootstrap_store::BootstrapStore;
 use crate::recon_store::ReconStore;
 use crate::snapshot::SnapshotManifestV1;
 
+pub mod source;
+
 pub const DELTA_SNAPSHOT_VERSION_V1: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -314,6 +316,11 @@ pub struct BootstrapBaseRefV1 {
     pub path: String,
     pub hash: String,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Optional content-addressed path, e.g. `artifacts/base/<hash>.tar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +330,11 @@ pub struct BootstrapDeltaRefV1 {
     pub from_epoch: u64,
     pub to_epoch: u64,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Optional content-addressed path, e.g. `artifacts/delta/<hash>.tar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
 }
 
 pub fn publish_index_v1(dir: &Path) -> Result<(), BootstrapError> {
@@ -488,6 +500,8 @@ fn build_set_for_base(
         path: rel_path(root, base_path),
         hash: base_hash.clone(),
         created_at: base_manifest.created_at,
+        size: std::fs::metadata(base_path).ok().map(|m| m.len()),
+        ca_path: Some(format!("artifacts/base/{base_hash}.tar")),
     };
 
     let mut ds: Vec<(DeltaManifestV1, PathBuf)> = deltas
@@ -505,12 +519,15 @@ fn build_set_for_base(
 
     let mut delta_refs = Vec::new();
     for (m, p) in ds {
+        let delta_hash = m.hash.clone();
         delta_refs.push(BootstrapDeltaRefV1 {
             path: rel_path(root, &p),
-            hash: m.hash.clone(),
+            hash: delta_hash.clone(),
             from_epoch: m.from_epoch,
             to_epoch: m.to_epoch,
             created_at: m.created_at,
+            size: std::fs::metadata(&p).ok().map(|mm| mm.len()),
+            ca_path: Some(format!("artifacts/delta/{delta_hash}.tar")),
         });
     }
 

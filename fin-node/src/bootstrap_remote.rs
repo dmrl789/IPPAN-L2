@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
+use crate::bootstrap::source::{
+    BootstrapSource as _, BootstrapSourceError, HttpSource, PeerSource,
+};
 use crate::bootstrap::{BootstrapIndexV1, BootstrapSetV1};
 use crate::config::FinNodeConfig;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapRemoteError {
@@ -17,6 +21,8 @@ pub enum BootstrapRemoteError {
     Http(String),
     #[error("config error: {0}")]
     Config(String),
+    #[error("source error: {0}")]
+    Source(String),
 }
 
 impl BootstrapRemoteError {
@@ -25,6 +31,12 @@ impl BootstrapRemoteError {
             code,
             message: message.into(),
         }
+    }
+}
+
+impl From<BootstrapSourceError> for BootstrapRemoteError {
+    fn from(e: BootstrapSourceError) -> Self {
+        BootstrapRemoteError::Source(e.to_string())
     }
 }
 
@@ -59,11 +71,37 @@ pub struct BootstrapProvenanceV1 {
     pub schema_version: u32,
     pub fetched_from: String,
     pub index_path: String,
+    #[serde(default)]
+    pub index_fetched_from: Option<String>,
     pub base_hash: String,
     #[serde(default)]
     pub delta_hashes: Vec<String>,
+    #[serde(default)]
+    pub artifact_sources: Vec<BootstrapArtifactSourceV1>,
     pub restored_to_epoch: u64,
     pub restored_at_unix: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BootstrapArtifactSourceV1 {
+    pub kind: String, // "base" | "delta"
+    pub path: String,
+    pub expected_hash: String,
+    /// Distinct peers that independently produced a valid artifact (quorum).
+    #[serde(default)]
+    pub fetched_from: Vec<String>,
+    /// Whether the final file was obtained via primary HTTP fallback.
+    #[serde(default)]
+    pub used_http_fallback: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BootstrapFetchProvenanceV1 {
+    pub schema_version: u32,
+    pub index_path: String,
+    pub index_fetched_from: String,
+    #[serde(default)]
+    pub artifacts: Vec<BootstrapArtifactSourceV1>,
 }
 
 pub fn read_bootstrap_status(
@@ -92,7 +130,13 @@ struct FetchPlanV1 {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct FetchArtifactV1 {
     kind: String, // "base" | "delta"
+    /// Local storage path under the cache `artifacts/` directory (derived from index `path`).
     path: String,
+    /// Relative path to request from the primary HTTP source (typically index `path`).
+    primary_path: String,
+    /// Relative path to request from peers (typically `ca_path` if present, else `path`).
+    peer_path: String,
+    /// Human-friendly primary URL for planning/auditing.
     url: String,
     expected_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,25 +208,33 @@ fn fetch_remote_bootstrap_inner(
     }
 
     let remote = &cfg.bootstrap.remote;
-    let base_url = remote.base_url.trim_end_matches('/').to_string();
     let index_path = remote.index_path.trim();
     validate_relative_path(index_path)
         .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
-    let index_url = join_url(&base_url, index_path);
+    let index_url = join_url(&remote.base_url, index_path);
 
     // 1) Fetch index.json
-    let client = http_client(cfg)?;
-    let index_bytes = http_get_bytes(&client, &index_url)?;
+    let primary = build_primary_source(cfg)?;
+    let peers = build_peer_sources(cfg)?;
+    let (index_bytes, index_fetched_from) =
+        fetch_index_with_fallback(cfg, &primary, peers.as_slice())?;
 
     // Optional signature verification (Phase 5)
-    verify_index_signature(cfg, &client, &base_url, index_path, &index_bytes)?;
-    let index: BootstrapIndexV1 = parse_and_validate_index(&index_bytes)?;
+    verify_index_signature(
+        cfg,
+        &primary,
+        index_path,
+        &index_bytes,
+        &index_fetched_from,
+        peers.as_slice(),
+    )?;
+    let index: BootstrapIndexV1 = parse_and_validate_index(index_bytes.as_ref())?;
 
     // 2) Select base + required deltas (latest set)
     let latest = select_latest_set(&index)?;
     validate_set_paths(&latest)?;
 
-    // 3) Enforce max total download size (HEAD each artifact)
+    // 3) Enforce max total download size (index sizes preferred; else HEAD probe)
     let max_download_bytes = remote
         .max_download_mb
         .saturating_mul(1024)
@@ -191,11 +243,25 @@ fn fetch_remote_bootstrap_inner(
 
     // base
     {
-        let url = join_url(&base_url, &latest.base.path);
-        let size = http_head_len(&client, &url)?;
+        let primary_path = latest.base.path.clone();
+        let peer_path = latest
+            .base
+            .ca_path
+            .clone()
+            .unwrap_or_else(|| latest.base.path.clone());
+        let url = primary.url_for(&primary_path);
+        let size = resolve_artifact_size(
+            &primary,
+            peers.as_slice(),
+            latest.base.size,
+            &primary_path,
+            &peer_path,
+        )?;
         artifacts.push(FetchArtifactV1 {
             kind: "base".to_string(),
             path: latest.base.path.clone(),
+            primary_path,
+            peer_path,
             url,
             expected_hash: latest.base.hash.clone(),
             from_epoch: None,
@@ -205,11 +271,21 @@ fn fetch_remote_bootstrap_inner(
     }
     // deltas
     for d in &latest.deltas {
-        let url = join_url(&base_url, &d.path);
-        let size = http_head_len(&client, &url)?;
+        let primary_path = d.path.clone();
+        let peer_path = d.ca_path.clone().unwrap_or_else(|| d.path.clone());
+        let url = primary.url_for(&primary_path);
+        let size = resolve_artifact_size(
+            &primary,
+            peers.as_slice(),
+            d.size,
+            &primary_path,
+            &peer_path,
+        )?;
         artifacts.push(FetchArtifactV1 {
             kind: "delta".to_string(),
             path: d.path.clone(),
+            primary_path,
+            peer_path,
             url,
             expected_hash: d.hash.clone(),
             from_epoch: Some(d.from_epoch),
@@ -242,7 +318,18 @@ fn fetch_remote_bootstrap_inner(
     // Persist the fetched index for auditing (always).
     let cache_dir = PathBuf::from(&remote.download_dir);
     std::fs::create_dir_all(&cache_dir)?;
-    std::fs::write(cache_dir.join("index.json"), &index_bytes)?;
+    std::fs::write(cache_dir.join("index.json"), index_bytes.as_ref())?;
+    // Persist fetch provenance for later restore/provenance reporting.
+    let _ = std::fs::write(
+        cache_dir.join("bootstrap_fetch_provenance.json"),
+        serde_json::to_vec_pretty(&BootstrapFetchProvenanceV1 {
+            schema_version: 1,
+            index_path: index_path.to_string(),
+            index_fetched_from: index_fetched_from.clone(),
+            artifacts: Vec::new(),
+        })
+        .unwrap_or_default(),
+    );
 
     if dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -255,13 +342,25 @@ fn fetch_remote_bootstrap_inner(
     let state_path = cache_dir.join("download_state.json");
     let state = Arc::new(Mutex::new(load_download_state(&state_path)?));
 
+    let transfer = &cfg.bootstrap.transfer;
+    let limiter = ByteRateLimiter::new(transfer.max_mbps);
+    let max_conc = transfer
+        .max_concurrency
+        .min(remote.concurrency)
+        .clamp(1, 32);
+
+    let mut fetch_artifact_prov: Vec<BootstrapArtifactSourceV1> = Vec::new();
     download_all(
-        &client,
+        &primary,
+        peers.as_slice(),
+        cfg,
         &artifacts_dir,
         &state_path,
         state.clone(),
         &plan.artifacts,
-        remote.concurrency,
+        max_conc,
+        limiter.clone(),
+        &mut fetch_artifact_prov,
     )?;
 
     // 5) Verify hashes + compatibility.
@@ -285,6 +384,18 @@ fn fetch_remote_bootstrap_inner(
     )?;
 
     println!("{}", serde_json::to_string_pretty(&plan)?);
+
+    // Best-effort persist fetch provenance with per-artifact sources.
+    let _ = std::fs::write(
+        cache_dir.join("bootstrap_fetch_provenance.json"),
+        serde_json::to_vec_pretty(&BootstrapFetchProvenanceV1 {
+            schema_version: 1,
+            index_path: index_path.to_string(),
+            index_fetched_from: index_fetched_from.clone(),
+            artifacts: fetch_artifact_prov,
+        })
+        .unwrap_or_default(),
+    );
     Ok(())
 }
 
@@ -449,14 +560,23 @@ fn fetch_and_restore_inner(
     let _ = bootstrap.set_epoch(cur_epoch);
 
     // 4) Write provenance file.
+    let fetch_prov: Option<BootstrapFetchProvenanceV1> =
+        std::fs::read(cache_dir.join("bootstrap_fetch_provenance.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<BootstrapFetchProvenanceV1>(&b).ok());
     write_bootstrap_provenance(
         &cache_dir,
         BootstrapProvenanceV1 {
-            schema_version: 1,
+            schema_version: 2,
             fetched_from: cfg.bootstrap.remote.base_url.clone(),
             index_path: cfg.bootstrap.remote.index_path.clone(),
+            index_fetched_from: fetch_prov.as_ref().map(|p| p.index_fetched_from.clone()),
             base_hash: base_snapshot_id.clone(),
             delta_hashes: latest.deltas.iter().map(|d| d.hash.clone()).collect(),
+            artifact_sources: fetch_prov
+                .as_ref()
+                .map(|p| p.artifacts.clone())
+                .unwrap_or_default(),
             restored_to_epoch: cur_epoch,
             restored_at_unix: unix_now_secs(),
         },
@@ -494,36 +614,6 @@ fn fetch_and_restore_inner(
         }))?
     );
     Ok(())
-}
-
-fn http_client(cfg: &FinNodeConfig) -> Result<reqwest::blocking::Client, BootstrapRemoteError> {
-    let rcfg = &cfg.bootstrap.remote;
-    let connect = std::time::Duration::from_millis(rcfg.connect_timeout_ms);
-    let read = std::time::Duration::from_millis(rcfg.read_timeout_ms);
-    reqwest::blocking::Client::builder()
-        .connect_timeout(connect)
-        .timeout(read)
-        .build()
-        .map_err(|e| BootstrapRemoteError::Http(e.to_string()))
-}
-
-fn http_get_bytes(
-    client: &reqwest::blocking::Client,
-    url: &str,
-) -> Result<Vec<u8>, BootstrapRemoteError> {
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| BootstrapRemoteError::Http(e.to_string()))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(BootstrapRemoteError::Http(format!(
-            "GET {url} failed: http_status={status}"
-        )));
-    }
-    resp.bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| BootstrapRemoteError::Http(e.to_string()))
 }
 
 fn http_head_len(
@@ -619,9 +709,17 @@ fn select_latest_set(idx: &BootstrapIndexV1) -> Result<BootstrapSetV1, Bootstrap
 fn validate_set_paths(set: &BootstrapSetV1) -> Result<(), BootstrapRemoteError> {
     validate_relative_path(&set.base.path)
         .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
+    if let Some(p) = set.base.ca_path.as_deref() {
+        validate_relative_path(p)
+            .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
+    }
     for d in &set.deltas {
         validate_relative_path(&d.path)
             .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
+        if let Some(p) = d.ca_path.as_deref() {
+            validate_relative_path(p)
+                .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
+        }
     }
 
     // Validate delta chain ordering/continuity (best-effort guard).
@@ -681,6 +779,91 @@ fn join_url(base_url: &str, rel_path: &str) -> String {
         base_url.trim_end_matches('/'),
         rel_path.trim_start_matches('/')
     )
+}
+
+fn build_primary_source(cfg: &FinNodeConfig) -> Result<HttpSource, BootstrapRemoteError> {
+    let r = &cfg.bootstrap.remote;
+    let connect = Duration::from_millis(r.connect_timeout_ms);
+    let timeout = Duration::from_millis(r.read_timeout_ms);
+    Ok(HttpSource::new(
+        format!("primary:{}", r.name),
+        r.base_url.clone(),
+        r.index_path.clone(),
+        connect,
+        timeout,
+    )?)
+}
+
+fn build_peer_sources(cfg: &FinNodeConfig) -> Result<Vec<PeerSource>, BootstrapRemoteError> {
+    if !cfg.bootstrap.p2p.enabled {
+        return Ok(Vec::new());
+    }
+    let r = &cfg.bootstrap.remote;
+    let t = &cfg.bootstrap.transfer;
+    let connect = Duration::from_millis(r.connect_timeout_ms.min(t.per_peer_timeout_ms));
+    let timeout = Duration::from_millis(t.per_peer_timeout_ms);
+    let mut out = Vec::new();
+    for (i, peer_url) in cfg.bootstrap.p2p.peers.iter().enumerate() {
+        let src = HttpSource::new(
+            format!("peer[{i}]:{}", peer_url.trim_end_matches('/')),
+            peer_url.clone(),
+            r.index_path.clone(),
+            connect,
+            timeout,
+        )?;
+        out.push(PeerSource::new(src));
+    }
+    Ok(out)
+}
+
+fn fetch_index_with_fallback(
+    _cfg: &FinNodeConfig,
+    primary: &HttpSource,
+    peers: &[PeerSource],
+) -> Result<(bytes::Bytes, String), BootstrapRemoteError> {
+    match primary.fetch_index() {
+        Ok(b) => return Ok((b, primary.base_url().to_string())),
+        Err(_e) => {
+            // fall through to peers
+        }
+    }
+    for p in peers {
+        if let Ok(b) = p.fetch_index() {
+            return Ok((b, p.base_url().to_string()));
+        }
+    }
+    Err(BootstrapRemoteError::coded(
+        BOOTSTRAP_INDEX_INVALID,
+        "failed to fetch index.json from primary and peers",
+    ))
+}
+
+fn resolve_artifact_size(
+    primary: &HttpSource,
+    peers: &[PeerSource],
+    size_opt: Option<u64>,
+    primary_path: &str,
+    peer_path: &str,
+) -> Result<u64, BootstrapRemoteError> {
+    if let Some(s) = size_opt {
+        return Ok(s);
+    }
+    // Primary probe first.
+    let url = primary.url_for(primary_path);
+    if let Ok(s) = http_head_len(primary.client(), &url) {
+        return Ok(s);
+    }
+    // Peer probe fallback.
+    for p in peers {
+        let url = p.url_for(peer_path);
+        if let Ok(s) = http_head_len(p.client(), &url) {
+            return Ok(s);
+        }
+    }
+    Err(BootstrapRemoteError::coded(
+        BOOTSTRAP_INDEX_INVALID,
+        "unable to determine artifact size (no index.size and HEAD probes failed)",
+    ))
 }
 
 fn load_download_state(path: &Path) -> Result<DownloadStateV1, BootstrapRemoteError> {
@@ -762,29 +945,157 @@ fn write_bootstrap_provenance(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ByteRateLimiter {
+    inner: Option<Arc<Mutex<ByteBucket>>>,
+}
+
+#[derive(Debug)]
+struct ByteBucket {
+    tokens_scaled: u128,
+    last_ms: u64,
+    cap_scaled: u128,
+    rate_per_ms_scaled: u128,
+}
+
+impl ByteRateLimiter {
+    fn new(max_mbps: u64) -> Self {
+        if max_mbps == 0 {
+            return Self { inner: None };
+        }
+        // Megabits/sec -> bytes/sec (decimal Mbps).
+        let bytes_per_sec = max_mbps.saturating_mul(1_000_000).saturating_div(8).max(1);
+        const SCALE: u128 = 1_000_000;
+        let rate_per_ms_scaled = (u128::from(bytes_per_sec).saturating_mul(SCALE) / 1000).max(1);
+        let cap_scaled = u128::from(bytes_per_sec).saturating_mul(SCALE); // 1s bucket
+        Self {
+            inner: Some(Arc::new(Mutex::new(ByteBucket {
+                tokens_scaled: cap_scaled,
+                last_ms: unix_now_millis(),
+                cap_scaled,
+                rate_per_ms_scaled,
+            }))),
+        }
+    }
+
+    fn acquire(&self, bytes: u64) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        const SCALE: u128 = 1_000_000;
+        let want = u128::from(bytes).saturating_mul(SCALE);
+        loop {
+            let wait_ms_opt = {
+                let now = unix_now_millis();
+                let mut b = inner.lock().expect("byte limiter mutex poisoned");
+                let elapsed = now.saturating_sub(b.last_ms);
+                if elapsed > 0 {
+                    let refill = u128::from(elapsed).saturating_mul(b.rate_per_ms_scaled);
+                    b.tokens_scaled = (b.tokens_scaled + refill).min(b.cap_scaled);
+                    b.last_ms = now;
+                }
+                if b.tokens_scaled >= want {
+                    b.tokens_scaled -= want;
+                    None
+                } else {
+                    let missing = want - b.tokens_scaled;
+                    let wait_ms_u128 = missing.div_ceil(b.rate_per_ms_scaled).max(1);
+                    Some(u64::try_from(wait_ms_u128).unwrap_or(u64::MAX))
+                }
+            };
+            match wait_ms_opt {
+                None => return,
+                Some(ms) => std::thread::sleep(Duration::from_millis(ms.min(200))),
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DownloadPermits {
+    inner: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+struct PermitGuard {
+    inner: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl DownloadPermits {
+    fn new(max_inflight: usize) -> Self {
+        Self {
+            inner: Arc::new((
+                std::sync::Mutex::new(max_inflight.max(1)),
+                std::sync::Condvar::new(),
+            )),
+        }
+    }
+
+    fn acquire(&self) -> PermitGuard {
+        let (lock, cv) = &*self.inner;
+        let mut n = lock.lock().expect("permit mutex poisoned");
+        while *n == 0 {
+            n = cv.wait(n).expect("permit condvar poisoned");
+        }
+        *n = n.saturating_sub(1);
+        PermitGuard {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for PermitGuard {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.inner;
+        let mut n = lock.lock().expect("permit mutex poisoned");
+        *n = n.saturating_add(1);
+        cv.notify_one();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn download_all(
-    client: &reqwest::blocking::Client,
+    primary: &HttpSource,
+    peers: &[PeerSource],
+    cfg: &FinNodeConfig,
     artifacts_dir: &Path,
     state_path: &Path,
     state: Arc<Mutex<DownloadStateV1>>,
     artifacts: &[FetchArtifactV1],
     concurrency: usize,
+    limiter: ByteRateLimiter,
+    prov_out: &mut Vec<BootstrapArtifactSourceV1>,
 ) -> Result<(), BootstrapRemoteError> {
     let concurrency = concurrency.clamp(1, 32);
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), BootstrapRemoteError>>();
+    let permits = DownloadPermits::new(concurrency);
+    let (tx, rx) =
+        std::sync::mpsc::channel::<Result<BootstrapArtifactSourceV1, BootstrapRemoteError>>();
     let mut in_flight = 0usize;
     let mut iter = artifacts.iter();
 
     loop {
         while in_flight < concurrency {
             let Some(a) = iter.next().cloned() else { break };
-            let client = client.clone();
+            let primary = primary.clone();
+            let peers = peers.to_vec();
+            let cfg = cfg.clone();
             let artifacts_dir = artifacts_dir.to_path_buf();
             let state_path = state_path.to_path_buf();
             let state = state.clone();
             let tx = tx.clone();
+            let limiter = limiter.clone();
+            let permits = permits.clone();
             std::thread::spawn(move || {
-                let r = download_one(&client, &artifacts_dir, &state_path, state, &a);
+                let r = download_one_with_sources(
+                    &primary,
+                    peers.as_slice(),
+                    &cfg,
+                    &artifacts_dir,
+                    &state_path,
+                    state,
+                    &a,
+                    limiter,
+                    permits,
+                );
                 let _ = tx.send(r);
             });
             in_flight += 1;
@@ -795,7 +1106,8 @@ fn download_all(
         }
 
         match rx.recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(p)) => {
+                prov_out.push(p);
                 in_flight = in_flight.saturating_sub(1);
             }
             Ok(Err(e)) => return Err(e),
@@ -810,13 +1122,18 @@ fn download_all(
     Ok(())
 }
 
-fn download_one(
-    client: &reqwest::blocking::Client,
+#[allow(clippy::too_many_arguments)]
+fn download_one_with_sources(
+    primary: &HttpSource,
+    peers: &[PeerSource],
+    cfg: &FinNodeConfig,
     artifacts_dir: &Path,
     state_path: &Path,
     state: Arc<Mutex<DownloadStateV1>>,
     a: &FetchArtifactV1,
-) -> Result<(), BootstrapRemoteError> {
+    limiter: ByteRateLimiter,
+    permits: DownloadPermits,
+) -> Result<BootstrapArtifactSourceV1, BootstrapRemoteError> {
     // Ensure the output path is confined under artifacts_dir.
     validate_relative_path(&a.path)
         .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
@@ -834,14 +1151,80 @@ fn download_one(
     if let Ok(meta) = std::fs::metadata(&out_path) {
         if meta.is_file() && meta.len() == a.size_bytes {
             update_download_entry(&state, state_path, a, a.size_bytes)?;
-            return Ok(());
+            return Ok(BootstrapArtifactSourceV1 {
+                kind: a.kind.clone(),
+                path: a.path.clone(),
+                expected_hash: a.expected_hash.clone(),
+                fetched_from: Vec::new(),
+                used_http_fallback: false,
+            });
         }
     }
 
-    let mut downloaded = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+    // Prefer peer-list mode when enabled; fall back to primary HTTP if quorum cannot be met.
+    if cfg.bootstrap.p2p.enabled && !peers.is_empty() {
+        match download_from_peers_quorum(
+            peers,
+            &permits,
+            &limiter,
+            &a.kind,
+            &a.peer_path,
+            &out_path,
+            a.size_bytes,
+            &a.expected_hash,
+            cfg.bootstrap.p2p.quorum.max(1),
+            cfg.bootstrap.p2p.max_failures.max(1),
+        ) {
+            Ok(peer_names) => {
+                update_download_entry(&state, state_path, a, a.size_bytes)?;
+                return Ok(BootstrapArtifactSourceV1 {
+                    kind: a.kind.clone(),
+                    path: a.path.clone(),
+                    expected_hash: a.expected_hash.clone(),
+                    fetched_from: peer_names,
+                    used_http_fallback: false,
+                });
+            }
+            Err(_e) => {
+                crate::metrics::BOOTSTRAP_QUORUM_MISMATCHES_TOTAL.inc();
+                // Continue into HTTP fallback.
+            }
+        }
+    }
+
+    // HTTP fallback (resume-safe).
+    let prov = {
+        let _permit = permits.acquire();
+        download_one_http(
+            primary.client(),
+            &limiter,
+            artifacts_dir,
+            state_path,
+            state,
+            a,
+            &part_path,
+            &out_path,
+        )?
+    };
+    Ok(prov)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_one_http(
+    client: &reqwest::blocking::Client,
+    limiter: &ByteRateLimiter,
+    artifacts_dir: &Path,
+    state_path: &Path,
+    state: Arc<Mutex<DownloadStateV1>>,
+    a: &FetchArtifactV1,
+    part_path: &Path,
+    out_path: &Path,
+) -> Result<BootstrapArtifactSourceV1, BootstrapRemoteError> {
+    let _ = artifacts_dir;
+    let mut downloaded = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
     if downloaded > a.size_bytes {
         // Corrupt partial file; restart.
-        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(part_path);
         downloaded = 0;
     }
 
@@ -884,7 +1267,7 @@ fn download_one(
                 break;
             }
             // Otherwise restart.
-            let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(part_path);
             downloaded = 0;
             continue;
         }
@@ -902,7 +1285,7 @@ fn download_one(
 
         // If server ignored range and returned full content, restart from zero.
         if downloaded > 0 && status == reqwest::StatusCode::OK {
-            let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(part_path);
             downloaded = 0;
         }
 
@@ -911,7 +1294,7 @@ fn download_one(
             .write(true)
             .append(downloaded > 0)
             .truncate(downloaded == 0)
-            .open(&part_path)?;
+            .open(part_path)?;
 
         let mut reader = resp;
         let mut buf = [0u8; 64 * 1024];
@@ -920,6 +1303,7 @@ fn download_one(
             if n == 0 {
                 break;
             }
+            limiter.acquire(u64::try_from(n).unwrap_or(u64::MAX));
             std::io::Write::write_all(&mut file, &buf[..n])?;
             crate::metrics::BOOTSTRAP_BYTES_DOWNLOADED_TOTAL
                 .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
@@ -937,7 +1321,7 @@ fn download_one(
     }
 
     // Final size check.
-    let meta = std::fs::metadata(&part_path)?;
+    let meta = std::fs::metadata(part_path)?;
     if meta.len() != a.size_bytes {
         return Err(BootstrapRemoteError::coded(
             BOOTSTRAP_INDEX_INVALID,
@@ -951,9 +1335,205 @@ fn download_one(
     }
 
     // Atomic promote.
-    std::fs::rename(&part_path, &out_path)?;
+    std::fs::rename(part_path, out_path)?;
     update_download_entry(&state, state_path, a, a.size_bytes)?;
-    Ok(())
+    Ok(BootstrapArtifactSourceV1 {
+        kind: a.kind.clone(),
+        path: a.path.clone(),
+        expected_hash: a.expected_hash.clone(),
+        fetched_from: vec![a.url.clone()],
+        used_http_fallback: true,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_from_peers_quorum(
+    peers: &[PeerSource],
+    permits: &DownloadPermits,
+    limiter: &ByteRateLimiter,
+    kind: &str,
+    rel_path: &str,
+    out_path: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+    quorum: usize,
+    max_failures: usize,
+) -> Result<Vec<String>, BootstrapRemoteError> {
+    let quorum = quorum.max(1);
+    let mut successes: Vec<(String, PathBuf)> = Vec::new();
+    let (tx, rx) = std::sync::mpsc::channel::<(String, Result<PathBuf, BootstrapRemoteError>)>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let total_peers = peers.len();
+
+    // Start attempts for all peers; global permits bound actual download concurrency.
+    for (i, p) in peers.iter().cloned().enumerate() {
+        let tx = tx.clone();
+        let rel_path = rel_path.to_string();
+        let out_dir = out_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let file_name = out_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact");
+        let tmp_path = out_dir.join(format!("{file_name}.peer{i}.tmp"));
+        let kind = kind.to_string();
+        let expected_hash = expected_hash.to_string();
+        let stop = stop.clone();
+        let limiter = limiter.clone();
+        let permits = permits.clone();
+        std::thread::spawn(move || {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let r = download_peer_to_temp_and_verify(
+                &p,
+                &permits,
+                &limiter,
+                &kind,
+                &rel_path,
+                &tmp_path,
+                expected_size,
+                &expected_hash,
+            );
+            let _ = tx.send((p.name().to_string(), r));
+        });
+    }
+
+    let mut failures = 0usize;
+    let mut received = 0usize;
+    while successes.len() < quorum && received < total_peers && failures < max_failures {
+        let Ok((peer_name, r)) = rx.recv() else {
+            break;
+        };
+        received = received.saturating_add(1);
+        match r {
+            Ok(tmp_path) => {
+                successes.push((peer_name, tmp_path));
+                if successes.len() >= quorum {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                crate::metrics::BOOTSTRAP_PEER_FAILURES_TOTAL
+                    .with_label_values(&[peer_name.as_str()])
+                    .inc();
+                // Best-effort: keep receiving; other peers may still succeed.
+                let _ = e;
+            }
+        }
+    }
+
+    if successes.len() < quorum {
+        // Clean up any partial successes.
+        for (_peer, p) in successes {
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_HASH_MISMATCH,
+            "peer quorum not satisfied",
+        ));
+    }
+
+    // Promote the first successful temp file to the target output path; delete the rest.
+    let mut used: Vec<String> = Vec::new();
+    for (i, (peer, tmp)) in successes.into_iter().enumerate() {
+        used.push(peer);
+        if i == 0 {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&tmp, out_path)?;
+        } else {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+    Ok(used)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_peer_to_temp_and_verify(
+    peer: &PeerSource,
+    permits: &DownloadPermits,
+    limiter: &ByteRateLimiter,
+    kind: &str,
+    rel_path: &str,
+    tmp_path: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<PathBuf, BootstrapRemoteError> {
+    let _permit = permits.acquire();
+    let url = peer.url_for(rel_path);
+    let resp = peer
+        .client()
+        .get(&url)
+        .send()
+        .map_err(|e| BootstrapRemoteError::Http(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(BootstrapRemoteError::Http(format!(
+            "GET {url} failed: http_status={status}"
+        )));
+    }
+
+    if let Some(parent) = tmp_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(tmp_path)?;
+    let mut reader = resp;
+    let mut buf = [0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        limiter.acquire(u64::try_from(n).unwrap_or(u64::MAX));
+        std::io::Write::write_all(&mut file, &buf[..n])?;
+        downloaded = downloaded.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        if downloaded > expected_size {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_INDEX_INVALID,
+                "peer download exceeded expected size",
+            ));
+        }
+    }
+    if downloaded != expected_size {
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_INDEX_INVALID,
+            "peer download incomplete",
+        ));
+    }
+
+    // Verify expected hash via existing artifact verifiers.
+    if kind == "base" {
+        let m = crate::snapshot::verify_snapshot_v1_tar(tmp_path)
+            .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_HASH_MISMATCH, e.to_string()))?;
+        if m.hash != expected_hash {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_HASH_MISMATCH,
+                "peer base hash mismatch",
+            ));
+        }
+    } else {
+        let d = crate::bootstrap::parse_delta_snapshot_v1_tar(tmp_path)
+            .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_HASH_MISMATCH, e.to_string()))?;
+        if d.manifest.hash != expected_hash {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_HASH_MISMATCH,
+                "peer delta hash mismatch",
+            ));
+        }
+    }
+
+    Ok(tmp_path.to_path_buf())
 }
 
 fn update_download_entry(
@@ -1139,10 +1719,11 @@ fn version_major_minor(v: &str) -> (u64, u64) {
 
 fn verify_index_signature(
     cfg: &FinNodeConfig,
-    client: &reqwest::blocking::Client,
-    base_url: &str,
+    primary: &HttpSource,
     index_path: &str,
-    index_bytes: &[u8],
+    index_bytes: &bytes::Bytes,
+    index_fetched_from: &str,
+    peers: &[PeerSource],
 ) -> Result<(), BootstrapRemoteError> {
     let scfg = &cfg.bootstrap.signing;
     if !scfg.enabled {
@@ -1156,10 +1737,17 @@ fn verify_index_signature(
     }
 
     let sig_rel = index_sig_rel_path(index_path);
-    let sig_url = join_url(base_url, &sig_rel);
+    let sig_fetch = if primary.base_url() == index_fetched_from {
+        primary.fetch_artifact(&sig_rel, None)
+    } else if let Some(p) = peers.iter().find(|p| p.base_url() == index_fetched_from) {
+        p.fetch_artifact(&sig_rel, None)
+    } else {
+        // If we can't identify the index source, fall back to primary.
+        primary.fetch_artifact(&sig_rel, None)
+    };
 
-    let sig_bytes = match http_get_bytes(client, &sig_url) {
-        Ok(b) => b,
+    let sig_bytes = match sig_fetch {
+        Ok(b) => b.to_vec(),
         Err(e) => {
             if scfg.required {
                 return Err(BootstrapRemoteError::coded(
@@ -1174,7 +1762,11 @@ fn verify_index_signature(
 
     #[cfg(feature = "bootstrap-signing")]
     {
-        verify_index_signature_bytes(scfg.publisher_pubkeys.as_slice(), index_bytes, &sig_bytes)
+        verify_index_signature_bytes(
+            scfg.publisher_pubkeys.as_slice(),
+            index_bytes.as_ref(),
+            &sig_bytes,
+        )
     }
     #[cfg(not(feature = "bootstrap-signing"))]
     {
@@ -1271,6 +1863,14 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn unix_now_millis() -> u64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

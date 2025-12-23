@@ -909,6 +909,10 @@ pub struct BootstrapConfig {
     pub remote: BootstrapRemoteConfig,
     #[serde(default)]
     pub signing: BootstrapSigningConfig,
+    #[serde(default)]
+    pub p2p: BootstrapP2pConfig,
+    #[serde(default)]
+    pub transfer: BootstrapTransferConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1003,6 +1007,83 @@ pub struct BootstrapSigningConfig {
     pub publisher_pubkeys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapP2pConfig {
+    /// Enable peer-list bootstrap distribution (opt-in).
+    #[serde(default = "default_bootstrap_p2p_enabled")]
+    pub enabled: bool,
+    /// List of peer base URLs hosting bootstrap artifacts (MVP: HTTP gateways).
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Quorum of distinct peers required for an artifact.
+    ///
+    /// - 1: accept first valid artifact
+    /// - >=2: require N distinct peers to independently produce a valid artifact
+    #[serde(default = "default_bootstrap_p2p_quorum")]
+    pub quorum: usize,
+    /// Maximum peer failures tolerated per artifact before falling back.
+    #[serde(default = "default_bootstrap_p2p_max_failures")]
+    pub max_failures: usize,
+}
+
+fn default_bootstrap_p2p_enabled() -> bool {
+    false
+}
+
+fn default_bootstrap_p2p_quorum() -> usize {
+    1
+}
+
+fn default_bootstrap_p2p_max_failures() -> usize {
+    3
+}
+
+impl Default for BootstrapP2pConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bootstrap_p2p_enabled(),
+            peers: Vec::new(),
+            quorum: default_bootstrap_p2p_quorum(),
+            max_failures: default_bootstrap_p2p_max_failures(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapTransferConfig {
+    /// Maximum concurrent downloads (global within a fetch).
+    #[serde(default = "default_bootstrap_transfer_max_concurrency")]
+    pub max_concurrency: usize,
+    /// Best-effort global download cap in megabits/sec. `0` disables rate limiting.
+    #[serde(default = "default_bootstrap_transfer_max_mbps")]
+    pub max_mbps: u64,
+    /// Per-peer request timeout (ms) for peer-list sources.
+    #[serde(default = "default_bootstrap_transfer_per_peer_timeout_ms")]
+    pub per_peer_timeout_ms: u64,
+}
+
+fn default_bootstrap_transfer_max_concurrency() -> usize {
+    4
+}
+
+fn default_bootstrap_transfer_max_mbps() -> u64 {
+    0
+}
+
+fn default_bootstrap_transfer_per_peer_timeout_ms() -> u64 {
+    20_000
+}
+
+impl Default for BootstrapTransferConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: default_bootstrap_transfer_max_concurrency(),
+            max_mbps: default_bootstrap_transfer_max_mbps(),
+            per_peer_timeout_ms: default_bootstrap_transfer_per_peer_timeout_ms(),
+        }
+    }
+}
+
 fn default_bootstrap_signing_enabled() -> bool {
     false
 }
@@ -1025,6 +1106,8 @@ impl BootstrapConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.remote.validate()?;
         self.signing.validate(&self.remote)?;
+        self.p2p.validate(&self.remote)?;
+        self.transfer.validate(&self.remote)?;
         Ok(())
     }
 }
@@ -1090,6 +1173,54 @@ impl BootstrapSigningConfig {
                     raw.len()
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+impl BootstrapP2pConfig {
+    pub fn validate(&self, remote: &BootstrapRemoteConfig) -> Result<(), String> {
+        if !remote.enabled {
+            // Peer distribution settings are ignored when remote is disabled.
+            return Ok(());
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.peers.is_empty() {
+            return Err("[bootstrap.p2p].peers is empty".to_string());
+        }
+        if self.quorum == 0 {
+            return Err("[bootstrap.p2p].quorum must be >= 1".to_string());
+        }
+        if self.quorum > self.peers.len() {
+            return Err("[bootstrap.p2p].quorum must be <= peers.len()".to_string());
+        }
+        if self.max_failures == 0 {
+            return Err("[bootstrap.p2p].max_failures must be >= 1".to_string());
+        }
+        for (i, p) in self.peers.iter().enumerate() {
+            if p.trim().is_empty() {
+                return Err(format!("[bootstrap.p2p].peers[{i}] is empty"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BootstrapTransferConfig {
+    pub fn validate(&self, remote: &BootstrapRemoteConfig) -> Result<(), String> {
+        if !remote.enabled {
+            return Ok(());
+        }
+        if self.max_concurrency == 0 {
+            return Err("[bootstrap.transfer].max_concurrency must be >= 1".to_string());
+        }
+        if self.max_concurrency > 32 {
+            return Err("[bootstrap.transfer].max_concurrency must be <= 32".to_string());
+        }
+        if self.per_peer_timeout_ms == 0 {
+            return Err("[bootstrap.transfer].per_peer_timeout_ms must be >= 1".to_string());
         }
         Ok(())
     }
