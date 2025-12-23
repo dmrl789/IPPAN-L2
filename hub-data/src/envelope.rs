@@ -63,5 +63,7 @@ fn dataset_id_from_action(a: &DataActionV1) -> Option<DatasetId> {
         DataActionV1::AppendAttestationV1(x) => Some(x.dataset_id),
         DataActionV1::CreateListingV1(x) => Some(x.dataset_id),
         DataActionV1::GrantEntitlementV1(x) => Some(x.dataset_id),
+        DataActionV1::AddLicensorV1(x) => Some(x.dataset_id),
+        DataActionV1::AddAttestorV1(x) => Some(x.dataset_id),
     }
 }

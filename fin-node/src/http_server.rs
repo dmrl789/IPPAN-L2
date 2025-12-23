@@ -152,6 +152,38 @@ pub fn serve(
                     ),
                 }
             }
+            ("POST", "/data/allowlist/licensors") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<hub_data::AddLicensorRequestV1>(&body) {
+                    Ok(req) => match data_api.submit_add_licensor(req) {
+                        Ok(out) => json_response(200, &out),
+                        Err(e) => data_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
+            ("POST", "/data/allowlist/attestors") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<hub_data::AddAttestorRequestV1>(&body) {
+                    Ok(req) => match data_api.submit_add_attestor(req) {
+                        Ok(out) => json_response(200, &out),
+                        Err(e) => data_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
             ("GET", p) if p.starts_with("/data/datasets/") && p.ends_with("/licenses") => {
                 let dataset_id = p
                     .trim_start_matches("/data/datasets/")
@@ -418,6 +450,10 @@ fn api_error_response(e: ApiError) -> Response<std::io::Cursor<Vec<u8>>> {
         ApiError::BadRequest(msg) => {
             json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
         }
+        ApiError::PolicyDenied(p) => json_response(
+            403,
+            &serde_json::json!({"schema_version": 1, "error": "policy_denied", "policy": p}),
+        ),
         ApiError::Upstream(msg) => {
             json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
         }
@@ -432,6 +468,10 @@ fn data_api_error_response(e: DataApiError) -> Response<std::io::Cursor<Vec<u8>>
         DataApiError::BadRequest(msg) => {
             json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
         }
+        DataApiError::PolicyDenied(p) => json_response(
+            403,
+            &serde_json::json!({"schema_version": 1, "error": "policy_denied", "policy": p}),
+        ),
         DataApiError::Upstream(msg) => {
             json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
         }

@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use crate::actions::{
-    CreateListingV1, DataActionV1, GrantEntitlementV1, IssueLicenseV1, RegisterDatasetV1,
+    AddAttestorV1, AddLicensorV1, AttestationPolicyV1, CreateListingV1, DataActionV1,
+    GrantEntitlementV1, IssueLicenseV1, RegisterDatasetV1,
 };
 use crate::canonical::canonical_json_bytes;
 use crate::envelope::DataEnvelopeV1;
@@ -11,6 +12,7 @@ use crate::validation::{
     validate_append_attestation_v1, validate_create_listing_v1, validate_grant_entitlement_v1,
     validate_issue_license_v1, validate_register_dataset_v1, ValidationError,
 };
+use l2_core::policy::{PolicyDenyCode, PolicyMode};
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
@@ -50,12 +52,21 @@ pub enum ApplyError {
 }
 
 pub fn apply(env: &DataEnvelopeV1, store: &DataStore) -> Result<ApplyReceipt, ApplyError> {
+    apply_with_policy(env, store, PolicyMode::Permissive, &[])
+}
+
+pub fn apply_with_policy(
+    env: &DataEnvelopeV1,
+    store: &DataStore,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
+) -> Result<ApplyReceipt, ApplyError> {
     let action = env.action.clone();
     let action_id = env.action_id;
 
     let r = store
         .tree()
-        .transaction(|tree| apply_tx(tree, action_id, &action));
+        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts));
 
     match r {
         Ok(receipt) => Ok(receipt),
@@ -91,6 +102,8 @@ fn apply_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     action: &DataActionV1,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Idempotency: already applied => success/no-op.
     if tree
@@ -121,10 +134,18 @@ fn apply_tx(
 
     let receipt = match action {
         DataActionV1::RegisterDatasetV1(a) => apply_register_dataset_v1_tx(tree, action_id, a)?,
-        DataActionV1::IssueLicenseV1(a) => apply_issue_license_v1_tx(tree, action_id, a)?,
-        DataActionV1::AppendAttestationV1(a) => apply_append_attestation_v1_tx(tree, action_id, a)?,
-        DataActionV1::CreateListingV1(a) => apply_create_listing_v1_tx(tree, action_id, a)?,
-        DataActionV1::GrantEntitlementV1(a) => apply_grant_entitlement_v1_tx(tree, action_id, a)?,
+        DataActionV1::IssueLicenseV1(a) => {
+            apply_issue_license_v1_tx(tree, action_id, a, mode, admin_accounts)?
+        }
+        DataActionV1::AppendAttestationV1(a) => {
+            apply_append_attestation_v1_tx(tree, action_id, a, mode)?
+        }
+        DataActionV1::CreateListingV1(a) => apply_create_listing_v1_tx(tree, action_id, a, mode)?,
+        DataActionV1::GrantEntitlementV1(a) => {
+            apply_grant_entitlement_v1_tx(tree, action_id, a, mode, admin_accounts)?
+        }
+        DataActionV1::AddLicensorV1(a) => apply_add_licensor_v1_tx(tree, action_id, a, mode)?,
+        DataActionV1::AddAttestorV1(a) => apply_add_attestor_v1_tx(tree, action_id, a, mode)?,
     };
 
     let receipt_bytes = canonical_json_bytes(&receipt).map_err(|e| {
@@ -168,12 +189,33 @@ fn apply_issue_license_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &IssueLicenseV1,
+    mode: PolicyMode,
+    _admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
-    validate_issue_license_v1(a, &dataset.owner)
+    validate_issue_license_v1(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    // Policy: licensor must be dataset owner or allowlisted.
+    let ok = a.licensor == dataset.owner
+        || tree
+            .get(keys::licensor_allow(a.dataset_id, &a.licensor.0))?
+            .is_some();
+    if !ok && mode == PolicyMode::Strict {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "licensor not permitted for dataset",
+        ));
+    }
+    if !ok && mode == PolicyMode::Permissive {
+        // Backcompat posture: in permissive mode, allow legacy behaviour (owner-only),
+        // but don't silently authorize a non-owner without explicit allowlist.
+        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
+            "licensor not permitted for dataset".to_string(),
+        )));
+    }
 
     // Idempotency by license_id: duplicates are a success/no-op.
     if tree.get(keys::license(a.license_id))?.is_some() {
@@ -212,14 +254,31 @@ fn apply_append_attestation_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &crate::actions::AppendAttestationV1,
+    mode: PolicyMode,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    if get_dataset_tx(tree, a.dataset_id)?.is_none() {
-        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
-            "dataset_id not found".to_string(),
-        )));
-    }
+    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
+    })?;
     validate_append_attestation_v1(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    // Policy: enforce attestation allowlist if enabled on dataset.
+    if dataset.attestation_policy == AttestationPolicyV1::AllowlistOnly {
+        let ok = tree
+            .get(keys::attestor_allow(a.dataset_id, &a.attestor.0))?
+            .is_some();
+        if !ok && mode == PolicyMode::Strict {
+            return Err(policy_deny(
+                PolicyDenyCode::Unauthorized,
+                "attestor not allowlisted",
+            ));
+        }
+        if !ok && mode == PolicyMode::Permissive {
+            return Err(ConflictableTransactionError::Abort(TxError::Rejected(
+                "attestor not allowlisted".to_string(),
+            )));
+        }
+    }
 
     // Idempotency by attestation_id: duplicates are a success/no-op.
     if tree.get(keys::attestation(a.attestation_id))?.is_some() {
@@ -258,12 +317,30 @@ fn apply_create_listing_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &CreateListingV1,
+    mode: PolicyMode,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
-    validate_create_listing_v1(a, &dataset.owner)
+    validate_create_listing_v1(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    // Policy: licensor must be dataset owner or allowlisted.
+    let ok = a.licensor == dataset.owner
+        || tree
+            .get(keys::licensor_allow(a.dataset_id, &a.licensor.0))?
+            .is_some();
+    if !ok && mode == PolicyMode::Strict {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "licensor not permitted for dataset",
+        ));
+    }
+    if !ok && mode == PolicyMode::Permissive {
+        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
+            "licensor not permitted for dataset".to_string(),
+        )));
+    }
 
     if let Some(existing) = tree.get(keys::listing(a.listing_id))? {
         let existing_listing: CreateListingV1 = serde_json::from_slice(&existing).map_err(|e| {
@@ -311,6 +388,8 @@ fn apply_grant_entitlement_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &GrantEntitlementV1,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Listing must exist (and be consistent with dataset_id).
     let listing_bytes = tree.get(keys::listing(a.listing_id))?.ok_or_else(|| {
@@ -327,6 +406,23 @@ fn apply_grant_entitlement_v1_tx(
 
     validate_grant_entitlement_v1(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    // Policy: entitlement grant must be performed by dataset.owner (or admin in strict).
+    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
+    })?;
+    if mode == PolicyMode::Strict && a.actor.is_none() {
+        return Err(policy_deny(PolicyDenyCode::MissingActor, "missing actor"));
+    }
+    let actor = a.actor.as_ref().unwrap_or(&dataset.owner);
+    let ok =
+        actor == &dataset.owner || (mode == PolicyMode::Strict && is_admin(actor, admin_accounts));
+    if !ok {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "actor not permitted to grant entitlement",
+        ));
+    }
 
     // Idempotency by purchase_id: duplicates are a success/no-op.
     if let Some(existing) = tree.get(keys::entitlement(a.purchase_id))? {
@@ -376,6 +472,78 @@ fn apply_grant_entitlement_v1_tx(
     })
 }
 
+fn apply_add_licensor_v1_tx(
+    tree: &TransactionalTree,
+    action_id: ActionId,
+    a: &AddLicensorV1,
+    mode: PolicyMode,
+) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
+    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
+    })?;
+    if mode == PolicyMode::Strict && a.actor != dataset.owner {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "only dataset owner may add licensors",
+        ));
+    }
+    let key = keys::licensor_allow(a.dataset_id, &a.licensor.0);
+    let already = tree.get(&key)?.is_some();
+    if !already {
+        tree.insert(key, sled::IVec::from(&b"1"[..]))?;
+    }
+    Ok(ApplyReceipt {
+        schema_version: 1,
+        outcome: if already {
+            ApplyOutcome::AlreadyApplied
+        } else {
+            ApplyOutcome::Applied
+        },
+        action_id,
+        dataset_id: Some(a.dataset_id),
+        license_id: None,
+        attestation_id: None,
+        listing_id: None,
+        purchase_id: None,
+    })
+}
+
+fn apply_add_attestor_v1_tx(
+    tree: &TransactionalTree,
+    action_id: ActionId,
+    a: &AddAttestorV1,
+    mode: PolicyMode,
+) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
+    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
+    })?;
+    if mode == PolicyMode::Strict && a.actor != dataset.owner {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "only dataset owner may add attestors",
+        ));
+    }
+    let key = keys::attestor_allow(a.dataset_id, &a.attestor.0);
+    let already = tree.get(&key)?.is_some();
+    if !already {
+        tree.insert(key, sled::IVec::from(&b"1"[..]))?;
+    }
+    Ok(ApplyReceipt {
+        schema_version: 1,
+        outcome: if already {
+            ApplyOutcome::AlreadyApplied
+        } else {
+            ApplyOutcome::Applied
+        },
+        action_id,
+        dataset_id: Some(a.dataset_id),
+        license_id: None,
+        attestation_id: None,
+        listing_id: None,
+        purchase_id: None,
+    })
+}
+
 fn get_dataset_tx(
     tree: &TransactionalTree,
     dataset_id: DatasetId,
@@ -386,6 +554,21 @@ fn get_dataset_tx(
     serde_json::from_slice::<RegisterDatasetV1>(&v)
         .map(Some)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))
+}
+
+fn is_admin(actor: &AccountId, admin_accounts: &[AccountId]) -> bool {
+    admin_accounts.iter().any(|a| a == actor)
+}
+
+fn policy_deny(
+    code: PolicyDenyCode,
+    message: &'static str,
+) -> ConflictableTransactionError<TxError> {
+    ConflictableTransactionError::Abort(TxError::Rejected(format!(
+        "policy:{}:{}",
+        code.as_str(),
+        message
+    )))
 }
 
 #[allow(dead_code)]

@@ -8,3 +8,17 @@ chain_status = ""
 submit_batch = ""
 get_inclusion = ""
 get_finality = ""
+
+[storage]
+receipts_dir = "receipts"
+fin_db_dir = "fin_db"
+data_db_dir = "data_db"
+policy_db_dir = "policy_db"
+
+[policy]
+mode = "permissive"
+admins = []
+
+[policy.compliance]
+enabled = false
+strategy = "none"

@@ -60,21 +60,12 @@ pub fn validate_register_dataset_v1(a: &RegisterDatasetV1) -> Result<(), Validat
     Ok(())
 }
 
-pub fn validate_issue_license_v1(
-    a: &IssueLicenseV1,
-    dataset_owner: &AccountId,
-) -> Result<(), ValidationError> {
+pub fn validate_issue_license_v1(a: &IssueLicenseV1) -> Result<(), ValidationError> {
     validate_account_id("licensor", &a.licensor)?;
     validate_account_id("licensee", &a.licensee)?;
     validate_bounded("nonce", &a.nonce, NONCE_MAX_LEN)?;
     if let Some(uri) = a.terms_uri.as_deref() {
         validate_bounded_allow_empty("terms_uri", uri, TERMS_URI_MAX_LEN)?;
-    }
-    // MVP rule: licensor must be dataset.owner.
-    if &a.licensor != dataset_owner {
-        return Err(ValidationError::Invalid(
-            "licensor must equal dataset.owner (MVP rule)".to_string(),
-        ));
     }
 
     let expected = derive_license_id(
@@ -120,16 +111,8 @@ pub fn validate_append_attestation_v1(a: &AppendAttestationV1) -> Result<(), Val
     Ok(())
 }
 
-pub fn validate_create_listing_v1(
-    a: &CreateListingV1,
-    dataset_owner: &AccountId,
-) -> Result<(), ValidationError> {
+pub fn validate_create_listing_v1(a: &CreateListingV1) -> Result<(), ValidationError> {
     validate_account_id("licensor", &a.licensor)?;
-    if &a.licensor != dataset_owner {
-        return Err(ValidationError::Invalid(
-            "licensor must equal dataset.owner (MVP rule)".to_string(),
-        ));
-    }
     if a.price_microunits.0 == 0 {
         return Err(ValidationError::Invalid(
             "price_microunits must be > 0".to_string(),
@@ -158,6 +141,9 @@ pub fn validate_create_listing_v1(
 
 pub fn validate_grant_entitlement_v1(a: &GrantEntitlementV1) -> Result<(), ValidationError> {
     validate_account_id("licensee", &a.licensee)?;
+    if let Some(actor) = a.actor.as_ref() {
+        validate_account_id("actor", actor)?;
+    }
     let expected =
         derive_entitlement_license_id_v1(a.dataset_id, a.listing_id, &a.licensee, &a.purchase_id);
     if expected != a.license_id {

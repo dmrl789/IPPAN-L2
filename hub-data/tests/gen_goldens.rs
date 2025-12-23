@@ -1,6 +1,7 @@
 use hub_data::canonical::canonical_json_bytes;
 use hub_data::{
-    CreateListingV1, DataActionV1, DataEnvelopeV1, GrantEntitlementV1, Hex32, PriceMicrounitsU128,
+    AttestationPolicyV1, CreateListingV1, DataActionV1, DataEnvelopeV1, GrantEntitlementV1, Hex32,
+    PriceMicrounitsU128,
 };
 use hub_data::{IssueLicenseV1, LicenseRightsV1, RegisterDatasetV1};
 use l2_core::AccountId;
@@ -33,6 +34,7 @@ fn print_goldens() {
             "example".to_string(),
         ],
         schema_version: 1,
+        attestation_policy: AttestationPolicyV1::Anyone,
     };
 
     let register_action = DataActionV1::RegisterDatasetV1(dataset.clone());
@@ -154,6 +156,7 @@ fn print_goldens() {
             &AccountId::new("acc-bob"),
             &purchase_id,
         ),
+        actor: Some(AccountId::new("acc-alice")),
     };
     let ent_action = DataActionV1::GrantEntitlementV1(ent.clone());
     let ent_env = DataEnvelopeV1::new(ent_action.clone()).unwrap();

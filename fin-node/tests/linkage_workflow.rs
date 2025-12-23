@@ -35,15 +35,18 @@ fn setup() -> (
 }
 
 fn bootstrap_asset_and_balance(fin_api: &FinApi, buyer: &AccountId) -> hub_fin::Hex32 {
-    let asset_id =
-        hub_fin::validation::derive_asset_id("Example Euro Stablecoin", "issuer-001", "EURX");
+    let issuer = AccountId::new("issuer-001");
+    let asset_id = hub_fin::validation::derive_asset_id("Example Euro Stablecoin", &issuer, "EURX");
     let create = CreateAssetV1 {
         asset_id,
         name: "Example Euro Stablecoin".to_string(),
         symbol: "EURX".to_string(),
-        issuer: "issuer-001".to_string(),
+        issuer: issuer.clone(),
         decimals: 6,
         metadata_uri: None,
+        actor: Some(issuer.clone()),
+        mint_policy: hub_fin::MintPolicyV1::IssuerOnly,
+        transfer_policy: hub_fin::TransferPolicyV1::Free,
     };
     fin_api
         .submit_action_obj(FinActionV1::CreateAssetV1(create))
@@ -53,6 +56,7 @@ fn bootstrap_asset_and_balance(fin_api: &FinApi, buyer: &AccountId) -> hub_fin::
         asset_id,
         to_account: buyer.clone(),
         amount: AmountU128(2_000_000),
+        actor: Some(issuer),
         client_tx_id: "mint-001".to_string(),
         memo: None,
     };
@@ -81,6 +85,7 @@ fn bootstrap_dataset_and_listing(
             mime_type: None,
             tags: vec![],
             schema_version: 1,
+            attestation_policy: hub_data::AttestationPolicyV1::Anyone,
         })
         .expect("register dataset");
     let dataset_id_hex = reg.dataset_id.expect("dataset_id");

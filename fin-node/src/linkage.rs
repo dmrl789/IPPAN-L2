@@ -158,6 +158,7 @@ impl LinkageApi {
             from_account: receipt.licensee.clone(),
             to_account: listing.licensor.clone(),
             amount,
+            actor: Some(receipt.licensee.clone()),
             client_tx_id,
             memo: memo.map(str::to_string),
             purchase_id: Some(receipt.purchase_id),
@@ -200,6 +201,7 @@ impl LinkageApi {
             dataset_id: listing.dataset_id,
             licensee: receipt.licensee.clone(),
             payment_ref,
+            actor: Some(listing.licensor.clone()),
         };
         let action = hub_data::DataActionRequestV1::GrantEntitlementV1(req).into_action();
         let env = hub_data::DataEnvelopeV1::new(action)
@@ -312,6 +314,7 @@ impl ApiError {
     fn from_fin_api(e: FinApiError) -> Self {
         match e {
             FinApiError::BadRequest(s) => ApiError::BadRequest(s),
+            FinApiError::PolicyDenied(p) => ApiError::BadRequest(p.to_string()),
             FinApiError::Upstream(s) => ApiError::Upstream(s),
             FinApiError::Internal(s) => ApiError::Internal(s),
         }
@@ -320,6 +323,7 @@ impl ApiError {
     fn from_data_api(e: DataApiError) -> Self {
         match e {
             DataApiError::BadRequest(s) => ApiError::BadRequest(s),
+            DataApiError::PolicyDenied(p) => ApiError::BadRequest(p.to_string()),
             DataApiError::Upstream(s) => ApiError::Upstream(s),
             DataApiError::Internal(s) => ApiError::Internal(s),
         }

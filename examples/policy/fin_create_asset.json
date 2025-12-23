@@ -1,0 +1,12 @@
+{
+  "type": "create_asset_v1",
+  "actor": "issuer-001",
+  "name": "Example Euro Stablecoin",
+  "symbol": "EURX",
+  "issuer": "issuer-001",
+  "decimals": 6,
+  "metadata_uri": "https://example.com/eurx",
+  "mint_policy": "issuer_only",
+  "transfer_policy": "free"
+}
+

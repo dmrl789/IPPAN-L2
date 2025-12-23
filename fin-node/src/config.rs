@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_types)]
 
 use l2_core::l1_contract::http_client::L1RpcConfig;
+use l2_core::policy::PolicyMode;
 use serde::Deserialize;
 use std::fs;
 
@@ -18,6 +19,8 @@ pub struct FinNodeConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +82,8 @@ pub struct StorageConfig {
     pub fin_db_dir: String,
     #[serde(default = "default_data_db_dir")]
     pub data_db_dir: String,
+    #[serde(default = "default_policy_db_dir")]
+    pub policy_db_dir: String,
 }
 
 fn default_receipts_dir() -> String {
@@ -93,12 +98,17 @@ fn default_data_db_dir() -> String {
     "data_db".to_string()
 }
 
+fn default_policy_db_dir() -> String {
+    "policy_db".to_string()
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             receipts_dir: default_receipts_dir(),
             fin_db_dir: default_fin_db_dir(),
             data_db_dir: default_data_db_dir(),
+            policy_db_dir: default_policy_db_dir(),
         }
     }
 }
@@ -109,6 +119,56 @@ pub struct LoggingConfig {
     pub level: String,
     #[serde(default = "default_log_format")]
     pub format: String,
+}
+
+fn default_policy_mode() -> PolicyMode {
+    PolicyMode::Permissive
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyConfig {
+    #[serde(default = "default_policy_mode")]
+    pub mode: PolicyMode,
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub compliance: ComplianceConfig,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: PolicyMode::Permissive,
+            admins: Vec::new(),
+            compliance: ComplianceConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub strategy: ComplianceStrategy,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: ComplianceStrategy::None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceStrategy {
+    #[default]
+    None,
+    GlobalAllowlist,
+    GlobalDenylist,
 }
 
 fn default_log_level() -> String {
