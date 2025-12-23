@@ -20,9 +20,11 @@ fn b64url32(bytes: &[u8; 32]) -> String {
 
 #[test]
 fn test_fixture_roundtrip_v1() {
-    let hub: HubPayloadEnvelopeV1 = serde_json::from_str(HUB_PAYLOAD_V1).expect("deserialize hub payload v1");
+    let hub: HubPayloadEnvelopeV1 =
+        serde_json::from_str(HUB_PAYLOAD_V1).expect("deserialize hub payload v1");
     let hub_json = serde_json::to_string(&hub).expect("serialize hub payload v1");
-    let hub2: HubPayloadEnvelopeV1 = serde_json::from_str(&hub_json).expect("roundtrip hub payload v1");
+    let hub2: HubPayloadEnvelopeV1 =
+        serde_json::from_str(&hub_json).expect("roundtrip hub payload v1");
     assert_eq!(hub, hub2);
 
     let batch: L2BatchEnvelopeV1 = serde_json::from_str(L2_BATCH_V1).expect("deserialize batch v1");
@@ -34,7 +36,10 @@ fn test_fixture_roundtrip_v1() {
 #[test]
 fn test_idempotency_key_stable_v1() {
     let batch: L2BatchEnvelopeV1 = serde_json::from_str(L2_BATCH_V1).expect("deserialize batch v1");
-    let payload_hash = batch.payload.canonical_hash_blake3().expect("payload canonical hash");
+    let payload_hash = batch
+        .payload
+        .canonical_hash_blake3()
+        .expect("payload canonical hash");
     let expected = derive_idempotency_key_v1(
         batch.contract_version,
         batch.hub,
@@ -49,7 +54,8 @@ fn test_idempotency_key_stable_v1() {
 fn test_canonical_hash_matches_golden_v1() {
     let expected: Expected = serde_json::from_str(EXPECTED).expect("deserialize expected hashes");
 
-    let hub: HubPayloadEnvelopeV1 = serde_json::from_str(HUB_PAYLOAD_V1).expect("deserialize hub payload v1");
+    let hub: HubPayloadEnvelopeV1 =
+        serde_json::from_str(HUB_PAYLOAD_V1).expect("deserialize hub payload v1");
     let hub_hash = hub.canonical_hash_blake3().expect("hub canonical hash");
     assert_eq!(
         b64url32(&hub_hash),
@@ -68,4 +74,3 @@ fn test_canonical_hash_matches_golden_v1() {
         expected.l2_batch_envelope_v1_idempotency_key_b64url
     );
 }
-

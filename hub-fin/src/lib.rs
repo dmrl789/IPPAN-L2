@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
-use l2_core::{AccountId, AssetId, FixedAmount, L2BatchId, L2HubId, SettlementError};
 use l2_core::l1_contract::{Base64Bytes, FixedAmountV1, HubPayloadEnvelopeV1, L2BatchEnvelopeV1};
+use l2_core::{AccountId, AssetId, FixedAmount, L2BatchId, L2HubId, SettlementError};
 
 /// Logical identifier used for IPPAN FIN batches.
 pub const HUB_ID: L2HubId = L2HubId::Fin;
@@ -284,7 +284,9 @@ pub struct FinTransaction {
 }
 
 /// Build a hub payload envelope (v1) from FIN transactions.
-pub fn to_hub_payload_envelope_v1(txs: &[FinTransaction]) -> Result<HubPayloadEnvelopeV1, SettlementError> {
+pub fn to_hub_payload_envelope_v1(
+    txs: &[FinTransaction],
+) -> Result<HubPayloadEnvelopeV1, SettlementError> {
     let payload = serde_json::to_vec(txs)
         .map_err(|e| SettlementError::Internal(format!("failed to serialize fin payload: {e}")))?;
     Ok(HubPayloadEnvelopeV1 {
@@ -437,7 +439,10 @@ mod tests {
 
         let a = to_hub_payload_envelope_v1(&txs).unwrap();
         let b = to_hub_payload_envelope_v1(&txs).unwrap();
-        assert_eq!(a.canonical_hash_blake3().unwrap(), b.canonical_hash_blake3().unwrap());
+        assert_eq!(
+            a.canonical_hash_blake3().unwrap(),
+            b.canonical_hash_blake3().unwrap()
+        );
     }
 
     #[test]

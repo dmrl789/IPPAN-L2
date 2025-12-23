@@ -45,22 +45,50 @@ impl L1RpcConfig {
         if self.base_url.trim().is_empty() {
             return Err(L1ClientError::Config("l1.base_url is empty".to_string()));
         }
-        if self.endpoints.chain_status.as_deref().unwrap_or("").trim().is_empty() {
+        if self
+            .endpoints
+            .chain_status
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return Err(L1ClientError::Config(
                 "missing endpoints.chain_status in config".to_string(),
             ));
         }
-        if self.endpoints.submit_batch.as_deref().unwrap_or("").trim().is_empty() {
+        if self
+            .endpoints
+            .submit_batch
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return Err(L1ClientError::Config(
                 "missing endpoints.submit_batch in config".to_string(),
             ));
         }
-        if self.endpoints.get_inclusion.as_deref().unwrap_or("").trim().is_empty() {
+        if self
+            .endpoints
+            .get_inclusion
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return Err(L1ClientError::Config(
                 "missing endpoints.get_inclusion in config".to_string(),
             ));
         }
-        if self.endpoints.get_finality.as_deref().unwrap_or("").trim().is_empty() {
+        if self
+            .endpoints
+            .get_finality
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return Err(L1ClientError::Config(
                 "missing endpoints.get_finality in config".to_string(),
             ));
@@ -102,7 +130,13 @@ impl HttpL1Client {
     }
 
     fn auth(&self, req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
-        match self.cfg.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match self
+            .cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(key) => req.header("Authorization", key),
             None => req,
         }
@@ -127,12 +161,9 @@ impl HttpL1Client {
 
 impl L1Client for HttpL1Client {
     fn chain_status(&self) -> Result<L1ChainStatus, L1ClientError> {
-        let path = self
-            .cfg
-            .endpoints
-            .chain_status
-            .as_deref()
-            .ok_or_else(|| L1ClientError::Config("missing endpoints.chain_status in config".to_string()))?;
+        let path = self.cfg.endpoints.chain_status.as_deref().ok_or_else(|| {
+            L1ClientError::Config("missing endpoints.chain_status in config".to_string())
+        })?;
         let url = self.join_url(path);
         let resp = self
             .auth(self.client.get(url))
@@ -147,12 +178,9 @@ impl L1Client for HttpL1Client {
     }
 
     fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError> {
-        let path = self
-            .cfg
-            .endpoints
-            .submit_batch
-            .as_deref()
-            .ok_or_else(|| L1ClientError::Config("missing endpoints.submit_batch in config".to_string()))?;
+        let path = self.cfg.endpoints.submit_batch.as_deref().ok_or_else(|| {
+            L1ClientError::Config("missing endpoints.submit_batch in config".to_string())
+        })?;
         let url = self.join_url(path);
         let resp = self
             .auth(self.client.post(url).json(batch))
@@ -170,13 +198,14 @@ impl L1Client for HttpL1Client {
         &self,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Option<L1InclusionProof>, L1ClientError> {
-        let path_tpl = self
-            .cfg
-            .endpoints
-            .get_inclusion
-            .as_deref()
-            .ok_or_else(|| L1ClientError::Config("missing endpoints.get_inclusion in config".to_string()))?;
-        let path = Self::replace_token(path_tpl, "{id}", &Self::idempotency_key_str(idempotency_key));
+        let path_tpl = self.cfg.endpoints.get_inclusion.as_deref().ok_or_else(|| {
+            L1ClientError::Config("missing endpoints.get_inclusion in config".to_string())
+        })?;
+        let path = Self::replace_token(
+            path_tpl,
+            "{id}",
+            &Self::idempotency_key_str(idempotency_key),
+        );
         let url = self.join_url(&path);
         let resp = self
             .auth(self.client.get(url))
@@ -186,12 +215,9 @@ impl L1Client for HttpL1Client {
     }
 
     fn get_finality(&self, l1_tx_id: &L1TxId) -> Result<Option<L1InclusionProof>, L1ClientError> {
-        let path_tpl = self
-            .cfg
-            .endpoints
-            .get_finality
-            .as_deref()
-            .ok_or_else(|| L1ClientError::Config("missing endpoints.get_finality in config".to_string()))?;
+        let path_tpl = self.cfg.endpoints.get_finality.as_deref().ok_or_else(|| {
+            L1ClientError::Config("missing endpoints.get_finality in config".to_string())
+        })?;
         let path = Self::replace_token(path_tpl, "{l1_tx_id}", &l1_tx_id.0);
         let url = self.join_url(&path);
         let resp = self
@@ -201,4 +227,3 @@ impl L1Client for HttpL1Client {
         Self::json_404_none(resp)
     }
 }
-

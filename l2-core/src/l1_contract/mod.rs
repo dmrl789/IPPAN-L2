@@ -25,8 +25,8 @@ pub mod mock_client;
 pub mod http_client;
 
 use crate::L2HubId;
-use blake3::Hasher;
 use base64::Engine as _;
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
 /// Contract version of the wire format.
@@ -94,15 +94,30 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
 }
 
 /// Base64url (no padding) bytes wrapper for JSON-friendly payloads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Base64Bytes(
-    #[serde(
-        serialize_with = "serde_b64url_nopad::serialize",
-        deserialize_with = "serde_b64url_nopad::deserialize"
-    )]
-    pub Vec<u8>,
-);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Base64Bytes(pub Vec<u8>);
+
+impl Serialize for Base64Bytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&base64url_nopad_encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Base64Bytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self(bytes))
+    }
+}
 
 /// Fixed-point amount scaled by 1e6 (6 decimals), represented as an integer.
 ///
@@ -197,7 +212,9 @@ impl HubPayloadEnvelopeV1 {
 
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.schema_version.trim().is_empty() {
-            return Err(ContractError::Invalid("schema_version is empty".to_string()));
+            return Err(ContractError::Invalid(
+                "schema_version is empty".to_string(),
+            ));
         }
         if self.content_type.trim().is_empty() {
             return Err(ContractError::Invalid("content_type is empty".to_string()));
@@ -223,7 +240,8 @@ impl L2BatchEnvelopeV1 {
             .canonical_hash_blake3()
             .map_err(|e| ContractError::Invalid(format!("payload canonicalization failed: {e}")))?;
 
-        let idempotency_key = derive_idempotency_key_v1(contract_version, hub, &batch_id, sequence, &payload_hash);
+        let idempotency_key =
+            derive_idempotency_key_v1(contract_version, hub, &batch_id, sequence, &payload_hash);
 
         let env = Self {
             contract_version,
@@ -261,8 +279,13 @@ impl L2BatchEnvelopeV1 {
             .payload
             .canonical_hash_blake3()
             .map_err(|e| ContractError::Invalid(format!("payload canonicalization failed: {e}")))?;
-        let expected =
-            derive_idempotency_key_v1(self.contract_version, self.hub, &self.batch_id, self.sequence, &payload_hash);
+        let expected = derive_idempotency_key_v1(
+            self.contract_version,
+            self.hub,
+            &self.batch_id,
+            self.sequence,
+            &payload_hash,
+        );
         if expected != self.idempotency_key {
             return Err(ContractError::Invalid(
                 "idempotency_key does not match v1 derivation rules".to_string(),
@@ -297,8 +320,10 @@ pub fn derive_idempotency_key_v1(
 pub trait L1Client {
     fn chain_status(&self) -> Result<L1ChainStatus, L1ClientError>;
     fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError>;
-    fn get_inclusion(&self, idempotency_key: &IdempotencyKey)
-        -> Result<Option<L1InclusionProof>, L1ClientError>;
+    fn get_inclusion(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<L1InclusionProof>, L1ClientError>;
     fn get_finality(&self, l1_tx_id: &L1TxId) -> Result<Option<L1InclusionProof>, L1ClientError>;
 }
 
@@ -333,8 +358,7 @@ pub enum CanonicalizeError {
 /// - Recursively sort object keys (stable)
 /// - Serialize to compact JSON bytes
 fn canonical_json_bytes<T: Serialize>(v: &T) -> Result<Vec<u8>, CanonicalizeError> {
-    let mut value =
-        serde_json::to_value(v).map_err(|e| CanonicalizeError::Serde(e.to_string()))?;
+    let mut value = serde_json::to_value(v).map_err(|e| CanonicalizeError::Serde(e.to_string()))?;
     canonical_json_sort_in_place(&mut value);
     serde_json::to_vec(&value).map_err(|e| CanonicalizeError::Serde(e.to_string()))
 }
@@ -379,25 +403,3 @@ fn base64url_nopad_decode_32(s: &str) -> Result<[u8; 32], String> {
     out.copy_from_slice(&decoded);
     Ok(out)
 }
-
-mod serde_b64url_nopad {
-    use super::*;
-
-    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&base64url_nopad_encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(s.as_bytes())
-            .map_err(serde::de::Error::custom)
-    }
-}
-

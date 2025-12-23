@@ -90,7 +90,9 @@ impl L1Client for MockL1Client {
     }
 
     fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError> {
-        batch.validate().map_err(|ContractError::Invalid(s)| L1ClientError::Protocol(s))?;
+        batch
+            .validate()
+            .map_err(|ContractError::Invalid(s)| L1ClientError::Protocol(s))?;
 
         let envelope_hash = batch
             .canonical_hash_blake3()
@@ -172,4 +174,3 @@ impl L1Client for MockL1Client {
         }))
     }
 }
-

@@ -7,8 +7,8 @@
 //! Handles content attestations for videos, articles, posts, datasets, and
 //! other digital artefacts. Does NOT store content, only hashes + metadata.
 
-use l2_core::{AccountId, FixedAmount, L2BatchId, L2HubId, SettlementError};
 use l2_core::l1_contract::{Base64Bytes, FixedAmountV1, HubPayloadEnvelopeV1, L2BatchEnvelopeV1};
+use l2_core::{AccountId, FixedAmount, L2BatchId, L2HubId, SettlementError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -222,6 +222,9 @@ mod tests {
 
         let a = to_hub_payload_envelope_v1(&txs).unwrap();
         let b = to_hub_payload_envelope_v1(&txs).unwrap();
-        assert_eq!(a.canonical_hash_blake3().unwrap(), b.canonical_hash_blake3().unwrap());
+        assert_eq!(
+            a.canonical_hash_blake3().unwrap(),
+            b.canonical_hash_blake3().unwrap()
+        );
     }
 }

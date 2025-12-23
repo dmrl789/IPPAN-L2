@@ -4,7 +4,8 @@
 
 use clap::Parser;
 use hub_fin::{
-    AccountState, FinHubEngine, FinOperation, FinState, FinTransaction, InMemoryFinStateStore, HUB_ID,
+    AccountState, FinHubEngine, FinOperation, FinState, FinTransaction, InMemoryFinStateStore,
+    HUB_ID,
 };
 use l2_core::{
     l1_contract::{
@@ -163,7 +164,8 @@ fn main() {
 
     if let Some(path) = args.submit_batch.as_deref() {
         let raw = fs::read_to_string(path).expect("failed to read batch file");
-        let env: L2BatchEnvelopeV1 = serde_json::from_str(&raw).expect("invalid L2BatchEnvelopeV1 JSON");
+        let env: L2BatchEnvelopeV1 =
+            serde_json::from_str(&raw).expect("invalid L2BatchEnvelopeV1 JSON");
         env.validate().expect("envelope validation failed");
         let result = client.submit_batch(&env).expect("submit_batch");
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
