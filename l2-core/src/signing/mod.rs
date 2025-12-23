@@ -16,7 +16,8 @@ pub const SIGNING_DOMAIN_SEPARATOR_V1: &[u8] = b"IPPAN-L2:SIGNED_ENVELOPE:V1\n";
 /// Exact rule (v1):
 /// `message = SIGNING_DOMAIN_SEPARATOR_V1 || canonical_bytes(inner)`
 pub fn signing_message_bytes(inner_canonical_bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(SIGNING_DOMAIN_SEPARATOR_V1.len() + inner_canonical_bytes.len());
+    let mut out =
+        Vec::with_capacity(SIGNING_DOMAIN_SEPARATOR_V1.len() + inner_canonical_bytes.len());
     out.extend_from_slice(SIGNING_DOMAIN_SEPARATOR_V1);
     out.extend_from_slice(inner_canonical_bytes);
     out
@@ -83,7 +84,12 @@ pub struct SignedEnvelopeV1<T> {
 }
 
 impl<T> SignedEnvelopeV1<T> {
-    pub fn new(inner: T, signer: SignerId, signature: SignatureBytes, signed_hash: [u8; 32]) -> Self {
+    pub fn new(
+        inner: T,
+        signer: SignerId,
+        signature: SignatureBytes,
+        signed_hash: [u8; 32],
+    ) -> Self {
         Self {
             contract_version: "v1".to_string(),
             inner,
@@ -142,4 +148,3 @@ mod hex_32 {
         Ok(out)
     }
 }
-
