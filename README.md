@@ -66,18 +66,19 @@ IPPAN-L2/
 - [OPS.md](docs/OPS.md) - Operations guide
 - [LOCAL_RUN.md](docs/LOCAL_RUN.md) - Running locally
 - [API.md](docs/API.md) - API reference
+- [HUB-FIN MVP](docs/hub-fin/README.md) - Finance hub MVP v1 docs (actions + API)
 - [architecture.md](docs/architecture.md) - System architecture
 
 ## Status
 
 Production integration phase:
 - ✅ L2 core types (batches, proofs, hub IDs)
-- ✅ FIN Hub (tokenization, transfers)
+- ✅ FIN Hub MVP v1 (CREATE_ASSET, MINT_UNITS; deterministic state + receipts)
 - ✅ DATA Hub (content attestations)
 - ✅ Ethereum Oracle integration
 - ✅ CI/CD pipeline
 - ✅ Security baseline
-- 🔄 HTTP endpoints (planned)
+- ✅ fin-node HTTP endpoints (health/ready/metrics + /fin/*)
 - 🔄 Production deployment (planned)
 
 This repo does **not** contain IPPAN CORE code. CORE lives in the main IPPAN repository.
