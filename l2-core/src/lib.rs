@@ -19,6 +19,9 @@ pub mod hub_linkage;
 pub mod l1_contract;
 pub mod policy;
 
+#[cfg(feature = "signed-envelopes")]
+pub mod signing;
+
 /// Generic transaction envelope shared by all IPPAN L2 hubs.
 ///
 /// This structure provides a deterministic wrapper around a hub identifier,
