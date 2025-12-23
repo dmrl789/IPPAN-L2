@@ -263,7 +263,11 @@ impl LeaderLockProvider for LeaderLock {
         }
         let _ = self
             .tree
-            .compare_and_swap(LOCK_KEY, Some(cur_bytes.as_ref()), Option::<sled::IVec>::None)
+            .compare_and_swap(
+                LOCK_KEY,
+                Some(cur_bytes.as_ref()),
+                Option::<sled::IVec>::None,
+            )
             .map_err(LeaderLockError::Db)?;
         Ok(())
     }
