@@ -8,20 +8,28 @@ targets = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
 ]
-# Exclude dev dependencies from checks
-exclude-dev = true
 
 [advisories]
-# Database to check for known vulnerabilities
+# The database to check for known vulnerabilities
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# Vulnerability handling
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
-# Exceptions for specific advisories (add with justification)
-ignore = []
+# Ignore specific advisories (transitive dependencies we can't easily fix)
+ignore = [
+    # idna 0.4.0 - Punycode label issue, comes from ethers/url dependency chain
+    # Waiting for ethers to update their url dependency
+    "RUSTSEC-2024-0421",
+    # ring 0.16.20 - AES panic on overflow, comes from ethers/rustls dependency chain
+    # ethers uses older rustls which depends on ring 0.16.x
+    "RUSTSEC-2025-0009",
+    # ring 0.16.20 is unmaintained - same as above
+    "RUSTSEC-2025-0010",
+    # fxhash unmaintained - transitive from ethers
+    "RUSTSEC-2025-0057",
+    # instant unmaintained - transitive dependency
+    "RUSTSEC-2024-0384",
+    # rustls-pemfile unmaintained - transitive from reqwest/rustls
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 # Allowed licenses
@@ -38,15 +46,11 @@ allow = [
     "Unicode-DFS-2016",
     "BSL-1.0",
     "MPL-2.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
 ]
 # Confidence threshold for license detection
 confidence-threshold = 0.8
-# Deny unlicensed crates
-unlicensed = "deny"
-# Copyleft licenses to deny
-copyleft = "warn"
-# Default license for crates without explicit license
-default = "deny"
 
 # Exceptions for specific crates (add with justification)
 [[licenses.clarify]]
@@ -57,10 +61,8 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 [bans]
 # Deny multiple versions of the same crate
 multiple-versions = "warn"
-# Deny wildcard dependencies
-wildcards = "deny"
-# Allow git dependencies (sometimes needed for fixes)
-allow-build-scripts = ["*"]
+# Allow wildcard dependencies (workspace path deps don't have versions)
+wildcards = "allow"
 # Deny specific crates (add problematic crates here)
 deny = []
 # Skip checking specific crates
