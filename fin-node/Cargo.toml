@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 hub-fin = { path = "../hub-fin" }
+hub-data = { path = "../hub-data" }
 l2-core = { path = "../l2-core", features = ["l1-http"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

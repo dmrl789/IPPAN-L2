@@ -77,6 +77,8 @@ pub struct StorageConfig {
     pub receipts_dir: String,
     #[serde(default = "default_fin_db_dir")]
     pub fin_db_dir: String,
+    #[serde(default = "default_data_db_dir")]
+    pub data_db_dir: String,
 }
 
 fn default_receipts_dir() -> String {
@@ -87,11 +89,16 @@ fn default_fin_db_dir() -> String {
     "fin_db".to_string()
 }
 
+fn default_data_db_dir() -> String {
+    "data_db".to_string()
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             receipts_dir: default_receipts_dir(),
             fin_db_dir: default_fin_db_dir(),
+            data_db_dir: default_data_db_dir(),
         }
     }
 }

@@ -3,6 +3,7 @@
 #![deny(clippy::float_cmp)]
 
 mod config;
+mod data_api;
 mod fin_api;
 mod http_server;
 mod metrics;
@@ -61,6 +62,22 @@ enum Command {
 
     /// Generate deterministic example batch envelopes (writes valid idempotency_key).
     GenExample(GenExampleArgs),
+
+    /// HUB-DATA operator utilities.
+    Data {
+        #[command(subcommand)]
+        cmd: DataCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DataCommand {
+    /// Export a deterministic HUB-DATA state snapshot (audit-friendly).
+    ExportState {
+        /// Output path for the JSON snapshot.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,12 +216,21 @@ fn main() {
                 .as_ref()
                 .map(|c| c.storage.fin_db_dir.as_str())
                 .unwrap_or("fin_db");
+            let data_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.data_db_dir.as_str())
+                .unwrap_or("data_db");
 
             let store =
                 hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
             let fin_api = fin_api::FinApi::new(l1.clone(), store, PathBuf::from(receipts_dir));
 
-            http_server::serve(bind, l1, expected, metrics_enabled, fin_api)
+            let data_store =
+                hub_data::DataStore::open(data_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let data_api =
+                data_api::DataApi::new(l1.clone(), data_store, PathBuf::from(receipts_dir));
+
+            http_server::serve(bind, l1, expected, metrics_enabled, fin_api, data_api)
                 .unwrap_or_else(|e| exit_err(&e));
         }
         Command::L1 { cmd } => match cmd {
@@ -315,6 +341,24 @@ fn main() {
             });
             println!("{}", cmd.out.display());
         }
+        Command::Data { cmd } => match cmd {
+            DataCommand::ExportState { out } => {
+                let data_db_dir = cfg
+                    .as_ref()
+                    .map(|c| c.storage.data_db_dir.as_str())
+                    .unwrap_or("data_db");
+                let store = hub_data::DataStore::open(data_db_dir)
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                let snapshot = store
+                    .export_snapshot_v1()
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                let bytes = serde_json::to_vec_pretty(&snapshot).unwrap();
+                fs::write(&out, bytes).unwrap_or_else(|e| {
+                    exit_err(&format!("failed to write {}: {e}", out.display()))
+                });
+                println!("{}", out.display());
+            }
+        },
     }
 }
 
