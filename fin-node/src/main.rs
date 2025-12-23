@@ -3,6 +3,7 @@
 #![deny(clippy::float_cmp)]
 
 mod bootstrap;
+mod bootstrap_mirror_health;
 mod bootstrap_remote;
 mod bootstrap_store;
 mod config;
@@ -202,6 +203,20 @@ enum BootstrapCommand {
         #[arg(long, default_value = "bootstrap_progress.json")]
         progress: PathBuf,
     },
+
+    /// Mirror health utilities (persistent).
+    Mirrors {
+        #[command(subcommand)]
+        cmd: BootstrapMirrorsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BootstrapMirrorsCommand {
+    /// Show persisted mirror health scores.
+    Status,
+    /// Reset all persisted mirror health (dangerous; affects deterministic selection).
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]
@@ -692,6 +707,7 @@ fn main() {
                 cfg.as_ref()
                     .map(|c| c.server.max_inflight_requests)
                     .unwrap_or(64),
+                bootstrap_db_dir.clone(),
                 ha_state,
                 snapshot_pause,
                 stop,
@@ -1026,6 +1042,36 @@ fn main() {
                     crate::bootstrap_remote::fetch_and_restore(cfg, &remote, &progress, force)
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                 }
+                BootstrapCommand::Mirrors { cmd } => match cmd {
+                    BootstrapMirrorsCommand::Status => {
+                        let db_dir = cfg.storage.bootstrap_db_dir.as_str();
+                        match crate::bootstrap_mirror_health::MirrorHealthStore::open(db_dir) {
+                            Ok(store) => {
+                                let list = store.list().unwrap_or_default();
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "schema_version": 1,
+                                        "bootstrap_db_dir": db_dir,
+                                        "mirrors": list,
+                                    }))
+                                    .unwrap()
+                                );
+                            }
+                            Err(e) => exit_err(&e.to_string()),
+                        }
+                    }
+                    BootstrapMirrorsCommand::Reset => {
+                        let db_dir = cfg.storage.bootstrap_db_dir.as_str();
+                        match crate::bootstrap_mirror_health::MirrorHealthStore::open(db_dir) {
+                            Ok(store) => {
+                                store.reset().unwrap_or_else(|e| exit_err(&e.to_string()));
+                                println!("ok");
+                            }
+                            Err(e) => exit_err(&e.to_string()),
+                        }
+                    }
+                },
                 BootstrapCommand::Restore {
                     base,
                     deltas,
