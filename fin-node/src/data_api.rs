@@ -560,6 +560,10 @@ impl DataApi {
         Ok(())
     }
 
+    pub fn store(&self) -> &DataStore {
+        &self.store
+    }
+
     fn action_receipt_path(&self, action_id_hex: &str) -> PathBuf {
         self.receipts_dir
             .join("data")

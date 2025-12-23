@@ -6,6 +6,7 @@ use crate::actions::{
 use crate::types::{ActionId, AttestationId, DatasetId, LicenseId, ListingId};
 use l2_core::hub_linkage::PurchaseId;
 use sled::IVec;
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -542,6 +543,61 @@ impl DataStore {
         self.tree.flush()?;
         Ok(())
     }
+
+    /// Export the underlying sled tree as a deterministic KV stream (v1).
+    ///
+    /// Format (repeated records, big-endian lengths):
+    /// - u32 key_len
+    /// - u32 val_len
+    /// - key bytes
+    /// - val bytes
+    ///
+    /// Ordering: lexicographic by raw key bytes (sled iteration order).
+    ///
+    /// This is intended for operational snapshots (audit/recovery), not consensus.
+    pub fn export_kv_v1<W: Write>(&self, w: &mut W) -> Result<(), StoreError> {
+        for r in self.tree.iter() {
+            let (k, v) = r?;
+            write_kv_record_v1(w, k.as_ref(), v.as_ref())
+                .map_err(|e| StoreError::Decode(format!("kv export write failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Clear the underlying tree (dangerous).
+    ///
+    /// Intended for snapshot restore with explicit operator confirmation.
+    pub fn clear_all(&self) -> Result<(), StoreError> {
+        self.tree.clear()?;
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        Ok(self.tree.is_empty())
+    }
+
+    /// Import a deterministic KV stream written by `export_kv_v1`.
+    ///
+    /// This overwrites any existing keys found in the stream.
+    pub fn import_kv_v1(bytes: &[u8], path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let store = Self::open(path)?;
+        for (k, v) in read_kv_records_v1(bytes)
+            .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
+        {
+            store.tree.insert(k, v)?;
+        }
+        Ok(store)
+    }
+
+    /// Import a deterministic KV stream written by `export_kv_v1` into this store.
+    pub fn import_kv_v1_into(&self, bytes: &[u8]) -> Result<(), StoreError> {
+        for (k, v) in read_kv_records_v1(bytes)
+            .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
+        {
+            self.tree.insert(k, v)?;
+        }
+        Ok(())
+    }
 }
 
 pub mod keys {
@@ -744,4 +800,36 @@ pub struct DatasetSnapshotV1 {
     pub dataset: RegisterDatasetV1,
     pub licenses: Vec<IssueLicenseV1>,
     pub attestations: Vec<AppendAttestationV1>,
+}
+
+fn write_kv_record_v1<W: Write>(w: &mut W, k: &[u8], v: &[u8]) -> std::io::Result<()> {
+    let k_len = u32::try_from(k.len()).unwrap_or(u32::MAX);
+    let v_len = u32::try_from(v.len()).unwrap_or(u32::MAX);
+    w.write_all(&k_len.to_be_bytes())?;
+    w.write_all(&v_len.to_be_bytes())?;
+    w.write_all(k)?;
+    w.write_all(v)?;
+    Ok(())
+}
+
+type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn read_kv_records_v1(mut bytes: &[u8]) -> Result<KvPairs, String> {
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 8 {
+            return Err("truncated kv record header".to_string());
+        }
+        let k_len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let v_len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        bytes = &bytes[8..];
+        if bytes.len() < k_len.saturating_add(v_len) {
+            return Err("truncated kv record payload".to_string());
+        }
+        let k = bytes[..k_len].to_vec();
+        let v = bytes[k_len..k_len + v_len].to_vec();
+        bytes = &bytes[k_len + v_len..];
+        out.push((k, v));
+    }
+    Ok(out)
 }

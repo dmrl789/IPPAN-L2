@@ -63,6 +63,7 @@ pub fn serve(
     _cors: CorsConfig,
     max_inflight_requests: usize,
     ha_state: Arc<HaState>,
+    write_pause: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let server =
@@ -148,6 +149,25 @@ pub fn serve(
                 .with_label_values(&[route])
                 .observe(started.elapsed().as_secs_f64());
             let resp = not_leader_response(&request_id, ha_state.leader_url());
+            let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
+            let _ = req.respond(resp);
+            continue;
+        }
+
+        // Snapshot pause: block write requests while a snapshot is being created.
+        if is_write_method(method.as_str()) && write_pause.load(Ordering::Relaxed) {
+            metrics::HTTP_REQUESTS_TOTAL
+                .with_label_values(&[route, "503"])
+                .inc();
+            metrics::HTTP_REQUEST_DURATION_SECONDS
+                .with_label_values(&[route])
+                .observe(started.elapsed().as_secs_f64());
+            let resp = error_response(
+                503,
+                "SNAPSHOT_IN_PROGRESS",
+                "snapshot_in_progress",
+                &request_id,
+            );
             let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
             let _ = req.respond(resp);
             continue;
@@ -1125,11 +1145,14 @@ fn not_leader_response(
 }
 
 fn ha_blocks_write(method: &str, ha_state: &HaState) -> bool {
-    let is_write_method = matches!(method, "POST" | "PUT" | "DELETE" | "PATCH");
-    is_write_method
+    is_write_method(method)
         && ha_state.enabled()
         && ha_state.write_mode() == crate::config::HaWriteMode::LeaderOnly
         && !ha_state.is_leader()
+}
+
+fn is_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
 }
 
 fn api_error_response(e: ApiError, request_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
