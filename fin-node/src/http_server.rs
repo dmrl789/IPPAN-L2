@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
 use crate::metrics;
 use l2_core::l1_contract::{L1ChainStatus, L1Client};
@@ -37,6 +38,7 @@ pub fn serve(
     expected_network_id: Option<String>,
     metrics_enabled: bool,
     fin_api: FinApi,
+    data_api: DataApi,
 ) -> Result<(), String> {
     let server =
         Server::http(bind).map_err(|e| format!("failed to bind http server on {bind}: {e}"))?;
@@ -82,6 +84,106 @@ pub fn serve(
                 match fin_api.submit_action(&body) {
                     Ok(out) => json_response(200, &out),
                     Err(e) => api_error_response(e),
+                }
+            }
+            ("POST", "/data/datasets") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<hub_data::RegisterDatasetRequestV1>(&body) {
+                    Ok(req) => match data_api.submit_register_dataset(req) {
+                        Ok(out) => json_response(200, &out),
+                        Err(e) => data_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
+            ("POST", "/data/licenses") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<hub_data::IssueLicenseRequestV1>(&body) {
+                    Ok(req) => match data_api.submit_issue_license(req) {
+                        Ok(out) => json_response(200, &out),
+                        Err(e) => data_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
+            ("POST", "/data/attestations") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<hub_data::AppendAttestationRequestV1>(&body) {
+                    Ok(req) => match data_api.submit_append_attestation(req) {
+                        Ok(out) => json_response(200, &out),
+                        Err(e) => data_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
+            ("GET", p) if p.starts_with("/data/datasets/") && p.ends_with("/licenses") => {
+                let dataset_id = p
+                    .trim_start_matches("/data/datasets/")
+                    .trim_end_matches("/licenses");
+                match data_api.list_licenses_by_dataset(dataset_id) {
+                    Ok(list) => json_response(
+                        200,
+                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "licenses": list}),
+                    ),
+                    Err(e) => data_api_error_response(e),
+                }
+            }
+            ("GET", p) if p.starts_with("/data/datasets/") && p.ends_with("/attestations") => {
+                let dataset_id = p
+                    .trim_start_matches("/data/datasets/")
+                    .trim_end_matches("/attestations");
+                match data_api.list_attestations_by_dataset(dataset_id) {
+                    Ok(list) => json_response(
+                        200,
+                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "attestations": list}),
+                    ),
+                    Err(e) => data_api_error_response(e),
+                }
+            }
+            ("GET", p) if p.starts_with("/data/datasets/") => {
+                let dataset_id = p.trim_start_matches("/data/datasets/");
+                match data_api.get_dataset(dataset_id) {
+                    Ok(Some(ds)) => json_response(
+                        200,
+                        &serde_json::json!({"schema_version": 1, "dataset": ds}),
+                    ),
+                    Ok(None) => json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
+                    ),
+                    Err(e) => data_api_error_response(e),
+                }
+            }
+            ("GET", p) if p.starts_with("/data/licenses/") => {
+                let license_id = p.trim_start_matches("/data/licenses/");
+                match data_api.get_license(license_id) {
+                    Ok(Some(lic)) => json_response(
+                        200,
+                        &serde_json::json!({"schema_version": 1, "license": lic}),
+                    ),
+                    Ok(None) => json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
+                    ),
+                    Err(e) => data_api_error_response(e),
                 }
             }
             ("GET", p) if p.starts_with("/fin/assets/") => {
@@ -134,6 +236,23 @@ pub fn serve(
                     Err(e) => api_error_response(e),
                 }
             }
+            ("GET", p) if p.starts_with("/data/receipts/") => {
+                let action_id = p.trim_start_matches("/data/receipts/");
+                match data_api.get_receipt(action_id) {
+                    Ok(Some(raw)) => {
+                        let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                            .unwrap();
+                        Response::from_data(raw)
+                            .with_status_code(200)
+                            .with_header(h)
+                    }
+                    Ok(None) => json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
+                    ),
+                    Err(e) => data_api_error_response(e),
+                }
+            }
             _ => Response::from_string("not found\n").with_status_code(404),
         };
 
@@ -161,6 +280,20 @@ fn api_error_response(e: ApiError) -> Response<std::io::Cursor<Vec<u8>>> {
             json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
         }
         ApiError::Internal(msg) => {
+            json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
+        }
+    }
+}
+
+fn data_api_error_response(e: DataApiError) -> Response<std::io::Cursor<Vec<u8>>> {
+    match e {
+        DataApiError::BadRequest(msg) => {
+            json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
+        }
+        DataApiError::Upstream(msg) => {
+            json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
+        }
+        DataApiError::Internal(msg) => {
             json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
         }
     }
