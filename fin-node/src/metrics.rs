@@ -1,9 +1,15 @@
 #![forbid(unsafe_code)]
+// Prometheus histogram/gauge APIs use `f64`.
+#![allow(clippy::float_arithmetic)]
+#![allow(clippy::float_cmp)]
 // Prometheus gauge APIs use `f64`.
 #![allow(clippy::disallowed_types)]
 
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, Gauge, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
+};
 use std::time::Instant;
 
 static START: Lazy<Instant> = Lazy::new(Instant::now);
@@ -74,6 +80,70 @@ pub static RECON_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("recon_failures_total", "Total reconciliation failures"),
         &["kind", "reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("http_requests_total", "Total HTTP requests"),
+        &["route", "status"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "http_request_duration_seconds",
+        "HTTP request duration (seconds)",
+    )
+    // Reasonable default buckets for a small node.
+    .buckets(vec![
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ]);
+    let h = HistogramVec::new(opts, &["route"]).expect("metric");
+    REGISTRY.register(Box::new(h.clone())).expect("register");
+    h
+});
+
+pub static RATE_LIMITED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("rate_limited_total", "Total rate-limited requests"),
+        &["scope"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static PAYLOAD_REJECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("payload_rejected_total", "Total rejected payloads"),
+        &["reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static PRUNING_DELETED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("pruning_deleted_total", "Total deleted items by pruning"),
+        &["kind"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static RECEIPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("receipts_total", "Total receipts by state"),
+        &["hub", "state"],
     )
     .expect("metric");
     REGISTRY.register(Box::new(c.clone())).expect("register");

@@ -8,17 +8,52 @@ use crate::types::{AttestationId, DatasetId, Hex32, LicenseId, ListingId, PriceM
 use l2_core::AccountId;
 
 pub const NAME_MIN_LEN: usize = 1;
-pub const NAME_MAX_LEN: usize = 96;
-pub const DESCRIPTION_MAX_LEN: usize = 512;
-pub const POINTER_URI_MAX_LEN: usize = 512;
-pub const MIME_TYPE_MAX_LEN: usize = 96;
-pub const TAG_MAX_LEN: usize = 32;
-pub const TAG_MAX_COUNT: usize = 16;
-pub const TERMS_URI_MAX_LEN: usize = 512;
-pub const NONCE_MAX_LEN: usize = 64;
-pub const STATEMENT_MAX_LEN: usize = 280;
-pub const REF_URI_MAX_LEN: usize = 512;
-pub const ACCOUNT_MAX_LEN: usize = 128;
+
+/// Configurable validation limits for HUB-DATA.
+///
+/// These limits affect *admission* only and must not affect hashing semantics.
+#[derive(Debug, Clone)]
+pub struct ValidationLimits {
+    /// Global max size for generic string fields (UTF-8 bytes).
+    /// Individual fields also have their own maxima (below).
+    pub max_string_bytes: usize,
+
+    pub name_max_len: usize,
+    pub description_max_len: usize,
+    pub pointer_uri_max_len: usize,
+    pub mime_type_max_len: usize,
+    pub terms_uri_max_len: usize,
+    pub nonce_max_len: usize,
+    pub statement_max_len: usize,
+    pub ref_uri_max_len: usize,
+
+    /// Max tags count.
+    pub max_tags: usize,
+    /// Max length of an individual tag (UTF-8 bytes).
+    pub max_tag_bytes: usize,
+    /// Max account id length (UTF-8 bytes).
+    pub max_account_bytes: usize,
+}
+
+impl Default for ValidationLimits {
+    fn default() -> Self {
+        Self {
+            // Preserve previous MVP bounds by default (back-compat + tests).
+            max_string_bytes: 1024,
+            name_max_len: 96,
+            description_max_len: 512,
+            pointer_uri_max_len: 512,
+            mime_type_max_len: 96,
+            terms_uri_max_len: 512,
+            nonce_max_len: 64,
+            statement_max_len: 280,
+            ref_uri_max_len: 512,
+            max_tags: 16,
+            max_tag_bytes: 32,
+            max_account_bytes: 128,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
@@ -27,22 +62,45 @@ pub enum ValidationError {
 }
 
 pub fn validate_register_dataset_v1(a: &RegisterDatasetV1) -> Result<(), ValidationError> {
-    validate_account_id("owner", &a.owner)?;
-    validate_bounded("name", &a.name, NAME_MAX_LEN)?;
+    validate_register_dataset_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_register_dataset_v1_with_limits(
+    a: &RegisterDatasetV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("owner", &a.owner, limits)?;
+    validate_bounded(
+        "name",
+        &a.name,
+        limits.name_max_len.min(limits.max_string_bytes),
+    )?;
     if a.name.trim().len() < NAME_MIN_LEN {
         return Err(ValidationError::Invalid("name is empty".to_string()));
     }
     if let Some(desc) = a.description.as_deref() {
-        validate_bounded_allow_empty("description", desc, DESCRIPTION_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "description",
+            desc,
+            limits.description_max_len.min(limits.max_string_bytes),
+        )?;
     }
     if let Some(uri) = a.pointer_uri.as_deref() {
-        validate_bounded_allow_empty("pointer_uri", uri, POINTER_URI_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "pointer_uri",
+            uri,
+            limits.pointer_uri_max_len.min(limits.max_string_bytes),
+        )?;
     }
     if let Some(mime) = a.mime_type.as_deref() {
-        validate_bounded_allow_empty("mime_type", mime, MIME_TYPE_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "mime_type",
+            mime,
+            limits.mime_type_max_len.min(limits.max_string_bytes),
+        )?;
     }
     // Tags must already be normalized (lowercase/trimmed), sorted, and de-duplicated.
-    let normalized = normalize_tags(&a.tags)?;
+    let normalized = normalize_tags_with_limits(&a.tags, limits)?;
     if normalized != a.tags {
         return Err(ValidationError::Invalid(
             "tags must be normalized (trim + lowercase), sorted, and de-duplicated".to_string(),
@@ -61,11 +119,26 @@ pub fn validate_register_dataset_v1(a: &RegisterDatasetV1) -> Result<(), Validat
 }
 
 pub fn validate_issue_license_v1(a: &IssueLicenseV1) -> Result<(), ValidationError> {
-    validate_account_id("licensor", &a.licensor)?;
-    validate_account_id("licensee", &a.licensee)?;
-    validate_bounded("nonce", &a.nonce, NONCE_MAX_LEN)?;
+    validate_issue_license_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_issue_license_v1_with_limits(
+    a: &IssueLicenseV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("licensor", &a.licensor, limits)?;
+    validate_account_id_with_limits("licensee", &a.licensee, limits)?;
+    validate_bounded(
+        "nonce",
+        &a.nonce,
+        limits.nonce_max_len.min(limits.max_string_bytes),
+    )?;
     if let Some(uri) = a.terms_uri.as_deref() {
-        validate_bounded_allow_empty("terms_uri", uri, TERMS_URI_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "terms_uri",
+            uri,
+            limits.terms_uri_max_len.min(limits.max_string_bytes),
+        )?;
     }
 
     let expected = derive_license_id(
@@ -86,13 +159,32 @@ pub fn validate_issue_license_v1(a: &IssueLicenseV1) -> Result<(), ValidationErr
 }
 
 pub fn validate_append_attestation_v1(a: &AppendAttestationV1) -> Result<(), ValidationError> {
-    validate_account_id("attestor", &a.attestor)?;
-    validate_bounded("nonce", &a.nonce, NONCE_MAX_LEN)?;
+    validate_append_attestation_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_append_attestation_v1_with_limits(
+    a: &AppendAttestationV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("attestor", &a.attestor, limits)?;
+    validate_bounded(
+        "nonce",
+        &a.nonce,
+        limits.nonce_max_len.min(limits.max_string_bytes),
+    )?;
     if let Some(s) = a.statement.as_deref() {
-        validate_bounded_allow_empty("statement", s, STATEMENT_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "statement",
+            s,
+            limits.statement_max_len.min(limits.max_string_bytes),
+        )?;
     }
     if let Some(uri) = a.ref_uri.as_deref() {
-        validate_bounded_allow_empty("ref_uri", uri, REF_URI_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "ref_uri",
+            uri,
+            limits.ref_uri_max_len.min(limits.max_string_bytes),
+        )?;
     }
 
     let expected = derive_attestation_id(
@@ -112,14 +204,25 @@ pub fn validate_append_attestation_v1(a: &AppendAttestationV1) -> Result<(), Val
 }
 
 pub fn validate_create_listing_v1(a: &CreateListingV1) -> Result<(), ValidationError> {
-    validate_account_id("licensor", &a.licensor)?;
+    validate_create_listing_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_create_listing_v1_with_limits(
+    a: &CreateListingV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("licensor", &a.licensor, limits)?;
     if a.price_microunits.0 == 0 {
         return Err(ValidationError::Invalid(
             "price_microunits must be > 0".to_string(),
         ));
     }
     if let Some(uri) = a.terms_uri.as_deref() {
-        validate_bounded_allow_empty("terms_uri", uri, TERMS_URI_MAX_LEN)?;
+        validate_bounded_allow_empty(
+            "terms_uri",
+            uri,
+            limits.terms_uri_max_len.min(limits.max_string_bytes),
+        )?;
     }
 
     let expected = derive_listing_id_v1(
@@ -140,9 +243,16 @@ pub fn validate_create_listing_v1(a: &CreateListingV1) -> Result<(), ValidationE
 }
 
 pub fn validate_grant_entitlement_v1(a: &GrantEntitlementV1) -> Result<(), ValidationError> {
-    validate_account_id("licensee", &a.licensee)?;
+    validate_grant_entitlement_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_grant_entitlement_v1_with_limits(
+    a: &GrantEntitlementV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("licensee", &a.licensee, limits)?;
     if let Some(actor) = a.actor.as_ref() {
-        validate_account_id("actor", actor)?;
+        validate_account_id_with_limits("actor", actor, limits)?;
     }
     let expected =
         derive_entitlement_license_id_v1(a.dataset_id, a.listing_id, &a.licensee, &a.purchase_id);
@@ -277,9 +387,17 @@ pub fn derive_entitlement_license_id_v1(
 }
 
 pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ValidationError> {
-    if tags.len() > TAG_MAX_COUNT {
+    normalize_tags_with_limits(tags, &ValidationLimits::default())
+}
+
+pub fn normalize_tags_with_limits(
+    tags: &[String],
+    limits: &ValidationLimits,
+) -> Result<Vec<String>, ValidationError> {
+    if tags.len() > limits.max_tags {
         return Err(ValidationError::Invalid(format!(
-            "tags exceeds max count {TAG_MAX_COUNT}"
+            "tags exceeds max count {}",
+            limits.max_tags
         )));
     }
     let mut out = Vec::with_capacity(tags.len());
@@ -288,9 +406,10 @@ pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ValidationError> {
         if n.is_empty() {
             return Err(ValidationError::Invalid("tag is empty".to_string()));
         }
-        if n.len() > TAG_MAX_LEN {
+        if n.len() > limits.max_tag_bytes.min(limits.max_string_bytes) {
             return Err(ValidationError::Invalid(format!(
-                "tag exceeds max length {TAG_MAX_LEN}"
+                "tag exceeds max length {}",
+                limits.max_tag_bytes
             )));
         }
         out.push(n.to_ascii_lowercase());
@@ -301,7 +420,15 @@ pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ValidationError> {
 }
 
 pub fn validate_account_id(field: &str, a: &AccountId) -> Result<(), ValidationError> {
-    validate_bounded(field, &a.0, ACCOUNT_MAX_LEN)
+    validate_account_id_with_limits(field, a, &ValidationLimits::default())
+}
+
+pub fn validate_account_id_with_limits(
+    field: &str,
+    a: &AccountId,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_bounded(field, &a.0, limits.max_account_bytes)
 }
 
 fn validate_bounded(field: &str, s: &str, max_len: usize) -> Result<(), ValidationError> {
@@ -328,4 +455,50 @@ fn validate_bounded_allow_empty(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::{AttestationPolicyV1, RegisterDatasetV1};
+
+    #[test]
+    fn register_dataset_respects_max_string_bytes() {
+        let limits = ValidationLimits {
+            max_string_bytes: 1024,
+            name_max_len: 8,
+            description_max_len: 512,
+            pointer_uri_max_len: 512,
+            mime_type_max_len: 96,
+            terms_uri_max_len: 512,
+            nonce_max_len: 64,
+            statement_max_len: 280,
+            ref_uri_max_len: 512,
+            max_tags: 16,
+            max_tag_bytes: 32,
+            max_account_bytes: 128,
+        };
+
+        let owner = AccountId::new("acc-alice");
+        let name = "123456789".to_string(); // 9 bytes > 8
+        let content_hash = Hex32([1u8; 32]);
+        let schema_version = 1u32;
+        let dataset_id = derive_dataset_id(&owner, &name, &content_hash, schema_version);
+
+        let a = RegisterDatasetV1 {
+            schema_version,
+            dataset_id,
+            owner,
+            name,
+            description: None,
+            content_hash,
+            pointer_uri: None,
+            mime_type: None,
+            tags: vec![],
+            attestation_policy: AttestationPolicyV1::Anyone,
+        };
+
+        let e = validate_register_dataset_v1_with_limits(&a, &limits).unwrap_err();
+        assert!(e.to_string().contains("name exceeds max length"));
+    }
 }

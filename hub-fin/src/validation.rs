@@ -4,12 +4,39 @@ use crate::actions::{CreateAssetV1, MintUnitsV1, TransferUnitsV1};
 use crate::types::{AmountU128, AssetId32, Hex32};
 use l2_core::AccountId;
 
-pub const NAME_MAX_LEN: usize = 128;
-pub const SYMBOL_MAX_LEN: usize = 16;
-pub const METADATA_URI_MAX_LEN: usize = 256;
-pub const MEMO_MAX_LEN: usize = 256;
-pub const ACCOUNT_MAX_LEN: usize = 128;
-pub const CLIENT_TX_ID_MAX_LEN: usize = 64;
+/// Configurable validation limits for HUB-FIN.
+///
+/// These limits affect *admission* only and must not affect hashing semantics.
+#[derive(Debug, Clone)]
+pub struct ValidationLimits {
+    /// Global max size for generic string fields (UTF-8 bytes).
+    /// Individual fields also have their own maxima (below).
+    pub max_string_bytes: usize,
+
+    pub name_max_len: usize,
+    pub symbol_max_len: usize,
+    pub metadata_uri_max_len: usize,
+    pub memo_max_len: usize,
+    pub client_tx_id_max_len: usize,
+
+    /// Max account id length (UTF-8 bytes).
+    pub max_account_bytes: usize,
+}
+
+impl Default for ValidationLimits {
+    fn default() -> Self {
+        Self {
+            // Preserve previous MVP bounds by default (back-compat + tests).
+            max_string_bytes: 1024,
+            name_max_len: 128,
+            symbol_max_len: 16,
+            metadata_uri_max_len: 256,
+            memo_max_len: 256,
+            client_tx_id_max_len: 64,
+            max_account_bytes: 128,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
@@ -18,11 +45,30 @@ pub enum ValidationError {
 }
 
 pub fn validate_create_asset_v1(a: &CreateAssetV1) -> Result<(), ValidationError> {
-    validate_bounded("name", &a.name, NAME_MAX_LEN)?;
-    validate_bounded("symbol", &a.symbol, SYMBOL_MAX_LEN)?;
-    validate_account_id("issuer", &a.issuer)?;
+    validate_create_asset_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_create_asset_v1_with_limits(
+    a: &CreateAssetV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_bounded(
+        "name",
+        &a.name,
+        limits.name_max_len.min(limits.max_string_bytes),
+    )?;
+    validate_bounded(
+        "symbol",
+        &a.symbol,
+        limits.symbol_max_len.min(limits.max_string_bytes),
+    )?;
+    validate_account_id_with_limits("issuer", &a.issuer, limits)?;
     if let Some(uri) = a.metadata_uri.as_deref() {
-        validate_bounded("metadata_uri", uri, METADATA_URI_MAX_LEN)?;
+        validate_bounded(
+            "metadata_uri",
+            uri,
+            limits.metadata_uri_max_len.min(limits.max_string_bytes),
+        )?;
     }
     // Leave room for future on-chain compatibility; keep it conservative.
     if a.decimals > 18 {
@@ -42,13 +88,28 @@ pub fn validate_create_asset_v1(a: &CreateAssetV1) -> Result<(), ValidationError
 }
 
 pub fn validate_mint_units_v1(a: &MintUnitsV1) -> Result<(), ValidationError> {
-    validate_account_id("to_account", &a.to_account)?;
-    validate_bounded("client_tx_id", &a.client_tx_id, CLIENT_TX_ID_MAX_LEN)?;
+    validate_mint_units_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_mint_units_v1_with_limits(
+    a: &MintUnitsV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("to_account", &a.to_account, limits)?;
+    validate_bounded(
+        "client_tx_id",
+        &a.client_tx_id,
+        limits.client_tx_id_max_len.min(limits.max_string_bytes),
+    )?;
     if let Some(memo) = a.memo.as_deref() {
-        validate_bounded("memo", memo, MEMO_MAX_LEN)?;
+        validate_bounded(
+            "memo",
+            memo,
+            limits.memo_max_len.min(limits.max_string_bytes),
+        )?;
     }
     if let Some(actor) = a.actor.as_ref() {
-        validate_account_id("actor", actor)?;
+        validate_account_id_with_limits("actor", actor, limits)?;
     }
     if a.amount.0 == 0 {
         return Err(ValidationError::Invalid("amount must be > 0".to_string()));
@@ -57,14 +118,29 @@ pub fn validate_mint_units_v1(a: &MintUnitsV1) -> Result<(), ValidationError> {
 }
 
 pub fn validate_transfer_units_v1(a: &TransferUnitsV1) -> Result<(), ValidationError> {
-    validate_account_id("from_account", &a.from_account)?;
-    validate_account_id("to_account", &a.to_account)?;
-    validate_bounded("client_tx_id", &a.client_tx_id, CLIENT_TX_ID_MAX_LEN)?;
+    validate_transfer_units_v1_with_limits(a, &ValidationLimits::default())
+}
+
+pub fn validate_transfer_units_v1_with_limits(
+    a: &TransferUnitsV1,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_account_id_with_limits("from_account", &a.from_account, limits)?;
+    validate_account_id_with_limits("to_account", &a.to_account, limits)?;
+    validate_bounded(
+        "client_tx_id",
+        &a.client_tx_id,
+        limits.client_tx_id_max_len.min(limits.max_string_bytes),
+    )?;
     if let Some(memo) = a.memo.as_deref() {
-        validate_bounded("memo", memo, MEMO_MAX_LEN)?;
+        validate_bounded(
+            "memo",
+            memo,
+            limits.memo_max_len.min(limits.max_string_bytes),
+        )?;
     }
     if let Some(actor) = a.actor.as_ref() {
-        validate_account_id("actor", actor)?;
+        validate_account_id_with_limits("actor", actor, limits)?;
     }
     if a.amount.0 == 0 {
         return Err(ValidationError::Invalid("amount must be > 0".to_string()));
@@ -73,7 +149,15 @@ pub fn validate_transfer_units_v1(a: &TransferUnitsV1) -> Result<(), ValidationE
 }
 
 pub fn validate_account_id(field: &str, a: &AccountId) -> Result<(), ValidationError> {
-    validate_bounded(field, &a.0, ACCOUNT_MAX_LEN)
+    validate_account_id_with_limits(field, a, &ValidationLimits::default())
+}
+
+pub fn validate_account_id_with_limits(
+    field: &str,
+    a: &AccountId,
+    limits: &ValidationLimits,
+) -> Result<(), ValidationError> {
+    validate_bounded(field, &a.0, limits.max_account_bytes)
 }
 
 fn validate_bounded(field: &str, s: &str, max_len: usize) -> Result<(), ValidationError> {

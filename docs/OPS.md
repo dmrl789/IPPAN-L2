@@ -109,6 +109,66 @@ export RUST_LOG_FORMAT=json
 | `/data/receipts/:action_id` | GET | DATA action receipt JSON (includes `submit_state`) |
 | `/linkage/purchase/:purchase_id` | GET | Linkage purchase receipt JSON (includes `*_submit_state` + `overall_status`) |
 
+## Rate limiting (fin-node HTTP)
+
+`fin-node` includes a **best-effort in-memory token bucket** rate limiter:
+
+- **Per-IP** bucket: applied to all endpoints except `/healthz`, `/readyz`, `/metrics`.
+- **Per-actor** bucket: applied to write endpoints after request parsing (actor derived from request).
+
+### Configuration
+
+Enable and tune via config:
+
+```toml
+[rate_limit]
+enabled = true
+requests_per_minute = 120
+burst = 60
+```
+
+### Behavior
+
+- **HTTP 429** on limit exceeded
+- Includes **`Retry-After`** header (seconds)
+
+### Limitations
+
+- **Per-process only**: if you run multiple `fin-node` instances behind a load balancer, rate limiting is not shared and becomes **best-effort**.
+
+## Retention & pruning (receipts)
+
+`fin-node` can prune old receipt files under `storage.receipts_dir` using the retention policy.
+
+### Configuration
+
+```toml
+[limits]
+max_receipt_bytes = 262144
+
+[retention]
+receipts_days = 30
+min_receipts_keep = 1000
+```
+
+### Manual pruning
+
+Dry-run (default):
+
+```bash
+cargo run -p fin-node -- prune --dry-run
+```
+
+Execute:
+
+```bash
+cargo run -p fin-node -- prune --execute
+```
+
+Safety notes:
+- Pruning only targets **receipt JSON files** with parseable timestamps.
+- It will always keep at least `retention.min_receipts_keep` newest receipts.
+
 ### Health Check Examples
 
 ```bash

@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 use base64::Engine as _;
-use hub_data::apply::ApplyError as DataApplyError;
+use hub_data::apply::{apply_with_policy_and_limits, ApplyError as DataApplyError};
 use hub_data::{
-    apply_with_policy, AppendAttestationRequestV1, ApplyOutcome, CreateListingRequestV1,
-    CreateListingV1, DataActionV1, DataEnvelopeV1, DataStore, GrantEntitlementV1, Hex32,
-    IssueLicenseRequestV1, RegisterDatasetRequestV1,
+    AppendAttestationRequestV1, ApplyOutcome, CreateListingRequestV1, CreateListingV1,
+    DataActionV1, DataEnvelopeV1, DataStore, GrantEntitlementV1, Hex32, IssueLicenseRequestV1,
+    RegisterDatasetRequestV1,
 };
 use l2_core::finality::SubmitState;
 use l2_core::l1_contract::{
@@ -20,6 +20,7 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
+use crate::metrics;
 use crate::policy_runtime::{ComplianceStrategy, PolicyRuntime};
 use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
 
@@ -30,6 +31,7 @@ pub struct DataApi {
     receipts_dir: PathBuf,
     policy: PolicyRuntime,
     recon: Option<ReconStore>,
+    limits: hub_data::validation::ValidationLimits,
 }
 
 impl DataApi {
@@ -45,6 +47,7 @@ impl DataApi {
             receipts_dir,
             policy: PolicyRuntime::default(),
             recon: None,
+            limits: hub_data::validation::ValidationLimits::default(),
         }
     }
 
@@ -65,12 +68,31 @@ impl DataApi {
         policy: PolicyRuntime,
         recon: Option<ReconStore>,
     ) -> Self {
+        Self::new_with_policy_recon_and_limits(
+            l1,
+            store,
+            receipts_dir,
+            policy,
+            recon,
+            hub_data::validation::ValidationLimits::default(),
+        )
+    }
+
+    pub fn new_with_policy_recon_and_limits(
+        l1: Arc<dyn L1Client + Send + Sync>,
+        store: DataStore,
+        receipts_dir: PathBuf,
+        policy: PolicyRuntime,
+        recon: Option<ReconStore>,
+        limits: hub_data::validation::ValidationLimits,
+    ) -> Self {
         Self {
             l1,
             store,
             receipts_dir,
             policy,
             recon,
+            limits,
         }
     }
 
@@ -135,24 +157,29 @@ impl DataApi {
         self.enforce_compliance(&env.action, &context_id)?;
 
         // 1) Apply locally (sled)
-        let local =
-            match apply_with_policy(&env, &self.store, self.policy.mode, &self.policy.admins) {
-                Ok(x) => x,
-                Err(e) => {
-                    let api_err = ApiError::from_apply_with_context(e, context_id.clone());
-                    if let ApiError::PolicyDenied(p) = &api_err {
-                        warn!(
-                            event = "action_denied",
-                            hub = "data",
-                            action_kind = %data_action_kind(&env.action),
-                            action_id = %context_id,
-                            code = ?p.code,
-                            message = %p.message
-                        );
-                    }
-                    return Err(api_err);
+        let local = match apply_with_policy_and_limits(
+            &env,
+            &self.store,
+            self.policy.mode,
+            &self.policy.admins,
+            &self.limits,
+        ) {
+            Ok(x) => x,
+            Err(e) => {
+                let api_err = ApiError::from_apply_with_context(e, context_id.clone());
+                if let ApiError::PolicyDenied(p) = &api_err {
+                    warn!(
+                        event = "action_denied",
+                        hub = "data",
+                        action_kind = %data_action_kind(&env.action),
+                        action_id = %context_id,
+                        code = ?p.code,
+                        message = %p.message
+                    );
                 }
-            };
+                return Err(api_err);
+            }
+        };
 
         info!(
             event = "action_applied",
@@ -301,15 +328,6 @@ impl DataApi {
             .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
-    pub fn list_listings_by_dataset_typed(
-        &self,
-        dataset_id: Hex32,
-    ) -> Result<Vec<CreateListingV1>, ApiError> {
-        self.store
-            .list_listings_by_dataset(dataset_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))
-    }
-
     pub fn list_entitlements_by_dataset_typed(
         &self,
         dataset_id: Hex32,
@@ -328,36 +346,157 @@ impl DataApi {
             .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
-    pub fn list_licenses_by_dataset(
+    pub fn list_licenses_by_dataset_page(
         &self,
         dataset_id_hex: &str,
-    ) -> Result<Vec<serde_json::Value>, ApiError> {
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), ApiError> {
         let dataset_id = Hex32::from_hex(dataset_id_hex)
             .map_err(|e| ApiError::BadRequest(format!("invalid dataset_id hex: {e}")))?;
-        let list = self
+        let mut ids = self
             .store
-            .list_licenses_by_dataset(dataset_id)
+            .list_license_ids_by_dataset_page(dataset_id, after, limit.saturating_add(1))
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok(list
-            .into_iter()
-            .map(|x| serde_json::to_value(x).expect("serde value"))
-            .collect())
+
+        let next_cursor = if ids.len() > limit {
+            ids.truncate(limit);
+            ids.last().map(|x| x.to_hex())
+        } else {
+            None
+        };
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(l) = self
+                .store
+                .get_license(id)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                out.push(serde_json::to_value(l).expect("serde value"));
+            }
+        }
+        Ok((out, next_cursor))
     }
 
-    pub fn list_attestations_by_dataset(
+    pub fn list_attestations_by_dataset_page(
         &self,
         dataset_id_hex: &str,
-    ) -> Result<Vec<serde_json::Value>, ApiError> {
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), ApiError> {
         let dataset_id = Hex32::from_hex(dataset_id_hex)
             .map_err(|e| ApiError::BadRequest(format!("invalid dataset_id hex: {e}")))?;
-        let list = self
+        let mut ids = self
             .store
-            .list_attestations_by_dataset(dataset_id)
+            .list_attestation_ids_by_dataset_page(dataset_id, after, limit.saturating_add(1))
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok(list
-            .into_iter()
-            .map(|x| serde_json::to_value(x).expect("serde value"))
-            .collect())
+
+        let next_cursor = if ids.len() > limit {
+            ids.truncate(limit);
+            ids.last().map(|x| x.to_hex())
+        } else {
+            None
+        };
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(a) = self
+                .store
+                .get_attestation(id)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                out.push(serde_json::to_value(a).expect("serde value"));
+            }
+        }
+        Ok((out, next_cursor))
+    }
+
+    pub fn list_listings_by_dataset_page_typed(
+        &self,
+        dataset_id: Hex32,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<CreateListingV1>, Option<String>), ApiError> {
+        let mut ids = self
+            .store
+            .list_listing_ids_by_dataset_page(dataset_id, after, limit.saturating_add(1))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let next_cursor = if ids.len() > limit {
+            ids.truncate(limit);
+            ids.last().map(|x| x.to_hex())
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(x) = self
+                .store
+                .get_listing(id)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                out.push(x);
+            }
+        }
+        Ok((out, next_cursor))
+    }
+
+    pub fn list_entitlements_by_dataset_page_typed(
+        &self,
+        dataset_id: Hex32,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<GrantEntitlementV1>, Option<String>), ApiError> {
+        let mut ids = self
+            .store
+            .list_purchase_ids_by_dataset_page(dataset_id, after, limit.saturating_add(1))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let next_cursor = if ids.len() > limit {
+            ids.truncate(limit);
+            ids.last().map(|x| x.to_hex())
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for pid in ids {
+            if let Some(x) = self
+                .store
+                .get_entitlement(pid)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                out.push(x);
+            }
+        }
+        Ok((out, next_cursor))
+    }
+
+    pub fn list_entitlements_by_licensee_page_typed(
+        &self,
+        licensee: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<GrantEntitlementV1>, Option<String>), ApiError> {
+        let mut ids = self
+            .store
+            .list_purchase_ids_by_licensee_page(licensee, after, limit.saturating_add(1))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let next_cursor = if ids.len() > limit {
+            ids.truncate(limit);
+            ids.last().map(|x| x.to_hex())
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for pid in ids {
+            if let Some(x) = self
+                .store
+                .get_entitlement(pid)
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                out.push(x);
+            }
+        }
+        Ok((out, next_cursor))
     }
 
     pub fn get_receipt(&self, action_id_hex: &str) -> Result<Option<Vec<u8>>, ApiError> {
@@ -402,11 +541,22 @@ impl DataApi {
             .ok_or_else(|| ApiError::Internal("missing data receipt".to_string()))?;
         r.submit_state = submit_state;
         let _ = self.persist_action_receipt(&r)?;
+        metrics::RECEIPTS_TOTAL
+            .with_label_values(&["data", submit_state_label(&r.submit_state)])
+            .inc();
         Ok(())
     }
 
     pub fn persist_receipt_typed(&self, receipt: &DataActionReceiptV1) -> Result<(), ApiError> {
         let _ = self.persist_action_receipt(receipt)?;
+        Ok(())
+    }
+
+    /// Flush underlying stores to disk (best-effort).
+    pub fn flush(&self) -> Result<(), ApiError> {
+        self.store
+            .flush()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -431,6 +581,10 @@ impl DataApi {
         self.store
             .put_final_receipt(action_id, &bytes)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        metrics::RECEIPTS_TOTAL
+            .with_label_values(&["data", "written"])
+            .inc();
 
         Ok(out)
     }
@@ -544,6 +698,9 @@ pub struct DataActionReceiptV1 {
     #[serde(default)]
     pub submit_state: SubmitState,
     pub written_at: String,
+    /// Unix seconds when the receipt was written (for retention/pruning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at_unix_secs: Option<u64>,
 }
 
 impl DataActionReceiptV1 {
@@ -557,6 +714,7 @@ impl DataActionReceiptV1 {
         let written_at = time::OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
+        let written_at_unix_secs = unix_now_secs();
         let batch_canonical_hash = b64url32(
             &batch
                 .canonical_hash_blake3()
@@ -581,6 +739,7 @@ impl DataActionReceiptV1 {
                 l1_tx_id: submit.l1_tx_id.as_ref().map(|x| x.0.clone()),
             },
             written_at,
+            written_at_unix_secs: Some(written_at_unix_secs),
         }
     }
 }
@@ -594,6 +753,16 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn submit_state_label(s: &SubmitState) -> &'static str {
+    match s {
+        SubmitState::NotSubmitted => "not_submitted",
+        SubmitState::Submitted { .. } => "submitted",
+        SubmitState::Included { .. } => "included",
+        SubmitState::Finalized { .. } => "finalized",
+        SubmitState::Failed { .. } => "failed",
+    }
 }
 
 #[cfg(test)]
@@ -691,8 +860,11 @@ mod tests {
         let got = api.get_license(&license_id).unwrap();
         assert!(got.is_some());
 
-        let list = api.list_licenses_by_dataset(&dataset_id).unwrap();
+        let (list, next) = api
+            .list_licenses_by_dataset_page(&dataset_id, None, 10)
+            .unwrap();
         assert_eq!(list.len(), 1);
+        assert!(next.is_none());
     }
 
     #[test]
@@ -737,7 +909,10 @@ mod tests {
             .unwrap();
         assert!(att.attestation_id.is_some());
 
-        let list = api.list_attestations_by_dataset(&dataset_id).unwrap();
+        let (list, next) = api
+            .list_attestations_by_dataset_page(&dataset_id, None, 10)
+            .unwrap();
         assert_eq!(list.len(), 1);
+        assert!(next.is_none());
     }
 }

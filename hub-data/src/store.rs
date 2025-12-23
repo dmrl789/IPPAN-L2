@@ -117,6 +117,23 @@ impl DataStore {
         Ok(out)
     }
 
+    /// List license ids by dataset in stable order with cursor pagination.
+    ///
+    /// - `after` is the last seen license id hex (exclusive).
+    /// - Ordering is lexicographic by license id hex (via key ordering).
+    pub fn list_license_ids_by_dataset_page(
+        &self,
+        dataset_id: DatasetId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<LicenseId>, StoreError> {
+        let prefix = keys::license_by_dataset_prefix(dataset_id);
+        scan_index_tail_hex_page(&self.tree, &prefix, after, limit)
+            .into_iter()
+            .map(|hex| crate::types::Hex32::from_hex(&hex).map_err(StoreError::Decode))
+            .collect()
+    }
+
     pub fn list_licenses_by_dataset(
         &self,
         dataset_id: DatasetId,
@@ -198,6 +215,19 @@ impl DataStore {
         Ok(out)
     }
 
+    pub fn list_listing_ids_by_dataset_page(
+        &self,
+        dataset_id: DatasetId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ListingId>, StoreError> {
+        let prefix = keys::listing_by_dataset_prefix(dataset_id);
+        scan_index_tail_hex_page(&self.tree, &prefix, after, limit)
+            .into_iter()
+            .map(|hex| crate::types::Hex32::from_hex(&hex).map_err(StoreError::Decode))
+            .collect()
+    }
+
     pub fn list_listings_by_dataset(
         &self,
         dataset_id: DatasetId,
@@ -275,6 +305,19 @@ impl DataStore {
         Ok(out)
     }
 
+    pub fn list_purchase_ids_by_dataset_page(
+        &self,
+        dataset_id: DatasetId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PurchaseId>, StoreError> {
+        let prefix = keys::ent_by_dataset_prefix(dataset_id);
+        scan_index_tail_hex_page(&self.tree, &prefix, after, limit)
+            .into_iter()
+            .map(|hex| PurchaseId::from_hex(&hex).map_err(StoreError::Decode))
+            .collect()
+    }
+
     pub fn list_purchase_ids_by_licensee(
         &self,
         licensee: &str,
@@ -291,6 +334,19 @@ impl DataStore {
             out.push(PurchaseId::from_hex(tail).map_err(StoreError::Decode)?);
         }
         Ok(out)
+    }
+
+    pub fn list_purchase_ids_by_licensee_page(
+        &self,
+        licensee: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PurchaseId>, StoreError> {
+        let prefix = keys::ent_by_licensee_prefix(licensee);
+        scan_index_tail_hex_page(&self.tree, &prefix, after, limit)
+            .into_iter()
+            .map(|hex| PurchaseId::from_hex(&hex).map_err(StoreError::Decode))
+            .collect()
     }
 
     pub fn list_entitlements_by_dataset(
@@ -361,6 +417,22 @@ impl DataStore {
             );
         }
         Ok(out)
+    }
+
+    pub fn list_attestation_ids_by_dataset_page(
+        &self,
+        dataset_id: DatasetId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AttestationId>, StoreError> {
+        let prefix = keys::attestation_by_dataset_prefix(dataset_id);
+        scan_index_tail_hex_page(&self.tree, &prefix, after, limit)
+            .into_iter()
+            .map(|hex| {
+                crate::types::Hex32::from_hex(&hex)
+                    .map_err(|e| StoreError::Decode(format!("invalid attestation_id in key: {e}")))
+            })
+            .collect()
     }
 
     pub fn list_attestations_by_dataset(
@@ -463,6 +535,12 @@ impl DataStore {
 
     pub(crate) fn tree(&self) -> &sled::Tree {
         &self.tree
+    }
+
+    /// Flush pending writes to disk (best-effort).
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.tree.flush()?;
+        Ok(())
     }
 }
 
@@ -575,6 +653,82 @@ pub mod keys {
 
     pub fn apply_receipt(action_id: ActionId) -> Vec<u8> {
         format!("apply_receipt:{}", action_id.to_hex()).into_bytes()
+    }
+}
+
+fn scan_index_tail_hex_page(
+    tree: &sled::Tree,
+    prefix: &[u8],
+    after: Option<&str>,
+    limit: usize,
+) -> Vec<String> {
+    // Keys are ASCII strings of the form:
+    //   "<prefix><hex>"
+    // We iterate in lexicographic order.
+    let start = if let Some(after) = after {
+        let mut s = prefix.to_vec();
+        s.extend_from_slice(after.as_bytes());
+        // Ensure we start strictly after the cursor key.
+        s.push(0);
+        s
+    } else {
+        prefix.to_vec()
+    };
+
+    let mut out = Vec::new();
+    for r in tree.range(start..) {
+        let (k, _) = match r {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        if !k.starts_with(prefix) {
+            break;
+        }
+        if out.len() >= limit {
+            break;
+        }
+        let s = match std::str::from_utf8(k.as_ref()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Some((_, tail)) = s.rsplit_once(':') else {
+            continue;
+        };
+        out.push(tail.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn license_ids_by_dataset_page_paginates_stably() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = DataStore::open(tmp.path()).expect("open");
+        let did = crate::types::Hex32([0u8; 32]);
+
+        // Insert 5 index keys with increasing license ids.
+        for i in 1u8..=5u8 {
+            let lid = crate::types::Hex32([i; 32]);
+            store
+                .tree
+                .insert(keys::license_by_dataset(did, lid), IVec::from(&b"1"[..]))
+                .expect("insert");
+        }
+
+        let page1 = store
+            .list_license_ids_by_dataset_page(did, None, 2)
+            .expect("page1");
+        assert_eq!(page1.len(), 2);
+        let after = page1.last().unwrap().to_hex();
+
+        let page2 = store
+            .list_license_ids_by_dataset_page(did, Some(&after), 2)
+            .expect("page2");
+        assert_eq!(page2.len(), 2);
+        assert!(page2[0].to_hex() > after);
     }
 }
 

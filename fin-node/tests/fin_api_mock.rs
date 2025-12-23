@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use fin_node::fin_api::FinApi;
-use hub_fin::FinStore;
+use hub_fin::{FinActionRequestV1, FinStore};
 use l2_core::l1_contract::{mock_client::MockL1Client, IdempotencyKey, L1Client};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,8 +34,9 @@ fn fin_api_submit_create_asset_and_mint_updates_state_and_writes_receipts() {
         "decimals": 6,
         "metadata_uri": "https://example.com/eurx"
     });
+    let create_req: FinActionRequestV1 = serde_json::from_value(create_body).expect("create req");
     let create = api
-        .submit_action(&serde_json::to_vec(&create_body).unwrap())
+        .submit_action_obj(create_req.into_action())
         .expect("submit create");
     assert!(PathBuf::from(&create.receipt_path).exists());
     let asset_id = create.asset_id.clone().expect("asset_id");
@@ -57,8 +58,9 @@ fn fin_api_submit_create_asset_and_mint_updates_state_and_writes_receipts() {
         "client_tx_id": "mint-001",
         "memo": "genesis allocation"
     });
+    let mint_req: FinActionRequestV1 = serde_json::from_value(mint_body.clone()).expect("mint req");
     let mint = api
-        .submit_action(&serde_json::to_vec(&mint_body).unwrap())
+        .submit_action_obj(mint_req.into_action())
         .expect("submit mint");
     assert!(PathBuf::from(&mint.receipt_path).exists());
     assert_eq!(mint.local_apply_outcome, hub_fin::ApplyOutcome::Applied);
@@ -84,8 +86,9 @@ fn fin_api_submit_create_asset_and_mint_updates_state_and_writes_receipts() {
     assert!(inclusion.is_some());
 
     // 3) Replay same mint => already applied + already known at L1.
+    let mint_req2: FinActionRequestV1 = serde_json::from_value(mint_body).expect("mint req2");
     let mint2 = api
-        .submit_action(&serde_json::to_vec(&mint_body).unwrap())
+        .submit_action_obj(mint_req2.into_action())
         .expect("submit mint replay");
     assert_eq!(
         mint2.local_apply_outcome,

@@ -123,12 +123,31 @@ impl ReconStore {
         Ok(())
     }
 
-    /// List all pending items, bounded by `limit`.
-    pub fn list_pending(&self, limit: usize) -> Result<Vec<ReconItem>, ReconStoreError> {
+    /// List pending items in stable key order with cursor pagination.
+    ///
+    /// Cursor format: `"{kind}:{id}"` where `kind` is snake_case (e.g. `fin_action`).
+    pub fn list_pending_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<ReconItem>, Option<String>), ReconStoreError> {
+        let prefix = b"recon:pending:";
+        let start = if let Some(after) = after {
+            let mut s = Vec::new();
+            s.extend_from_slice(prefix);
+            s.extend_from_slice(after.as_bytes());
+            s.push(0);
+            s
+        } else {
+            prefix.to_vec()
+        };
+
         let mut out = Vec::new();
-        for r in self.tree.scan_prefix(b"recon:pending:") {
+        let mut next_cursor = None;
+
+        for r in self.tree.range(start..) {
             let (k, v) = r?;
-            if out.len() >= limit {
+            if !k.starts_with(prefix) {
                 break;
             }
             if let Some((kind, id)) = decode_key(&k) {
@@ -138,8 +157,16 @@ impl ReconStore {
                     meta: decode_meta(&v)?,
                 });
             }
+            if out.len() > limit {
+                // Truncate to limit and compute next cursor from the last kept item.
+                out.truncate(limit);
+                if let Some(last) = out.last() {
+                    next_cursor = Some(format!("{}:{}", last.kind.as_str(), last.id));
+                }
+                break;
+            }
         }
-        Ok(out)
+        Ok((out, next_cursor))
     }
 
     /// Fetch up to `limit` due items (where `next_check_at <= now_secs`), sorted deterministically.
@@ -192,6 +219,12 @@ impl ReconStore {
         }
         Ok(m)
     }
+
+    /// Flush pending writes to disk (best-effort).
+    pub fn flush(&self) -> Result<(), ReconStoreError> {
+        self.tree.flush()?;
+        Ok(())
+    }
 }
 
 fn key_pending(kind: ReconKind, id: &str) -> Vec<u8> {
@@ -219,4 +252,31 @@ fn encode_meta(meta: &ReconMetadata) -> Result<Vec<u8>, ReconStoreError> {
 
 fn decode_meta(v: &[u8]) -> Result<ReconMetadata, ReconStoreError> {
     serde_json::from_slice(v).map_err(|e| ReconStoreError::Serde(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_pending_page_uses_cursor() {
+        let store = ReconStore::open_temporary().expect("tmp recon");
+        let meta = ReconMetadata::new(0);
+        store
+            .enqueue(ReconKind::FinAction, "aa", &meta)
+            .expect("enqueue");
+        store
+            .enqueue(ReconKind::FinAction, "bb", &meta)
+            .expect("enqueue");
+        store
+            .enqueue(ReconKind::FinAction, "cc", &meta)
+            .expect("enqueue");
+
+        let (p1, next) = store.list_pending_page(None, 2).expect("page1");
+        assert_eq!(p1.len(), 2);
+        assert!(next.is_some());
+
+        let (p2, _) = store.list_pending_page(next.as_deref(), 2).expect("page2");
+        assert_eq!(p2.len(), 1);
+    }
 }

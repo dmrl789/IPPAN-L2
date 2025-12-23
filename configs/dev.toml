@@ -35,6 +35,38 @@ get_finality = "env:L1_ENDPOINT_GET_FINALITY"
 bind_address = "0.0.0.0:3000"
 # Enable metrics endpoint
 metrics_enabled = true
+max_inflight_requests = 64
+
+[limits]
+max_body_bytes = 524288
+max_string_bytes = 2048
+max_tags = 64
+max_tag_bytes = 64
+max_batch_items = 512
+max_receipt_bytes = 524288
+max_json_depth = 64
+
+[rate_limit]
+enabled = true
+requests_per_minute = 300
+burst = 120
+
+[pagination]
+default_limit = 50
+max_limit = 200
+
+[retention]
+receipts_days = 14
+recon_failed_days = 7
+min_receipts_keep = 200
+
+[pruning]
+enabled = true
+interval_secs = 86400
+
+[cors]
+enabled = false
+allow_origins = []
 
 [hubs]
 # Enable FIN Hub
