@@ -3,6 +3,7 @@
 #![deny(clippy::float_cmp)]
 
 mod config;
+mod fin_api;
 mod http_server;
 mod metrics;
 
@@ -189,7 +190,21 @@ fn main() {
                 .as_ref()
                 .map(|c| c.server.metrics_enabled)
                 .unwrap_or(true);
-            http_server::serve(bind, l1, expected, metrics_enabled)
+
+            let receipts_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.receipts_dir.as_str())
+                .unwrap_or("receipts");
+            let fin_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.fin_db_dir.as_str())
+                .unwrap_or("fin_db");
+
+            let store =
+                hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let fin_api = fin_api::FinApi::new(l1.clone(), store, PathBuf::from(receipts_dir));
+
+            http_server::serve(bind, l1, expected, metrics_enabled, fin_api)
                 .unwrap_or_else(|e| exit_err(&e));
         }
         Command::L1 { cmd } => match cmd {

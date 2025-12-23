@@ -1,5 +1,9 @@
 # IPPAN FIN Hub – Specification (Draft)
 
+> **Note (MVP v1 implemented):** The production-ready HUB-FIN MVP is documented under `docs/hub-fin/`
+> (see `docs/hub-fin/README.md`). This draft spec below describes an earlier, broader design and may
+> not match the current MVP surface.
+
 The IPPAN FIN Hub is a Layer 2 (L2) execution environment for financial
 instruments running on top of IPPAN CORE (L1). It supports:
 

@@ -18,3 +18,9 @@ l2-core = { path = "../l2-core" }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+blake3 = "1"
+hex = "0.4"
+sled = "0.34"
+
+[dev-dependencies]
+tempfile = "3"
