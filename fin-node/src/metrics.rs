@@ -7,8 +7,8 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::time::Instant;
 
@@ -134,6 +134,39 @@ pub static PRUNING_DELETED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("pruning_deleted_total", "Total deleted items by pruning"),
         &["kind"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static HA_IS_LEADER: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::with_opts(Opts::new(
+        "ha_is_leader",
+        "Whether this node is leader (0/1)",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+pub static HA_LEADER_CHANGES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("ha_leader_changes_total", "Total leadership transitions"),
+        &["event"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static HA_LOCK_ACQUIRE_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ha_lock_acquire_failures_total",
+            "Total HA lock acquire failures",
+        ),
+        &["reason"],
     )
     .expect("metric");
     REGISTRY.register(Box::new(c.clone())).expect("register");

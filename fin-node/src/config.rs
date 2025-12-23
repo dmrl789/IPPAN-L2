@@ -6,6 +6,7 @@
 use l2_core::l1_contract::http_client::L1RpcConfig;
 use l2_core::policy::PolicyMode;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +38,8 @@ pub struct FinNodeConfig {
     pub recon: ReconConfig,
     #[serde(default)]
     pub linkage: LinkageConfig,
+    #[serde(default)]
+    pub ha: HaConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -477,6 +480,66 @@ impl Default for LinkageConfig {
     fn default() -> Self {
         Self {
             entitlement_policy: LinkageEntitlementPolicy::Optimistic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HaConfig {
+    #[serde(default = "default_ha_enabled")]
+    pub enabled: bool,
+    /// Unique identifier for this node instance (used as the lock holder id).
+    #[serde(default = "default_ha_node_id")]
+    pub node_id: String,
+    /// Lease duration (milliseconds). The leader renews every `lease_ms/3`.
+    #[serde(default = "default_ha_lease_ms")]
+    pub lease_ms: u64,
+    /// Directory used for the Sled-based leader lock (must be shared across nodes).
+    #[serde(default = "default_ha_lock_db_dir")]
+    pub lock_db_dir: String,
+    /// Write policy when HA is enabled.
+    #[serde(default)]
+    pub write_mode: HaWriteMode,
+    /// Optional mapping from node_id -> base HTTP URL (used for leader hints).
+    #[serde(default)]
+    pub leader_urls: BTreeMap<String, String>,
+}
+
+fn default_ha_enabled() -> bool {
+    false
+}
+
+fn default_ha_node_id() -> String {
+    "fin-node-1".to_string()
+}
+
+fn default_ha_lease_ms() -> u64 {
+    15_000
+}
+
+fn default_ha_lock_db_dir() -> String {
+    "ha_db".to_string()
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HaWriteMode {
+    /// Only the leader accepts mutating HTTP requests.
+    #[default]
+    LeaderOnly,
+    /// Allow writes on all nodes (dev mode; still bounded by shared storage contention).
+    AllowAll,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ha_enabled(),
+            node_id: default_ha_node_id(),
+            lease_ms: default_ha_lease_ms(),
+            lock_db_dir: default_ha_lock_db_dir(),
+            write_mode: HaWriteMode::LeaderOnly,
+            leader_urls: BTreeMap::new(),
         }
     }
 }

@@ -5,6 +5,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct PrunePlan {
@@ -102,6 +105,61 @@ pub fn execute_prune(plan: &PrunePlan) -> Result<(), String> {
         fs::remove_file(p).map_err(|e| format!("failed deleting {}: {e}", p.display()))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct PruningLoop {
+    pub receipts_dir: PathBuf,
+    pub retention: RetentionConfig,
+    pub limits: LimitsConfig,
+    pub interval_secs: u64,
+}
+
+impl PruningLoop {
+    pub fn start(self, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            info!(
+                event = "pruning_loop_started",
+                interval_secs = self.interval_secs
+            );
+            let interval = std::time::Duration::from_secs(u64::max(60, self.interval_secs));
+            while !stop.load(Ordering::Relaxed) {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                match plan_prune_receipts_dir(
+                    &self.receipts_dir,
+                    &self.retention,
+                    &self.limits,
+                    now_secs,
+                ) {
+                    Ok(plan) => {
+                        let delete_count = plan.deletions.len();
+                        if delete_count > 0 {
+                            if let Err(e) = execute_prune(&plan) {
+                                warn!(event = "pruning_failed", error = %e);
+                            } else {
+                                info!(event = "pruning_completed", deleted = delete_count);
+                                crate::metrics::PRUNING_DELETED_TOTAL
+                                    .with_label_values(&["receipt_file"])
+                                    .inc_by(delete_count as u64);
+                            }
+                        }
+                    }
+                    Err(e) => warn!(event = "pruning_failed", error = %e),
+                }
+                // Sleep in chunks for responsive shutdown.
+                let mut slept = std::time::Duration::from_secs(0);
+                while slept < interval && !stop.load(Ordering::Relaxed) {
+                    let step = std::time::Duration::from_secs(1);
+                    std::thread::sleep(step);
+                    slept += step;
+                }
+            }
+            info!(event = "pruning_loop_stopped");
+        })
+    }
 }
 
 fn collect_json_files(root: &Path) -> Result<Vec<PathBuf>, String> {
