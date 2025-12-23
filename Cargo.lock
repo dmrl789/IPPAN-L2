@@ -1400,7 +1400,7 @@ dependencies = [
  "sled",
  "tar",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "time",
  "tiny_http",
  "toml",
@@ -1816,7 +1816,7 @@ dependencies = [
  "serde_json",
  "sled",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -1831,7 +1831,7 @@ dependencies = [
  "serde_json",
  "sled",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -2246,7 +2246,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tracing",
 ]
 
