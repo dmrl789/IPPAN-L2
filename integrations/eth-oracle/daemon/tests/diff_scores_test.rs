@@ -48,7 +48,12 @@ fn diff_scores_detects_changes_and_limits_to_max() {
         },
     );
 
-    let latest = vec![unchanged.clone(), changed_score.clone(), new_subject.clone(), extra.clone()];
+    let latest = vec![
+        unchanged.clone(),
+        changed_score.clone(),
+        new_subject.clone(),
+        extra.clone(),
+    ];
 
     let out = diff_scores(&last_sent, latest, 2);
 
@@ -58,4 +63,3 @@ fn diff_scores_detects_changes_and_limits_to_max() {
     assert!(out.contains(&new_subject) || out.contains(&extra));
     assert!(!out.contains(&unchanged));
 }
-

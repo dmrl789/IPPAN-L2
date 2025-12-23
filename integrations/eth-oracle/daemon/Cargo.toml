@@ -1,7 +1,11 @@
 [package]
 name = "ippan_eth_oracle_daemon"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "IPPAN Ethereum Oracle Daemon - Pushes IPPAN metrics to Ethereum"
 
 [dependencies]
 anyhow = "1"

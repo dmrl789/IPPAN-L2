@@ -1,0 +1,51 @@
+# IPPAN-L2 Production Configuration Template
+# 
+# IMPORTANT: This is a template. Copy and customize for your deployment.
+# Never commit production secrets to version control.
+#
+# Usage:
+#   export IPPAN_L2_CONFIG=/etc/ippan-l2/config.toml
+#   export L1_BASE_URL=https://core.ippan.io
+#   export L1_API_KEY=your-production-api-key
+#   ./fin-node
+#
+# All sensitive values should come from environment variables.
+
+[l1]
+# IPPAN CORE settlement endpoint
+# REQUIRED: Set via L1_BASE_URL environment variable
+base_url = "env:L1_BASE_URL"
+# API key for authentication
+# REQUIRED: Set via L1_API_KEY environment variable
+api_key = "env:L1_API_KEY"
+
+[server]
+# HTTP bind address for health/metrics endpoints
+# Use 0.0.0.0 for container deployments
+bind_address = "0.0.0.0:3000"
+# Enable metrics endpoint
+metrics_enabled = true
+
+[hubs]
+# Enable FIN Hub
+fin_enabled = true
+# Enable DATA Hub
+data_enabled = true
+
+[storage]
+# Persistent storage path
+# IMPORTANT: Must be on persistent volume in containerized deployments
+path = "/var/lib/ippan-l2/prod"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+# Use "info" or "warn" in production
+level = "info"
+# Output format: json for log aggregation
+format = "json"
+
+[oracle]
+# Oracle daemon configuration
+enabled = true
+# Poll interval (production: less frequent to reduce load)
+poll_interval_ms = 60000

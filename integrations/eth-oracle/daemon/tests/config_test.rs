@@ -32,4 +32,3 @@ max_updates_per_round = 10
     assert_eq!(cfg.ethereum.rpc_url, "https://rpc.override");
     assert_eq!(cfg.ippan.rpc_url, "http://ippan.override");
 }
-

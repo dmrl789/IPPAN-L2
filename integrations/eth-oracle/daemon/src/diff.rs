@@ -1,5 +1,5 @@
-use crate::model::SubjectScore;
 use crate::model::SubjectMeta;
+use crate::model::SubjectScore;
 use std::collections::HashMap;
 
 pub fn select_changed_scores(

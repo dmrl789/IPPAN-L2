@@ -41,7 +41,9 @@ impl IppanClient {
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(anyhow::anyhow!("IPPAN endpoint returned HTTP status {status}"));
+            return Err(anyhow::anyhow!(
+                "IPPAN endpoint returned HTTP status {status}"
+            ));
         }
 
         let body = resp.text().await?;

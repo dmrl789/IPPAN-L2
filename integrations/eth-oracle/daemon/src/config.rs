@@ -70,13 +70,13 @@ pub fn resolve_env_ref(value: &str) -> Result<String> {
         if var.is_empty() {
             return Err(anyhow!("invalid env ref: {value}"));
         }
-        return Ok(env::var(var).with_context(|| format!("missing env var {var} for {value}"))?);
+        return env::var(var).with_context(|| format!("missing env var {var} for {value}"));
     }
     Ok(value.to_string())
 }
 
 pub fn required_env(name: &str) -> Result<String> {
-    Ok(env::var(name).with_context(|| format!("missing required env var {name}"))?)
+    env::var(name).with_context(|| format!("missing required env var {name}"))
 }
 
 #[cfg(test)]

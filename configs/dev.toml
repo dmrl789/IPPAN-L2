@@ -1,0 +1,42 @@
+# IPPAN-L2 Development Environment Configuration
+# This config is for dev/staging environments.
+#
+# Usage:
+#   export IPPAN_L2_CONFIG=configs/dev.toml
+#   export L1_API_KEY=your-dev-api-key
+#   cargo run -p fin-node
+#
+# Environment variables can override TOML values.
+
+[l1]
+# IPPAN CORE settlement endpoint (dev environment)
+base_url = "env:L1_BASE_URL"
+# API key from environment
+api_key = "env:L1_API_KEY"
+
+[server]
+# HTTP bind address for health/metrics endpoints
+bind_address = "0.0.0.0:3000"
+# Enable metrics endpoint
+metrics_enabled = true
+
+[hubs]
+# Enable FIN Hub
+fin_enabled = true
+# Enable DATA Hub
+data_enabled = true
+
+[storage]
+# Persistent storage path
+path = "/var/lib/ippan-l2/dev"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Output format: json, pretty
+format = "json"
+
+[oracle]
+# Oracle daemon configuration
+enabled = true
+poll_interval_ms = 30000
