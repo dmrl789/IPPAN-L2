@@ -4,10 +4,19 @@ use crate::actions::{
     AppendAttestationV1, CreateListingV1, GrantEntitlementV1, IssueLicenseV1, RegisterDatasetV1,
 };
 use crate::types::{ActionId, AttestationId, DatasetId, LicenseId, ListingId};
+use base64::Engine as _;
 use l2_core::hub_linkage::PurchaseId;
-use sled::IVec;
+use sled::transaction::ConflictableTransactionError;
+use sled::transaction::TransactionError;
+use sled::Transactional;
 use std::io::Write;
 use std::path::Path;
+
+pub const CHANGELOG_VERSION_V1: u32 = 1;
+
+const CHANGELOG_EPOCH_KEY: &[u8] = b"changelog_epoch";
+const CHANGELOG_SEQ_KEY: &[u8] = b"changelog_seq";
+const CHANGELOG_PREFIX: &[u8] = b"changelog:";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -17,16 +26,45 @@ pub enum StoreError {
     Decode(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogOp {
+    Put,
+    Del,
+}
+
+impl ChangelogOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChangelogOp::Put => "put",
+            ChangelogOp::Del => "del",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChangelogEntryV1 {
+    pub schema_version: u32,
+    pub epoch: u64,
+    pub seq: u64,
+    pub op: String,
+    pub key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_b64: Option<String>,
+    pub value_hash: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct DataStore {
     tree: sled::Tree,
+    changelog: sled::Tree,
 }
 
 impl DataStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db = sled::open(path)?;
         let tree = db.open_tree("hub-data")?;
-        Ok(Self { tree })
+        let changelog = db.open_tree("hub-data-changelog")?;
+        Ok(Self { tree, changelog })
     }
 
     pub fn get_dataset(
@@ -46,7 +84,7 @@ impl DataStore {
         let key = keys::dataset(dataset.dataset_id);
         let bytes = serde_json::to_vec(dataset)
             .map_err(|e| StoreError::Decode(format!("failed encoding dataset json: {e}")))?;
-        self.tree.insert(key, bytes)?;
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -81,7 +119,7 @@ impl DataStore {
         let key = keys::license(license.license_id);
         let bytes = serde_json::to_vec(license)
             .map_err(|e| StoreError::Decode(format!("failed encoding license json: {e}")))?;
-        self.tree.insert(key, bytes)?;
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -90,10 +128,8 @@ impl DataStore {
         dataset_id: DatasetId,
         license_id: LicenseId,
     ) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::license_by_dataset(dataset_id, license_id),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::license_by_dataset(dataset_id, license_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -179,7 +215,7 @@ impl DataStore {
         let key = keys::listing(listing.listing_id);
         let bytes = serde_json::to_vec(listing)
             .map_err(|e| StoreError::Decode(format!("failed encoding listing json: {e}")))?;
-        self.tree.insert(key, bytes)?;
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -188,10 +224,8 @@ impl DataStore {
         dataset_id: DatasetId,
         listing_id: ListingId,
     ) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::listing_by_dataset(dataset_id, listing_id),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::listing_by_dataset(dataset_id, listing_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -260,7 +294,7 @@ impl DataStore {
         let key = keys::entitlement(ent.purchase_id);
         let bytes = serde_json::to_vec(ent)
             .map_err(|e| StoreError::Decode(format!("failed encoding entitlement json: {e}")))?;
-        self.tree.insert(key, bytes)?;
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -269,10 +303,8 @@ impl DataStore {
         dataset_id: DatasetId,
         purchase_id: PurchaseId,
     ) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::ent_by_dataset(dataset_id, purchase_id),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::ent_by_dataset(dataset_id, purchase_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -281,10 +313,8 @@ impl DataStore {
         licensee: &str,
         purchase_id: PurchaseId,
     ) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::ent_by_licensee(licensee, purchase_id),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::ent_by_licensee(licensee, purchase_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -382,7 +412,7 @@ impl DataStore {
         let key = keys::attestation(att.attestation_id);
         let bytes = serde_json::to_vec(att)
             .map_err(|e| StoreError::Decode(format!("failed encoding attestation json: {e}")))?;
-        self.tree.insert(key, bytes)?;
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -391,10 +421,8 @@ impl DataStore {
         dataset_id: DatasetId,
         attestation_id: AttestationId,
     ) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::attestation_by_dataset(dataset_id, attestation_id),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::attestation_by_dataset(dataset_id, attestation_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -492,14 +520,15 @@ impl DataStore {
     }
 
     pub fn set_state_version(&self, v: u32) -> Result<(), StoreError> {
-        self.tree
-            .insert(keys::state_version(), v.to_string().into_bytes())?;
+        let key = keys::state_version();
+        let bytes = v.to_string().into_bytes();
+        self.tx_put(key, &bytes)?;
         Ok(())
     }
 
     pub fn mark_applied(&self, action_id: ActionId) -> Result<(), StoreError> {
-        self.tree
-            .insert(keys::applied(action_id), IVec::from(&b"1"[..]))?;
+        let key = keys::applied(action_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -508,8 +537,8 @@ impl DataStore {
         action_id: ActionId,
         receipt_json: &[u8],
     ) -> Result<(), StoreError> {
-        self.tree
-            .insert(keys::apply_receipt(action_id), receipt_json)?;
+        let key = keys::apply_receipt(action_id);
+        self.tx_put(&key, receipt_json)?;
         Ok(())
     }
 
@@ -526,7 +555,8 @@ impl DataStore {
         action_id: ActionId,
         receipt_json: &[u8],
     ) -> Result<(), StoreError> {
-        self.tree.insert(keys::receipt(action_id), receipt_json)?;
+        let key = keys::receipt(action_id);
+        self.tx_put(&key, receipt_json)?;
         Ok(())
     }
 
@@ -534,8 +564,24 @@ impl DataStore {
         Ok(self.tree.get(keys::receipt(action_id))?.map(|v| v.to_vec()))
     }
 
+    /// Low-level write used by bootstrap restore (bypasses changelog).
+    pub fn raw_put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.tree.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Low-level delete used by bootstrap restore (bypasses changelog).
+    pub fn raw_del(&self, key: &[u8]) -> Result<(), StoreError> {
+        let _ = self.tree.remove(key)?;
+        Ok(())
+    }
+
     pub(crate) fn tree(&self) -> &sled::Tree {
         &self.tree
+    }
+
+    pub(crate) fn changelog_tree(&self) -> &sled::Tree {
+        &self.changelog
     }
 
     /// Flush pending writes to disk (best-effort).
@@ -584,6 +630,7 @@ impl DataStore {
         for (k, v) in read_kv_records_v1(bytes)
             .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
         {
+            // Snapshot import must not emit changelog entries (bootstrap deltas are separate).
             store.tree.insert(k, v)?;
         }
         Ok(store)
@@ -594,9 +641,69 @@ impl DataStore {
         for (k, v) in read_kv_records_v1(bytes)
             .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
         {
+            // Snapshot import must not emit changelog entries (bootstrap deltas are separate).
             self.tree.insert(k, v)?;
         }
         Ok(())
+    }
+
+    pub fn changelog_epoch(&self) -> Result<u64, StoreError> {
+        Ok(changelog_epoch_get(&self.changelog)?)
+    }
+
+    pub fn set_changelog_epoch(&self, epoch: u64) -> Result<(), StoreError> {
+        self.changelog
+            .insert(CHANGELOG_EPOCH_KEY, epoch.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    pub fn export_changelog_epoch_v1(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<ChangelogEntryV1>, StoreError> {
+        let mut out = Vec::new();
+        let prefix = changelog_epoch_prefix(epoch);
+        for r in self.changelog.scan_prefix(prefix) {
+            let (_k, v) = r?;
+            let e: ChangelogEntryV1 = serde_json::from_slice(&v)
+                .map_err(|e| StoreError::Decode(format!("changelog decode failed: {e}")))?;
+            out.push(e);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_changelog_epoch(&self, epoch: u64) -> Result<(), StoreError> {
+        let prefix = changelog_epoch_prefix(epoch);
+        let keys: Vec<Vec<u8>> = self
+            .changelog
+            .scan_prefix(prefix)
+            .filter_map(|r| r.ok().map(|(k, _)| k.to_vec()))
+            .collect();
+        for k in keys {
+            let _ = self.changelog.remove(k)?;
+        }
+        Ok(())
+    }
+
+    fn tx_put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        let r: Result<(), TransactionError<String>> =
+            (&self.tree, &self.changelog).transaction(|(t, c)| {
+                let mut ctx = ChangelogTxCtx::load(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                t.insert(key, value)?;
+                ctx.record_put(c, key, value)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                ctx.store(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                Ok(())
+            });
+        match r {
+            Ok(()) => Ok(()),
+            Err(TransactionError::Storage(e)) => Err(StoreError::Db(e)),
+            Err(TransactionError::Abort(e)) => {
+                Err(StoreError::Decode(format!("changelog tx aborted: {e}")))
+            }
+        }
     }
 }
 
@@ -755,6 +862,98 @@ fn scan_index_tail_hex_page(
     out
 }
 
+fn changelog_epoch_get(changelog: &sled::Tree) -> Result<u64, sled::Error> {
+    let Some(v) = changelog.get(CHANGELOG_EPOCH_KEY)? else {
+        return Ok(0);
+    };
+    if v.len() != 8 {
+        return Ok(0);
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(v.as_ref());
+    Ok(u64::from_be_bytes(b))
+}
+
+fn changelog_epoch_prefix(epoch: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(CHANGELOG_PREFIX.len() + 8 + 1);
+    p.extend_from_slice(CHANGELOG_PREFIX);
+    p.extend_from_slice(&epoch.to_be_bytes());
+    p.push(b':');
+    p
+}
+
+fn changelog_entry_key(epoch: u64, seq: u64) -> Vec<u8> {
+    let mut k = changelog_epoch_prefix(epoch);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+pub(crate) struct ChangelogTxCtx {
+    epoch: u64,
+    next_seq: u64,
+}
+
+impl ChangelogTxCtx {
+    pub(crate) fn load(
+        changelog: &sled::transaction::TransactionalTree,
+    ) -> Result<Self, sled::transaction::UnabortableTransactionError> {
+        let epoch = changelog
+            .get(CHANGELOG_EPOCH_KEY)?
+            .and_then(|v| (v.len() == 8).then_some(v))
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(v.as_ref());
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+
+        let seq = changelog
+            .get(CHANGELOG_SEQ_KEY)?
+            .and_then(|v| (v.len() == 8).then_some(v))
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(v.as_ref());
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+        Ok(Self {
+            epoch,
+            next_seq: seq,
+        })
+    }
+
+    pub(crate) fn store(
+        &self,
+        changelog: &sled::transaction::TransactionalTree,
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        changelog.insert(CHANGELOG_SEQ_KEY, self.next_seq.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    pub(crate) fn record_put(
+        &mut self,
+        changelog: &sled::transaction::TransactionalTree,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry_key = changelog_entry_key(self.epoch, self.next_seq);
+        let value_hash = blake3::hash(value).to_hex().to_string();
+        let entry = ChangelogEntryV1 {
+            schema_version: CHANGELOG_VERSION_V1,
+            epoch: self.epoch,
+            seq: self.next_seq,
+            op: ChangelogOp::Put.as_str().to_string(),
+            key_hex: hex::encode(key),
+            value_b64: Some(base64::engine::general_purpose::STANDARD.encode(value)),
+            value_hash,
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap_or_default();
+        changelog.insert(entry_key, bytes)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
@@ -770,7 +969,10 @@ mod pagination_tests {
             let lid = crate::types::Hex32([i; 32]);
             store
                 .tree
-                .insert(keys::license_by_dataset(did, lid), IVec::from(&b"1"[..]))
+                .insert(
+                    keys::license_by_dataset(did, lid),
+                    sled::IVec::from(&b"1"[..]),
+                )
                 .expect("insert");
         }
 

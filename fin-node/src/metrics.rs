@@ -229,6 +229,68 @@ pub static SNAPSHOT_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static BOOTSTRAP_RESTORE_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "bootstrap_restore_seconds",
+        "Bootstrap restore duration (seconds)",
+    )
+    .buckets(vec![
+        0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ]);
+    let h = HistogramVec::new(opts, &["result"]).expect("metric");
+    REGISTRY.register(Box::new(h.clone())).expect("register");
+    h
+});
+
+pub static DELTAS_APPLIED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("deltas_applied_total", "Total applied delta snapshots"),
+        &["result"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static DELTA_APPLY_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "delta_apply_failures_total",
+            "Total delta snapshot apply failures",
+        ),
+        &["reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static SNAPSHOT_DELTA_CREATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "snapshot_delta_created_total",
+            "Total delta snapshots created",
+        ),
+        &["result"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static SNAPSHOT_DELTA_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "snapshot_delta_size_bytes",
+            "Delta snapshot size in bytes (last created)",
+        ),
+        &["scope"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
 pub fn gather_text() -> String {
     PROCESS_UPTIME_SECONDS.set(START.elapsed().as_secs_f64());
     let mf = REGISTRY.gather();

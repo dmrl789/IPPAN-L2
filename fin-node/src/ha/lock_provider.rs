@@ -39,6 +39,7 @@ pub struct LeaderInfo {
     pub expires_at_ms: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum LockProviderError {
     #[error("timeout: {0}")]

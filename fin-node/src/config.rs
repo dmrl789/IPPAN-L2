@@ -300,6 +300,9 @@ pub struct StorageConfig {
     pub policy_db_dir: String,
     #[serde(default = "default_recon_db_dir")]
     pub recon_db_dir: String,
+    /// Sled DB for bootstrap metadata + file changelog (incremental snapshots).
+    #[serde(default = "default_bootstrap_db_dir")]
+    pub bootstrap_db_dir: String,
 }
 
 fn default_receipts_dir() -> String {
@@ -322,6 +325,10 @@ fn default_recon_db_dir() -> String {
     "recon_db".to_string()
 }
 
+fn default_bootstrap_db_dir() -> String {
+    "bootstrap_db".to_string()
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -330,6 +337,7 @@ impl Default for StorageConfig {
             data_db_dir: default_data_db_dir(),
             policy_db_dir: default_policy_db_dir(),
             recon_db_dir: default_recon_db_dir(),
+            bootstrap_db_dir: default_bootstrap_db_dir(),
         }
     }
 }
@@ -796,6 +804,24 @@ pub struct SnapshotsConfig {
     /// Maximum number of snapshots to keep when rotation is enabled.
     #[serde(default = "default_snapshots_max_snapshots")]
     pub max_snapshots: usize,
+    /// Optional interval for cutting base snapshots (e.g. "7d", "24h").
+    ///
+    /// If set, the scheduler uses interval-based base+delta scheduling (instead of daily cron).
+    #[serde(default)]
+    pub base_every: Option<String>,
+    /// Optional interval for cutting delta snapshots (e.g. "15m", "1h").
+    ///
+    /// If set, the scheduler uses interval-based base+delta scheduling (instead of daily cron).
+    #[serde(default)]
+    pub delta_every: Option<String>,
+    /// Number of base snapshots to retain (base+delta retention mode).
+    #[serde(default = "default_snapshots_retain_bases")]
+    pub retain_bases: usize,
+    /// Maximum deltas to retain for a base snapshot.
+    ///
+    /// Note: the scheduler never prunes deltas required to reach the latest state for the current base.
+    #[serde(default = "default_snapshots_retain_deltas_per_base")]
+    pub retain_deltas_per_base: usize,
     /// Optional hook executed after a snapshot is successfully created.
     ///
     /// The snapshot path will be passed as the last argument.
@@ -822,12 +848,24 @@ fn default_snapshots_max_snapshots() -> usize {
     10
 }
 
+fn default_snapshots_retain_bases() -> usize {
+    4
+}
+
+fn default_snapshots_retain_deltas_per_base() -> usize {
+    672
+}
+
 impl Default for SnapshotsConfig {
     fn default() -> Self {
         Self {
             enabled: default_snapshots_enabled(),
             output_dir: default_snapshots_output_dir(),
             max_snapshots: default_snapshots_max_snapshots(),
+            base_every: None,
+            delta_every: None,
+            retain_bases: default_snapshots_retain_bases(),
+            retain_deltas_per_base: default_snapshots_retain_deltas_per_base(),
             post_snapshot_hook: None,
             pre_restore_hook: None,
             schedule: SnapshotScheduleConfig::default(),

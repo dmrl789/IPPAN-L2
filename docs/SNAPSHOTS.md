@@ -93,6 +93,50 @@ Restore:
 fin-node --config ./configs/prod.toml snapshot restore --from ./snapshots/l2-snapshot-YYYYMMDD-HHMMSS.tar --force
 ```
 
+## Incremental snapshots (DeltaSnapshotV1) — base + deltas
+
+In addition to full snapshots, `fin-node` supports **incremental delta snapshots** for fast bootstrap:
+
+- **Base** snapshot: SnapshotV1 tar (`manifest.hash` is the `base_snapshot_id`)
+- **Delta** snapshots: append-only changes between epochs
+
+### DeltaSnapshotV1 artifact layout (tar)
+
+DeltaSnapshotV1 is a plain tar archive containing:
+
+- `delta_manifest.json`
+- `changes.jsonl`
+
+### `delta_manifest.json` (v1 schema)
+
+```json
+{
+  "delta_version": 1,
+  "ippan_l2_version": "x.y.z",
+  "base_snapshot_id": "<base manifest.hash>",
+  "from_epoch": 123,
+  "to_epoch": 124,
+  "created_at": 1730000000,
+  "counts": { "puts": 0, "dels": 0 },
+  "hash": "<blake3 hex of changes.jsonl>"
+}
+```
+
+### `changes.jsonl`
+
+Each line is a JSON record:
+
+- `store`: `fin|data|recon|receipts|linkage`
+- `op`: `put|del`
+- `key_hex`: hex-encoded key bytes
+- `value_b64`: base64 value bytes (only for `put`)
+
+Ordering is deterministic (sorted by `(store, key_hex, op, seq)`), and deletes are represented as tombstones (`op:"del"`).
+
+### Delta integrity
+
+`delta_manifest.hash` is computed as `blake3(changes.jsonl bytes)`. Restore refuses to apply deltas if the hash mismatches.
+
 ## Configuration
 
 ```toml
@@ -118,4 +162,8 @@ See:
 - `docs/examples/upload_snapshot_s3.sh`
 - `docs/examples/upload_snapshot_scp.sh`
 - `docs/examples/prepare_restore.sh`
+
+## See also
+
+- `docs/BOOTSTRAP.md` for the end-to-end join flow and operator commands.
 

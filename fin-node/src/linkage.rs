@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::bootstrap_store::BootstrapStore;
 use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct LinkageApi {
     receipts_dir: PathBuf,
     entitlement_policy: EntitlementPolicy,
     recon: Option<ReconStore>,
+    bootstrap: Option<BootstrapStore>,
 }
 
 impl LinkageApi {
@@ -59,7 +61,13 @@ impl LinkageApi {
             receipts_dir,
             entitlement_policy,
             recon,
+            bootstrap: None,
         }
+    }
+
+    pub fn with_bootstrap(mut self, bootstrap: Option<BootstrapStore>) -> Self {
+        self.bootstrap = bootstrap;
+        self
     }
 
     pub fn buy_license(&self, req: BuyLicenseRequestV1) -> Result<LinkageReceiptV1, ApiError> {
@@ -396,6 +404,15 @@ impl LinkageApi {
         let bytes =
             serde_json::to_vec_pretty(receipt).map_err(|e| ApiError::Internal(e.to_string()))?;
         fs::write(&out, bytes).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        if let Some(b) = self.bootstrap.as_ref() {
+            if let Ok(rel) = out.strip_prefix(&self.receipts_dir) {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                let bytes2 = serde_json::to_vec_pretty(receipt).unwrap_or_else(|_| Vec::new());
+                // Linkage receipts are in their own namespace (also stored separately in base snapshot).
+                let _ = b.record_put("linkage", rel_s.as_bytes(), &bytes2);
+            }
+        }
         Ok(())
     }
 
