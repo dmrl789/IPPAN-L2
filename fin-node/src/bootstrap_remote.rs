@@ -144,7 +144,9 @@ fn fetch_remote_bootstrap_inner(
     remote_name: &str,
     dry_run: bool,
 ) -> Result<(), BootstrapRemoteError> {
-    cfg.bootstrap.validate().map_err(BootstrapRemoteError::Config)?;
+    cfg.bootstrap
+        .validate()
+        .map_err(BootstrapRemoteError::Config)?;
     if !cfg.bootstrap.remote.enabled {
         return Err(BootstrapRemoteError::coded(
             BOOTSTRAP_INDEX_INVALID,
@@ -313,7 +315,9 @@ fn fetch_and_restore_inner(
     progress_path: &Path,
     force: bool,
 ) -> Result<(), BootstrapRemoteError> {
-    cfg.bootstrap.validate().map_err(BootstrapRemoteError::Config)?;
+    cfg.bootstrap
+        .validate()
+        .map_err(BootstrapRemoteError::Config)?;
     if !cfg.snapshots.enabled {
         return Err(BootstrapRemoteError::coded(
             BOOTSTRAP_INDEX_INVALID,
