@@ -13,8 +13,9 @@ use l2_core::hub_linkage::{
     EntitlementPolicy, LinkageOverallStatus, LinkageReceiptV1, LinkageStatus,
 };
 use l2_core::l1_contract::{IdempotencyKey, L1Client, L1ClientError, L1InclusionProof, L1TxId};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct ReconLoopConfig {
@@ -501,6 +502,46 @@ impl Reconciler {
         );
         item.meta.next_check_at = now_secs.saturating_add(delay);
         let _ = self.recon.update(item.kind, &item.id, &item.meta);
+    }
+}
+
+#[derive(Clone)]
+pub struct ReconLoop {
+    reconciler: Reconciler,
+    interval_secs: u64,
+}
+
+impl ReconLoop {
+    pub fn new(reconciler: Reconciler, interval_secs: u64) -> Self {
+        Self {
+            reconciler,
+            interval_secs: interval_secs.max(1),
+        }
+    }
+
+    pub fn start(self, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            info!(
+                event = "recon_loop_started",
+                interval_secs = self.interval_secs
+            );
+            let interval = std::time::Duration::from_secs(self.interval_secs);
+            while !stop.load(Ordering::Relaxed) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.reconciler.tick(now);
+                // Sleep in small chunks so shutdown/step-down is responsive.
+                let mut slept = std::time::Duration::from_secs(0);
+                while slept < interval && !stop.load(Ordering::Relaxed) {
+                    let step = std::time::Duration::from_millis(250);
+                    std::thread::sleep(step);
+                    slept += step;
+                }
+            }
+            info!(event = "recon_loop_stopped");
+        })
     }
 }
 

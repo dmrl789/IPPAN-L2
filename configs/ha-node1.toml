@@ -1,0 +1,67 @@
+# Example HA config (node 1)
+#
+# Assumptions:
+# - `shared/*` is a shared volume mounted on all fin-node instances
+# - you run fin-node in mock mode unless you fill in [l1.endpoints]
+
+[node]
+label = "ha-fin-node-1"
+
+[server]
+bind_address = "0.0.0.0:3001"
+metrics_enabled = true
+max_inflight_requests = 128
+
+[l1]
+base_url = "http://127.0.0.1:8080"
+api_key = ""
+connect_timeout_ms = 3000
+request_timeout_ms = 10000
+
+[l1.retry]
+max_attempts = 3
+base_delay_ms = 250
+max_delay_ms = 2000
+
+[l1.endpoints]
+chain_status = ""
+submit_batch = ""
+get_inclusion = ""
+get_finality = ""
+
+[storage]
+receipts_dir = "shared/receipts"
+fin_db_dir = "shared/fin_db"
+data_db_dir = "shared/data_db"
+policy_db_dir = "shared/policy_db"
+recon_db_dir = "shared/recon_db"
+
+[recon]
+enabled = true
+interval_secs = 30
+batch_limit = 50
+max_scan = 5000
+max_attempts = 50
+base_delay_secs = 2
+max_delay_secs = 300
+
+[pruning]
+enabled = true
+interval_secs = 86400
+
+[retention]
+receipts_days = 30
+recon_failed_days = 7
+min_receipts_keep = 1000
+
+[ha]
+enabled = true
+node_id = "fin-node-1"
+lease_ms = 15000
+lock_db_dir = "shared/ha_db"
+write_mode = "leader_only"
+
+[ha.leader_urls]
+fin-node-1 = "http://127.0.0.1:3001"
+fin-node-2 = "http://127.0.0.1:3002"
+

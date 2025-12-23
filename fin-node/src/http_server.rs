@@ -6,6 +6,7 @@
 use crate::config::{CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig};
 use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
+use crate::ha::supervisor::HaState;
 use crate::linkage::{ApiError as LinkageApiError, BuyLicenseRequestV1, LinkageApi};
 use crate::metrics;
 use crate::rate_limit::{RateLimiter, SystemTimeSource};
@@ -61,6 +62,7 @@ pub fn serve(
     rate_limit: RateLimitConfig,
     _cors: CorsConfig,
     max_inflight_requests: usize,
+    ha_state: Arc<HaState>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let server =
@@ -137,6 +139,20 @@ pub fn serve(
             }
         }
 
+        // HA write gating (leader_only): block non-leader write requests.
+        if ha_blocks_write(method.as_str(), &ha_state) {
+            metrics::HTTP_REQUESTS_TOTAL
+                .with_label_values(&[route, "503"])
+                .inc();
+            metrics::HTTP_REQUEST_DURATION_SECONDS
+                .with_label_values(&[route])
+                .observe(started.elapsed().as_secs_f64());
+            let resp = not_leader_response(&request_id, ha_state.leader_url());
+            let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
+            let _ = req.respond(resp);
+            continue;
+        }
+
         let resp = match (method.as_str(), path) {
             ("GET", "/healthz") => {
                 let body = serde_json::to_string(&HealthResponse { status: "ok" })
@@ -163,6 +179,10 @@ pub fn serve(
             }
             ("GET", "/metrics") => {
                 Response::from_string("metrics disabled\n").with_status_code(404)
+            }
+            ("GET", "/ha/status") => {
+                let snap = ha_state.snapshot();
+                json_response(200, &snap)
             }
             // OpenAPI (v1): served only under the versioned prefix.
             ("GET", "/openapi.json") if is_versioned => {
@@ -880,6 +900,7 @@ fn rate_limited_response(
                 code: "rate_limited",
                 message: "rate_limited".to_string(),
                 request_id,
+                leader_url: None,
             },
             retry_after_secs: Some(retry_after_secs),
         },
@@ -1006,6 +1027,32 @@ mod tests {
         let r = payload_too_large_response("test-req");
         assert_eq!(r.status_code(), 413);
     }
+
+    #[test]
+    fn ha_blocks_write_when_follower_in_leader_only_mode() {
+        let cfg = crate::config::HaConfig {
+            enabled: true,
+            write_mode: crate::config::HaWriteMode::LeaderOnly,
+            node_id: "node-a".to_string(),
+            ..crate::config::HaConfig::default()
+        };
+
+        let ha_state = HaState::new(cfg);
+        ha_state.set_from_lease(
+            false,
+            Some(crate::ha::leader_lock::LeaderLease {
+                holder_id: "node-b".to_string(),
+                acquired_at_ms: 0,
+                renew_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                lease_ms: 15_000,
+            }),
+        );
+
+        assert!(ha_blocks_write("POST", &ha_state));
+        let r = not_leader_response("req-1", Some("http://leader:3000".to_string()));
+        assert_eq!(r.status_code(), 503);
+    }
 }
 
 fn json_response<T: Serialize>(code: u16, v: &T) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -1028,6 +1075,8 @@ struct ErrorBody<'a> {
     code: &'a str,
     message: String,
     request_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leader_url: Option<String>,
 }
 
 fn sanitize_message(s: &str) -> String {
@@ -1053,10 +1102,37 @@ fn error_response(
                 code,
                 message: sanitize_message(message),
                 request_id,
+                leader_url: None,
             },
             retry_after_secs: None,
         },
     )
+}
+
+fn not_leader_response(
+    request_id: &str,
+    leader_url: Option<String>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(
+        503,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code: "NOT_LEADER",
+                message: "Write requests must go to leader".to_string(),
+                request_id,
+                leader_url,
+            },
+            retry_after_secs: None,
+        },
+    )
+}
+
+fn ha_blocks_write(method: &str, ha_state: &HaState) -> bool {
+    let is_write_method = matches!(method, "POST" | "PUT" | "DELETE" | "PATCH");
+    is_write_method
+        && ha_state.enabled()
+        && ha_state.write_mode() == crate::config::HaWriteMode::LeaderOnly
+        && !ha_state.is_leader()
 }
 
 fn api_error_response(e: ApiError, request_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -1180,6 +1256,7 @@ fn route_label(method: &str, path: &str) -> &'static str {
         ("GET", "/readyz") => "GET /readyz",
         ("GET", "/metrics") => "GET /metrics",
         ("GET", "/openapi.json") => "GET /openapi.json",
+        ("GET", "/ha/status") => "GET /ha/status",
         ("GET", "/recon/pending") => "GET /recon/pending",
         ("POST", "/fin/actions") => "POST /fin/actions",
         ("POST", "/data/datasets") => "POST /data/datasets",

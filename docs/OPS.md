@@ -105,6 +105,7 @@ export RUST_LOG_FORMAT=json
 | `/api/v1/readyz` | GET | Readiness check (requires L1 `chain_status`; optional network id match) |
 | `/api/v1/metrics` | GET | Prometheus metrics (if enabled) |
 | `/api/v1/openapi.json` | GET | OpenAPI 3.1 spec (production integration contract) |
+| `/api/v1/ha/status` | GET | HA leader status (if HA enabled) |
 | `/api/v1/recon/pending` | GET | Snapshot of pending reconciliation items (bounded) |
 | `/api/v1/fin/receipts/:action_id` | GET | FIN action receipt JSON (includes `submit_state`) |
 | `/api/v1/data/receipts/:action_id` | GET | DATA action receipt JSON (includes `submit_state`) |
@@ -201,6 +202,9 @@ When metrics are enabled, the following metrics are exposed:
 | `recon_pending_total{kind}` | Gauge | Pending reconciliation items |
 | `recon_checks_total{kind,result}` | Counter | Recon checks (`checked`,`included`,`finalized`, etc.) |
 | `recon_failures_total{kind,reason}` | Counter | Recon failures by reason |
+| `ha_is_leader` | Gauge | Whether this node is leader (0/1) |
+| `ha_leader_changes_total{event}` | Counter | Leadership transitions (`became_leader`,`stepped_down`) |
+| `ha_lock_acquire_failures_total{reason}` | Counter | Lock acquisition failures (`contended`,`error`) |
 | `ippan_oracle_poll_total` | Counter | Oracle poll iterations |
 | `ippan_oracle_push_total` | Counter | Scores pushed to Ethereum |
 

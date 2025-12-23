@@ -69,3 +69,15 @@ curl -sSf http://127.0.0.1:3000/readyz
 curl -sSf http://127.0.0.1:3000/metrics
 ```
 
+## HA (multi-node)
+
+`fin-node` supports a lightweight HA mode where **exactly one node** runs background writer loops
+(reconciliation/pruning) and followers serve read-only APIs.
+
+See `docs/HA.md` for:
+
+- required **shared storage** assumptions,
+- `[ha]` config examples,
+- `/api/v1/ha/status` endpoint and HA metrics,
+- write routing / `NOT_LEADER` behavior.
+

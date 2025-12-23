@@ -12,6 +12,7 @@
   ],
   "tags": [
     { "name": "Health" },
+    { "name": "HA" },
     { "name": "FIN" },
     { "name": "DATA" },
     { "name": "Linkage" },
@@ -117,6 +118,26 @@
             "content": {
               "application/json": {
                 "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ha/status": {
+      "get": {
+        "tags": ["HA"],
+        "summary": "HA leader status (best-effort)",
+        "responses": {
+          "200": {
+            "description": "HA status",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HaStatusResponse" }
               }
             }
           }
@@ -959,7 +980,21 @@
         "properties": {
           "code": { "type": "string", "minLength": 1, "maxLength": 64 },
           "message": { "type": "string", "minLength": 1, "maxLength": 256 },
-          "request_id": { "type": "string", "minLength": 1, "maxLength": 64 }
+          "request_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "leader_url": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "additionalProperties": false
+      },
+      "HaStatusResponse": {
+        "type": "object",
+        "required": ["enabled", "node_id", "is_leader", "lease_ms", "expires_in_ms"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "node_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "is_leader": { "type": "boolean" },
+          "leader_id": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+          "lease_ms": { "type": "integer", "minimum": 1 },
+          "expires_in_ms": { "type": "integer", "minimum": 0 }
         },
         "additionalProperties": false
       },
