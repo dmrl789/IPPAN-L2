@@ -297,6 +297,46 @@ pub fn restore_snapshot_v1_tar(
     Ok(manifest)
 }
 
+/// Verify SnapshotV1 tar archive integrity without modifying local state.
+///
+/// Checks:
+/// - required files exist inside the archive
+/// - `manifest.hash` matches the computed integrity hash over canonical contents
+pub fn verify_snapshot_v1_tar(from_path: &Path) -> Result<SnapshotManifestV1, SnapshotError> {
+    let extracted = extract_snapshot_tar_to_temp(from_path)?;
+    let manifest: SnapshotManifestV1 = {
+        let raw = fs::read(extracted.dir.join("manifest.json"))?;
+        serde_json::from_slice(&raw)?
+    };
+
+    // Validate required files.
+    let required = [
+        "hub-fin.kv",
+        "hub-data.kv",
+        "linkage.kv",
+        "receipts.kv",
+        "recon.kv",
+    ];
+    for f in required {
+        let p = extracted.dir.join(f);
+        if !p.exists() {
+            return Err(SnapshotError::Corrupt(format!("missing {f}")));
+        }
+    }
+
+    let expected = compute_integrity_hash(&[
+        ("hub-fin.kv", &extracted.dir.join("hub-fin.kv")),
+        ("hub-data.kv", &extracted.dir.join("hub-data.kv")),
+        ("linkage.kv", &extracted.dir.join("linkage.kv")),
+        ("receipts.kv", &extracted.dir.join("receipts.kv")),
+        ("recon.kv", &extracted.dir.join("recon.kv")),
+    ])?;
+    if expected != manifest.hash {
+        return Err(SnapshotError::HashMismatch);
+    }
+    Ok(manifest)
+}
+
 fn write_store_kv<F>(path: &Path, label: &'static str, f: F) -> Result<(), SnapshotError>
 where
     F: FnOnce(&mut fs::File) -> Result<(), String>,

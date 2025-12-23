@@ -1386,6 +1386,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "clap",
+ "ed25519-dalek",
  "hex",
  "hub-data",
  "hub-fin",

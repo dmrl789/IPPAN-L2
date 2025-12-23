@@ -42,6 +42,8 @@ pub struct FinNodeConfig {
     pub ha: HaConfig,
     #[serde(default)]
     pub snapshots: SnapshotsConfig,
+    #[serde(default)]
+    pub bootstrap: BootstrapConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -894,5 +896,201 @@ impl Default for SnapshotScheduleConfig {
             enabled: default_snapshot_schedule_enabled(),
             cron: None,
         }
+    }
+}
+
+// ============================================================
+// Bootstrap (remote fetcher) configuration
+// ============================================================
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BootstrapConfig {
+    #[serde(default)]
+    pub remote: BootstrapRemoteConfig,
+    #[serde(default)]
+    pub signing: BootstrapSigningConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapRemoteConfig {
+    /// Enable remote bootstrap fetch.
+    #[serde(default = "default_bootstrap_remote_enabled")]
+    pub enabled: bool,
+    /// Logical name for this remote (used by `--remote`).
+    #[serde(default = "default_bootstrap_remote_name")]
+    pub name: String,
+    /// Base URL of the snapshot repository.
+    #[serde(default)]
+    pub base_url: String,
+    /// Relative path to the index JSON (default: "index.json").
+    #[serde(default = "default_bootstrap_remote_index_path")]
+    pub index_path: String,
+    /// Local cache directory for downloads + state.
+    #[serde(default = "default_bootstrap_remote_download_dir")]
+    pub download_dir: String,
+    /// Maximum total download size (MB) for a single fetch.
+    #[serde(default = "default_bootstrap_remote_max_download_mb")]
+    pub max_download_mb: u64,
+    /// Connect timeout (ms).
+    #[serde(default = "default_bootstrap_remote_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Read timeout (ms).
+    #[serde(default = "default_bootstrap_remote_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    /// Parallel artifact download concurrency.
+    #[serde(default = "default_bootstrap_remote_concurrency")]
+    pub concurrency: usize,
+}
+
+fn default_bootstrap_remote_enabled() -> bool {
+    false
+}
+
+fn default_bootstrap_remote_name() -> String {
+    "default".to_string()
+}
+
+fn default_bootstrap_remote_index_path() -> String {
+    "index.json".to_string()
+}
+
+fn default_bootstrap_remote_download_dir() -> String {
+    "./bootstrap_cache".to_string()
+}
+
+fn default_bootstrap_remote_max_download_mb() -> u64 {
+    4096
+}
+
+fn default_bootstrap_remote_connect_timeout_ms() -> u64 {
+    3000
+}
+
+fn default_bootstrap_remote_read_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_bootstrap_remote_concurrency() -> usize {
+    4
+}
+
+impl Default for BootstrapRemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bootstrap_remote_enabled(),
+            name: default_bootstrap_remote_name(),
+            base_url: String::new(),
+            index_path: default_bootstrap_remote_index_path(),
+            download_dir: default_bootstrap_remote_download_dir(),
+            max_download_mb: default_bootstrap_remote_max_download_mb(),
+            connect_timeout_ms: default_bootstrap_remote_connect_timeout_ms(),
+            read_timeout_ms: default_bootstrap_remote_read_timeout_ms(),
+            concurrency: default_bootstrap_remote_concurrency(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapSigningConfig {
+    /// Enable signature verification (best-effort unless `required=true`).
+    #[serde(default = "default_bootstrap_signing_enabled")]
+    pub enabled: bool,
+    /// If true: missing/invalid signatures refuse bootstrap.
+    #[serde(default = "default_bootstrap_signing_required")]
+    pub required: bool,
+    /// Allowlisted publisher Ed25519 public keys (hex-encoded 32 bytes).
+    #[serde(default)]
+    pub publisher_pubkeys: Vec<String>,
+}
+
+fn default_bootstrap_signing_enabled() -> bool {
+    false
+}
+
+fn default_bootstrap_signing_required() -> bool {
+    false
+}
+
+impl Default for BootstrapSigningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bootstrap_signing_enabled(),
+            required: default_bootstrap_signing_required(),
+            publisher_pubkeys: Vec::new(),
+        }
+    }
+}
+
+impl BootstrapConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        self.remote.validate()?;
+        self.signing.validate(&self.remote)?;
+        Ok(())
+    }
+}
+
+impl BootstrapRemoteConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.name.trim().is_empty() {
+            return Err("[bootstrap.remote].name is empty".to_string());
+        }
+        if self.base_url.trim().is_empty() {
+            return Err("[bootstrap.remote].base_url is empty".to_string());
+        }
+        if self.index_path.trim().is_empty() {
+            return Err("[bootstrap.remote].index_path is empty".to_string());
+        }
+        if self.download_dir.trim().is_empty() {
+            return Err("[bootstrap.remote].download_dir is empty".to_string());
+        }
+        if self.max_download_mb == 0 {
+            return Err("[bootstrap.remote].max_download_mb must be >= 1".to_string());
+        }
+        if self.connect_timeout_ms == 0 {
+            return Err("[bootstrap.remote].connect_timeout_ms must be >= 1".to_string());
+        }
+        if self.read_timeout_ms == 0 {
+            return Err("[bootstrap.remote].read_timeout_ms must be >= 1".to_string());
+        }
+        if self.concurrency == 0 {
+            return Err("[bootstrap.remote].concurrency must be >= 1".to_string());
+        }
+        if self.concurrency > 32 {
+            return Err("[bootstrap.remote].concurrency must be <= 32".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl BootstrapSigningConfig {
+    pub fn validate(&self, remote: &BootstrapRemoteConfig) -> Result<(), String> {
+        if !remote.enabled {
+            // Signing settings are ignored when remote is disabled.
+            return Ok(());
+        }
+        if !self.enabled && self.required {
+            return Err("[bootstrap.signing].required=true requires enabled=true".to_string());
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.publisher_pubkeys.is_empty() {
+            return Err("[bootstrap.signing].publisher_pubkeys is empty".to_string());
+        }
+        for (i, k) in self.publisher_pubkeys.iter().enumerate() {
+            let raw = hex::decode(k).map_err(|e| {
+                format!("[bootstrap.signing].publisher_pubkeys[{i}] invalid hex: {e}")
+            })?;
+            if raw.len() != 32 {
+                return Err(format!(
+                    "[bootstrap.signing].publisher_pubkeys[{i}] must be 32 bytes (got {})",
+                    raw.len()
+                ));
+            }
+        }
+        Ok(())
     }
 }

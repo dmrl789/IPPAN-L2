@@ -34,11 +34,13 @@ signal-hook = "0.3"
 redis = { version = "0.27", optional = true }
 tar = "0.4"
 tempfile = "3"
+ed25519-dalek = { version = "2", optional = true }
 
 [features]
 default = []
 ha-redis = ["dep:redis"]
 ha-consul = []
+bootstrap-signing = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 assert_cmd = "2"

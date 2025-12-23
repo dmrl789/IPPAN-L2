@@ -7,8 +7,8 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry, TextEncoder,
 };
 use std::time::Instant;
 
@@ -289,6 +289,56 @@ pub static SNAPSHOT_DELTA_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("metric");
     REGISTRY.register(Box::new(g.clone())).expect("register");
     g
+});
+
+// ============================================================
+// Remote bootstrap (fetcher) metrics
+// ============================================================
+
+pub static BOOTSTRAP_FETCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "bootstrap_fetch_total",
+            "Total remote bootstrap fetch attempts",
+        ),
+        &["result"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_BYTES_DOWNLOADED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "bootstrap_bytes_downloaded_total",
+        "Total bytes downloaded by remote bootstrap fetcher",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_VERIFY_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "bootstrap_verify_failures_total",
+        "Total remote bootstrap verification failures",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_RESTORE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "bootstrap_restore_total",
+            "Total remote bootstrap restore attempts",
+        ),
+        &["result"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
 });
 
 pub fn gather_text() -> String {
