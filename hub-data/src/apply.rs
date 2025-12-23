@@ -9,8 +9,9 @@ use crate::envelope::DataEnvelopeV1;
 use crate::store::{keys, DataStore, StoreError};
 use crate::types::{ActionId, AttestationId, DatasetId, LicenseId, ListingId};
 use crate::validation::{
-    validate_append_attestation_v1, validate_create_listing_v1, validate_grant_entitlement_v1,
-    validate_issue_license_v1, validate_register_dataset_v1, ValidationError,
+    validate_append_attestation_v1_with_limits, validate_create_listing_v1_with_limits,
+    validate_grant_entitlement_v1_with_limits, validate_issue_license_v1_with_limits,
+    validate_register_dataset_v1_with_limits, ValidationError, ValidationLimits,
 };
 use l2_core::policy::{PolicyDenyCode, PolicyMode};
 use l2_core::AccountId;
@@ -61,12 +62,28 @@ pub fn apply_with_policy(
     mode: PolicyMode,
     admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ApplyError> {
+    apply_with_policy_and_limits(
+        env,
+        store,
+        mode,
+        admin_accounts,
+        &ValidationLimits::default(),
+    )
+}
+
+pub fn apply_with_policy_and_limits(
+    env: &DataEnvelopeV1,
+    store: &DataStore,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
+) -> Result<ApplyReceipt, ApplyError> {
     let action = env.action.clone();
     let action_id = env.action_id;
 
     let r = store
         .tree()
-        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts));
+        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts, limits));
 
     match r {
         Ok(receipt) => Ok(receipt),
@@ -104,6 +121,7 @@ fn apply_tx(
     action: &DataActionV1,
     mode: PolicyMode,
     admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Idempotency: already applied => success/no-op.
     if tree
@@ -133,16 +151,20 @@ fn apply_tx(
     }
 
     let receipt = match action {
-        DataActionV1::RegisterDatasetV1(a) => apply_register_dataset_v1_tx(tree, action_id, a)?,
+        DataActionV1::RegisterDatasetV1(a) => {
+            apply_register_dataset_v1_tx(tree, action_id, a, limits)?
+        }
         DataActionV1::IssueLicenseV1(a) => {
-            apply_issue_license_v1_tx(tree, action_id, a, mode, admin_accounts)?
+            apply_issue_license_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
         }
         DataActionV1::AppendAttestationV1(a) => {
-            apply_append_attestation_v1_tx(tree, action_id, a, mode)?
+            apply_append_attestation_v1_tx(tree, action_id, a, mode, limits)?
         }
-        DataActionV1::CreateListingV1(a) => apply_create_listing_v1_tx(tree, action_id, a, mode)?,
+        DataActionV1::CreateListingV1(a) => {
+            apply_create_listing_v1_tx(tree, action_id, a, mode, limits)?
+        }
         DataActionV1::GrantEntitlementV1(a) => {
-            apply_grant_entitlement_v1_tx(tree, action_id, a, mode, admin_accounts)?
+            apply_grant_entitlement_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
         }
         DataActionV1::AddLicensorV1(a) => apply_add_licensor_v1_tx(tree, action_id, a, mode)?,
         DataActionV1::AddAttestorV1(a) => apply_add_attestor_v1_tx(tree, action_id, a, mode)?,
@@ -162,8 +184,9 @@ fn apply_register_dataset_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &RegisterDatasetV1,
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    validate_register_dataset_v1(a)
+    validate_register_dataset_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
     if tree.get(keys::dataset(a.dataset_id))?.is_some() {
         return Err(ConflictableTransactionError::Abort(TxError::Rejected(
@@ -191,11 +214,12 @@ fn apply_issue_license_v1_tx(
     a: &IssueLicenseV1,
     mode: PolicyMode,
     _admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
-    validate_issue_license_v1(a)
+    validate_issue_license_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     // Policy: licensor must be dataset owner or allowlisted.
@@ -255,11 +279,12 @@ fn apply_append_attestation_v1_tx(
     action_id: ActionId,
     a: &crate::actions::AppendAttestationV1,
     mode: PolicyMode,
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
-    validate_append_attestation_v1(a)
+    validate_append_attestation_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     // Policy: enforce attestation allowlist if enabled on dataset.
@@ -318,11 +343,12 @@ fn apply_create_listing_v1_tx(
     action_id: ActionId,
     a: &CreateListingV1,
     mode: PolicyMode,
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
-    validate_create_listing_v1(a)
+    validate_create_listing_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     // Policy: licensor must be dataset owner or allowlisted.
@@ -390,6 +416,7 @@ fn apply_grant_entitlement_v1_tx(
     a: &GrantEntitlementV1,
     mode: PolicyMode,
     admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Listing must exist (and be consistent with dataset_id).
     let listing_bytes = tree.get(keys::listing(a.listing_id))?.ok_or_else(|| {
@@ -404,7 +431,7 @@ fn apply_grant_entitlement_v1_tx(
         )));
     }
 
-    validate_grant_entitlement_v1(a)
+    validate_grant_entitlement_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     // Policy: entitlement grant must be performed by dataset.owner (or admin in strict).

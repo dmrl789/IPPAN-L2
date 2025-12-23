@@ -49,6 +49,39 @@ get_finality = "REPLACE_WITH_GET_FINALITY_PATH_WITH_{l1_tx_id}"
 [server]
 bind_address = "0.0.0.0:3000"
 metrics_enabled = true
+max_inflight_requests = 64
+
+[limits]
+# Devnet: moderate defaults (bigger than prod, still bounded).
+max_body_bytes = 524288
+max_string_bytes = 2048
+max_tags = 64
+max_tag_bytes = 64
+max_batch_items = 512
+max_receipt_bytes = 524288
+max_json_depth = 64
+
+[rate_limit]
+enabled = true
+requests_per_minute = 600
+burst = 200
+
+[pagination]
+default_limit = 50
+max_limit = 200
+
+[retention]
+receipts_days = 14
+recon_failed_days = 7
+min_receipts_keep = 200
+
+[pruning]
+enabled = false
+interval_secs = 86400
+
+[cors]
+enabled = false
+allow_origins = []
 
 [storage]
 # Receipt output directory (relative to working directory or absolute).

@@ -41,6 +41,40 @@ get_finality = "env:L1_ENDPOINT_GET_FINALITY"
 bind_address = "0.0.0.0:3000"
 # Enable metrics endpoint
 metrics_enabled = true
+# Best-effort overload protection (HTTP 503 when exceeded).
+max_inflight_requests = 64
+
+[limits]
+max_body_bytes = 262144
+max_string_bytes = 1024
+max_tags = 32
+max_tag_bytes = 48
+max_batch_items = 256
+max_receipt_bytes = 262144
+max_json_depth = 64
+
+[rate_limit]
+enabled = true
+requests_per_minute = 120
+burst = 60
+
+[pagination]
+default_limit = 50
+max_limit = 200
+
+[retention]
+receipts_days = 30
+recon_failed_days = 7
+min_receipts_keep = 1000
+
+[pruning]
+enabled = true
+interval_secs = 86400
+
+[cors]
+# Default deny. Set `enabled=true` + allow_origins when running behind a trusted gateway.
+enabled = false
+allow_origins = []
 
 [hubs]
 # Enable FIN Hub

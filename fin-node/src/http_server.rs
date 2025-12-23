@@ -1,15 +1,25 @@
 #![forbid(unsafe_code)]
+// Prometheus histograms require `f64` observations.
+#![allow(clippy::float_arithmetic)]
+#![allow(clippy::float_cmp)]
 
+use crate::config::{CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig};
 use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
 use crate::linkage::{ApiError as LinkageApiError, BuyLicenseRequestV1, LinkageApi};
 use crate::metrics;
+use crate::rate_limit::{RateLimiter, SystemTimeSource};
 use crate::recon_store::ReconStore;
 use l2_core::l1_contract::{L1ChainStatus, L1Client};
 use serde::Serialize;
+use std::io::Read as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tiny_http::{Header, Response, Server};
 use tracing::{info, warn};
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize)]
 struct HealthResponse<'a> {
@@ -44,15 +54,85 @@ pub fn serve(
     data_api: DataApi,
     linkage_api: LinkageApi,
     recon: Option<ReconStore>,
+    limits: LimitsConfig,
+    pagination: PaginationConfig,
+    rate_limit: RateLimitConfig,
+    _cors: CorsConfig,
+    max_inflight_requests: usize,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let server =
         Server::http(bind).map_err(|e| format!("failed to bind http server on {bind}: {e}"))?;
     info!(bind, "fin-node http server started");
 
-    for mut req in server.incoming_requests() {
+    let limiter = Arc::new(RateLimiter::new(rate_limit, SystemTimeSource));
+    let inflight = Arc::new(AtomicUsize::new(0));
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut req = match server.recv_timeout(Duration::from_millis(250)) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(e) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                warn!(error = %e, "http accept failed");
+                continue;
+            }
+        };
+
+        let request_id = new_request_id();
+        let origin = header_value(&req, "Origin");
+        let started = std::time::Instant::now();
+
+        let cur = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        let _guard = InflightGuard {
+            inflight: inflight.clone(),
+        };
+        if cur > max_inflight_requests.max(1) {
+            metrics::HTTP_REQUESTS_TOTAL
+                .with_label_values(&["overloaded", "503"])
+                .inc();
+            metrics::HTTP_REQUEST_DURATION_SECONDS
+                .with_label_values(&["overloaded"])
+                .observe(started.elapsed().as_secs_f64());
+            let resp = error_response(503, "overloaded", "node_overloaded", &request_id);
+            let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
+            let _ = req.respond(resp);
+            continue;
+        }
+
         let url = req.url().to_string();
         let method = req.method().as_str().to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+        let route = route_label(method.as_str(), path);
+        let ip = req
+            .remote_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        // Per-IP rate limiting (best-effort).
+        if limiter.enabled() && !matches!(path, "/healthz" | "/readyz" | "/metrics") {
+            let d = limiter.check_ip(&ip);
+            if !d.allowed {
+                metrics::RATE_LIMITED_TOTAL.with_label_values(&["ip"]).inc();
+                metrics::HTTP_REQUESTS_TOTAL
+                    .with_label_values(&[route, "429"])
+                    .inc();
+                metrics::HTTP_REQUEST_DURATION_SECONDS
+                    .with_label_values(&[route])
+                    .observe(started.elapsed().as_secs_f64());
+                let resp = with_common_headers(
+                    rate_limited_response(d.retry_after_secs, &request_id),
+                    &request_id,
+                    &_cors,
+                    origin.as_deref(),
+                );
+                // Ignore respond errors (client disconnected).
+                let _ = req.respond(resp);
+                continue;
+            }
+        }
 
         let resp = match (method.as_str(), path) {
             ("GET", "/healthz") => {
@@ -83,123 +163,271 @@ pub fn serve(
             }
             ("GET", "/recon/pending") => {
                 if let Some(store) = recon.as_ref() {
-                    let list = store
-                        .list_pending(500)
+                    let params = parse_query(query);
+                    let limit = params
+                        .get("limit")
+                        .and_then(|x| x.parse::<usize>().ok())
+                        .unwrap_or(pagination.default_limit)
+                        .min(pagination.max_limit);
+                    let cursor = params
+                        .get("cursor")
+                        .map(String::as_str)
+                        .filter(|s| !s.trim().is_empty());
+                    let (list, next_cursor) = store
+                        .list_pending_page(cursor, limit)
                         .map_err(|e| format!("failed listing recon pending: {e}"))?;
                     json_response(
                         200,
-                        &serde_json::json!({"schema_version": 1, "pending": list}),
+                        &serde_json::json!({"schema_version": 1, "pending": list, "next_cursor": next_cursor}),
                     )
                 } else {
-                    json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "recon_disabled"}),
-                    )
+                    error_response(404, "not_found", "recon_disabled", &request_id)
                 }
             }
-            ("POST", "/fin/actions") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
+            ("POST", "/fin/actions") => match read_body_limited(&mut req, limits.max_body_bytes) {
+                Ok(body) => {
+                    if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                        error_response(400, "bad_request", &msg, &request_id)
+                    } else {
+                        match serde_json::from_slice::<hub_fin::FinActionRequestV1>(&body) {
+                            Ok(req_obj) => {
+                                let actor = fin_action_actor(&req_obj);
+                                match enforce_actor_rate_limit(&limiter, &actor, &request_id) {
+                                    Some(resp) => resp,
+                                    None => {
+                                        match fin_api.submit_action_obj(req_obj.into_action()) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => api_error_response(e, &request_id),
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error_response(400, "bad_request", &e.to_string(), &request_id)
+                            }
+                        }
+                    }
                 }
-                match fin_api.submit_action(&body) {
-                    Ok(out) => json_response(200, &out),
-                    Err(e) => api_error_response(e),
-                }
-            }
+                Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                Err(BodyReadError::Io(e)) => error_response(
+                    500,
+                    "internal",
+                    &format!("body_read_failed: {e}"),
+                    &request_id,
+                ),
+            },
             ("POST", "/data/datasets") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<hub_data::RegisterDatasetRequestV1>(&body) {
-                    Ok(req) => match data_api.submit_register_dataset(req) {
-                        Ok(out) => json_response(200, &out),
-                        Err(e) => data_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<hub_data::RegisterDatasetRequestV1>(
+                                &body,
+                            ) {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.owner.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match data_api.submit_register_dataset(req_obj) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => data_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
             ("POST", "/data/licenses") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<hub_data::IssueLicenseRequestV1>(&body) {
-                    Ok(req) => match data_api.submit_issue_license(req) {
-                        Ok(out) => json_response(200, &out),
-                        Err(e) => data_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<hub_data::IssueLicenseRequestV1>(&body) {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.licensor.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match data_api.submit_issue_license(req_obj) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => data_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
             ("POST", "/data/attestations") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<hub_data::AppendAttestationRequestV1>(&body) {
-                    Ok(req) => match data_api.submit_append_attestation(req) {
-                        Ok(out) => json_response(200, &out),
-                        Err(e) => data_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<hub_data::AppendAttestationRequestV1>(
+                                &body,
+                            ) {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.attestor.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match data_api.submit_append_attestation(req_obj) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => data_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
             ("POST", "/data/listings") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<hub_data::CreateListingRequestV1>(&body) {
-                    Ok(req) => match data_api.submit_create_listing(req) {
-                        Ok(out) => json_response(200, &out),
-                        Err(e) => data_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<hub_data::CreateListingRequestV1>(&body)
+                            {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.licensor.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match data_api.submit_create_listing(req_obj) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => data_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
             ("POST", "/data/allowlist/licensors") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<hub_data::AddLicensorRequestV1>(&body) {
-                    Ok(req) => match data_api.submit_add_licensor(req) {
-                        Ok(out) => json_response(200, &out),
-                        Err(e) => data_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<hub_data::AddLicensorRequestV1>(&body) {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.actor.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match data_api.submit_add_licensor(req_obj) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => data_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
             ("POST", "/data/allowlist/attestors") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<hub_data::AddAttestorRequestV1>(&body) {
-                    Ok(req) => match data_api.submit_add_attestor(req) {
-                        Ok(out) => json_response(200, &out),
-                        Err(e) => data_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<hub_data::AddAttestorRequestV1>(&body) {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.actor.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match data_api.submit_add_attestor(req_obj) {
+                                            Ok(out) => json_response(200, &out),
+                                            Err(e) => data_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
@@ -207,52 +435,82 @@ pub fn serve(
                 let dataset_id = p
                     .trim_start_matches("/data/datasets/")
                     .trim_end_matches("/licenses");
-                match data_api.list_licenses_by_dataset(dataset_id) {
-                    Ok(list) => json_response(
+                let params = parse_query(query);
+                let limit = params
+                    .get("limit")
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(pagination.default_limit)
+                    .min(pagination.max_limit);
+                let cursor = params
+                    .get("cursor")
+                    .map(String::as_str)
+                    .filter(|s| !s.trim().is_empty());
+                match data_api.list_licenses_by_dataset_page(dataset_id, cursor, limit) {
+                    Ok((list, next_cursor)) => json_response(
                         200,
-                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "licenses": list}),
+                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "items": list, "next_cursor": next_cursor}),
                     ),
-                    Err(e) => data_api_error_response(e),
+                    Err(e) => data_api_error_response(e, &request_id),
                 }
             }
             ("GET", p) if p.starts_with("/data/datasets/") && p.ends_with("/attestations") => {
                 let dataset_id = p
                     .trim_start_matches("/data/datasets/")
                     .trim_end_matches("/attestations");
-                match data_api.list_attestations_by_dataset(dataset_id) {
-                    Ok(list) => json_response(
+                let params = parse_query(query);
+                let limit = params
+                    .get("limit")
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(pagination.default_limit)
+                    .min(pagination.max_limit);
+                let cursor = params
+                    .get("cursor")
+                    .map(String::as_str)
+                    .filter(|s| !s.trim().is_empty());
+                match data_api.list_attestations_by_dataset_page(dataset_id, cursor, limit) {
+                    Ok((list, next_cursor)) => json_response(
                         200,
-                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "attestations": list}),
+                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "items": list, "next_cursor": next_cursor}),
                     ),
-                    Err(e) => data_api_error_response(e),
+                    Err(e) => data_api_error_response(e, &request_id),
                 }
             }
             ("GET", "/data/listings") => {
                 let params = parse_query(query);
                 let dataset_id = params.get("dataset_id").map(String::as_str).unwrap_or("");
                 if dataset_id.is_empty() {
-                    json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": "missing dataset_id"}),
-                    )
+                    error_response(400, "bad_request", "missing dataset_id", &request_id)
                 } else {
                     match hub_data::Hex32::from_hex(dataset_id) {
-                        Ok(did) => match data_api.list_listings_by_dataset_typed(did) {
-                            Ok(list) => {
-                                let v: Vec<serde_json::Value> = list
-                                    .into_iter()
-                                    .map(|x| serde_json::to_value(x).expect("serde value"))
-                                    .collect();
-                                json_response(
-                                    200,
-                                    &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "listings": v}),
-                                )
+                        Ok(did) => {
+                            let limit = params
+                                .get("limit")
+                                .and_then(|x| x.parse::<usize>().ok())
+                                .unwrap_or(pagination.default_limit)
+                                .min(pagination.max_limit);
+                            let cursor = params
+                                .get("cursor")
+                                .map(String::as_str)
+                                .filter(|s| !s.trim().is_empty());
+                            match data_api.list_listings_by_dataset_page_typed(did, cursor, limit) {
+                                Ok((list, next_cursor)) => {
+                                    let v: Vec<serde_json::Value> = list
+                                        .into_iter()
+                                        .map(|x| serde_json::to_value(x).expect("serde value"))
+                                        .collect();
+                                    json_response(
+                                        200,
+                                        &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "items": v, "next_cursor": next_cursor}),
+                                    )
+                                }
+                                Err(e) => data_api_error_response(e, &request_id),
                             }
-                            Err(e) => data_api_error_response(e),
-                        },
-                        Err(e) => json_response(
+                        }
+                        Err(e) => error_response(
                             400,
-                            &serde_json::json!({"schema_version": 1, "error": format!("invalid dataset_id: {e}")}),
+                            "bad_request",
+                            &format!("invalid dataset_id: {e}"),
+                            &request_id,
                         ),
                     }
                 }
@@ -268,15 +526,82 @@ pub fn serve(
                 let limit = params
                     .get("limit")
                     .and_then(|x| x.parse::<usize>().ok())
-                    .unwrap_or(100);
+                    .unwrap_or(pagination.default_limit)
+                    .min(pagination.max_limit);
+                let cursor = params
+                    .get("cursor")
+                    .map(String::as_str)
+                    .filter(|s| !s.trim().is_empty());
                 if !dataset_id.is_empty() && !licensee.is_empty() {
-                    json_response(
+                    error_response(
                         400,
-                        &serde_json::json!({"schema_version": 1, "error": "pass dataset_id OR licensee"}),
+                        "bad_request",
+                        "pass dataset_id OR licensee",
+                        &request_id,
                     )
                 } else if !dataset_id.is_empty() {
                     match hub_data::Hex32::from_hex(dataset_id) {
-                        Ok(did) => match data_api.list_entitlements_by_dataset_typed(did) {
+                        Ok(did) => {
+                            if cursor.is_some() {
+                                match data_api
+                                    .list_entitlements_by_dataset_page_typed(did, cursor, limit)
+                                {
+                                    Ok((list, next_cursor)) => {
+                                        let v: Vec<serde_json::Value> = list
+                                            .into_iter()
+                                            .map(|ent| entitlement_view_json(&data_api, ent))
+                                            .collect();
+                                        json_response(
+                                            200,
+                                            &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "limit": limit, "items": v, "next_cursor": next_cursor}),
+                                        )
+                                    }
+                                    Err(e) => data_api_error_response(e, &request_id),
+                                }
+                            } else {
+                                match data_api.list_entitlements_by_dataset_typed(did) {
+                                    Ok(list) => {
+                                        let v: Vec<serde_json::Value> = list
+                                            .into_iter()
+                                            .skip(offset)
+                                            .take(limit)
+                                            .map(|ent| entitlement_view_json(&data_api, ent))
+                                            .collect();
+                                        json_response(
+                                            200,
+                                            &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "offset": offset, "limit": limit, "items": v}),
+                                        )
+                                    }
+                                    Err(e) => data_api_error_response(e, &request_id),
+                                }
+                            }
+                        }
+                        Err(e) => error_response(
+                            400,
+                            "bad_request",
+                            &format!("invalid dataset_id: {e}"),
+                            &request_id,
+                        ),
+                    }
+                } else if !licensee.is_empty() {
+                    if cursor.is_some() {
+                        match data_api
+                            .list_entitlements_by_licensee_page_typed(licensee, cursor, limit)
+                        {
+                            Ok((list, next_cursor)) => {
+                                let v: Vec<serde_json::Value> = list
+                                    .into_iter()
+                                    .map(|ent| entitlement_view_json(&data_api, ent))
+                                    .collect();
+                                json_response(
+                                    200,
+                                    &serde_json::json!({"schema_version": 1, "licensee": licensee, "limit": limit, "items": v, "next_cursor": next_cursor}),
+                                )
+                            }
+                            Err(e) => data_api_error_response(e, &request_id),
+                        }
+                    } else {
+                        match data_api.list_entitlements_by_licensee_typed(licensee) {
                             Ok(list) => {
                                 let v: Vec<serde_json::Value> = list
                                     .into_iter()
@@ -286,36 +611,18 @@ pub fn serve(
                                     .collect();
                                 json_response(
                                     200,
-                                    &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "offset": offset, "limit": limit, "entitlements": v}),
+                                    &serde_json::json!({"schema_version": 1, "licensee": licensee, "offset": offset, "limit": limit, "items": v}),
                                 )
                             }
-                            Err(e) => data_api_error_response(e),
-                        },
-                        Err(e) => json_response(
-                            400,
-                            &serde_json::json!({"schema_version": 1, "error": format!("invalid dataset_id: {e}")}),
-                        ),
-                    }
-                } else if !licensee.is_empty() {
-                    match data_api.list_entitlements_by_licensee_typed(licensee) {
-                        Ok(list) => {
-                            let v: Vec<serde_json::Value> = list
-                                .into_iter()
-                                .skip(offset)
-                                .take(limit)
-                                .map(|ent| entitlement_view_json(&data_api, ent))
-                                .collect();
-                            json_response(
-                                200,
-                                &serde_json::json!({"schema_version": 1, "licensee": licensee, "offset": offset, "limit": limit, "entitlements": v}),
-                            )
+                            Err(e) => data_api_error_response(e, &request_id),
                         }
-                        Err(e) => data_api_error_response(e),
                     }
                 } else {
-                    json_response(
+                    error_response(
                         400,
-                        &serde_json::json!({"schema_version": 1, "error": "missing dataset_id or licensee"}),
+                        "bad_request",
+                        "missing dataset_id or licensee",
+                        &request_id,
                     )
                 }
             }
@@ -326,11 +633,8 @@ pub fn serve(
                         200,
                         &serde_json::json!({"schema_version": 1, "dataset": ds}),
                     ),
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => data_api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => data_api_error_response(e, &request_id),
                 }
             }
             ("GET", p) if p.starts_with("/data/licenses/") => {
@@ -340,11 +644,8 @@ pub fn serve(
                         200,
                         &serde_json::json!({"schema_version": 1, "license": lic}),
                     ),
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => data_api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => data_api_error_response(e, &request_id),
                 }
             }
             ("GET", p) if p.starts_with("/fin/assets/") => {
@@ -354,11 +655,8 @@ pub fn serve(
                         200,
                         &serde_json::json!({"schema_version": 1, "asset": asset}),
                     ),
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => api_error_response(e, &request_id),
                 }
             }
             ("GET", "/fin/balances") => {
@@ -366,9 +664,11 @@ pub fn serve(
                 let asset_id = params.get("asset_id").map(String::as_str).unwrap_or("");
                 let account = params.get("account").map(String::as_str).unwrap_or("");
                 if asset_id.is_empty() || account.is_empty() {
-                    json_response(
+                    error_response(
                         400,
-                        &serde_json::json!({"schema_version": 1, "error": "missing asset_id or account"}),
+                        "bad_request",
+                        "missing asset_id or account",
+                        &request_id,
                     )
                 } else {
                     match fin_api.get_balance(asset_id, account) {
@@ -376,7 +676,7 @@ pub fn serve(
                             200,
                             &serde_json::json!({"schema_version": 1, "asset_id": asset_id, "account": account, "amount_scaled_u128": amount}),
                         ),
-                        Err(e) => api_error_response(e),
+                        Err(e) => api_error_response(e, &request_id),
                     }
                 }
             }
@@ -390,11 +690,8 @@ pub fn serve(
                             .with_status_code(200)
                             .with_header(h)
                     }
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => api_error_response(e, &request_id),
                 }
             }
             ("GET", p) if p.starts_with("/receipts/fin/") => {
@@ -407,11 +704,8 @@ pub fn serve(
                             .with_status_code(200)
                             .with_header(h)
                     }
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => api_error_response(e, &request_id),
                 }
             }
             ("GET", p) if p.starts_with("/data/receipts/") => {
@@ -424,11 +718,8 @@ pub fn serve(
                             .with_status_code(200)
                             .with_header(h)
                     }
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => data_api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => data_api_error_response(e, &request_id),
                 }
             }
             ("GET", p) if p.starts_with("/receipts/data/") => {
@@ -441,29 +732,45 @@ pub fn serve(
                             .with_status_code(200)
                             .with_header(h)
                     }
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => data_api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => data_api_error_response(e, &request_id),
                 }
             }
             ("POST", "/linkage/buy-license") => {
-                let mut body = Vec::new();
-                if let Err(e) = req.as_reader().read_to_end(&mut body) {
-                    return Err(format!("failed reading request body: {e}"));
-                }
-                match serde_json::from_slice::<BuyLicenseRequestV1>(&body) {
-                    Ok(req) => match linkage_api.buy_license(req) {
-                        Ok(receipt) => json_response(
-                            200,
-                            &serde_json::json!({"schema_version": 1, "receipt": receipt}),
-                        ),
-                        Err(e) => linkage_api_error_response(e),
-                    },
-                    Err(e) => json_response(
-                        400,
-                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                match read_body_limited(&mut req, limits.max_body_bytes) {
+                    Ok(body) => {
+                        if let Err(msg) = validate_json_depth(&body, limits.max_json_depth) {
+                            error_response(400, "bad_request", &msg, &request_id)
+                        } else {
+                            match serde_json::from_slice::<BuyLicenseRequestV1>(&body) {
+                                Ok(req_obj) => {
+                                    match enforce_actor_rate_limit(
+                                        &limiter,
+                                        &req_obj.buyer_account.0,
+                                        &request_id,
+                                    ) {
+                                        Some(resp) => resp,
+                                        None => match linkage_api.buy_license(req_obj) {
+                                            Ok(receipt) => json_response(
+                                                200,
+                                                &serde_json::json!({"schema_version": 1, "receipt": receipt}),
+                                            ),
+                                            Err(e) => linkage_api_error_response(e, &request_id),
+                                        },
+                                    }
+                                }
+                                Err(e) => {
+                                    error_response(400, "bad_request", &e.to_string(), &request_id)
+                                }
+                            }
+                        }
+                    }
+                    Err(BodyReadError::TooLarge) => payload_too_large_response(&request_id),
+                    Err(BodyReadError::Io(e)) => error_response(
+                        500,
+                        "internal",
+                        &format!("body_read_failed: {e}"),
+                        &request_id,
                     ),
                 }
             }
@@ -473,21 +780,220 @@ pub fn serve(
                     Ok(Some(r)) => {
                         json_response(200, &serde_json::json!({"schema_version": 1, "receipt": r}))
                     }
-                    Ok(None) => json_response(
-                        404,
-                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
-                    ),
-                    Err(e) => linkage_api_error_response(e),
+                    Ok(None) => error_response(404, "not_found", "not_found", &request_id),
+                    Err(e) => linkage_api_error_response(e, &request_id),
                 }
             }
-            _ => Response::from_string("not found\n").with_status_code(404),
+            _ => error_response(404, "not_found", "not_found", &request_id),
         };
 
+        let status = resp.status_code().0.to_string();
+        metrics::HTTP_REQUESTS_TOTAL
+            .with_label_values(&[route, status.as_str()])
+            .inc();
+        metrics::HTTP_REQUEST_DURATION_SECONDS
+            .with_label_values(&[route])
+            .observe(started.elapsed().as_secs_f64());
+
+        let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
         if let Err(e) = req.respond(resp) {
             warn!(error = %e, "failed writing http response");
         }
     }
     Ok(())
+}
+
+struct InflightGuard {
+    inflight: Arc<AtomicUsize>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn new_request_id() -> String {
+    let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("req-{ms}-{n}")
+}
+
+fn header_value(req: &tiny_http::Request, name: &'static str) -> Option<String> {
+    for h in req.headers() {
+        if h.field.equiv(name) {
+            return Some(h.value.as_str().to_string());
+        }
+    }
+    None
+}
+
+fn with_common_headers(
+    resp: Response<std::io::Cursor<Vec<u8>>>,
+    request_id: &str,
+    cors: &CorsConfig,
+    origin: Option<&str>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut resp =
+        resp.with_header(Header::from_bytes(&b"X-Request-Id"[..], request_id.as_bytes()).unwrap());
+    resp = resp
+        .with_header(Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap());
+    if cors.enabled {
+        if let Some(origin) = origin {
+            if cors.allow_origins.iter().any(|o| o.as_str() == origin) {
+                resp = resp.with_header(
+                    Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes())
+                        .unwrap(),
+                );
+                resp = resp.with_header(Header::from_bytes(&b"Vary"[..], &b"Origin"[..]).unwrap());
+            }
+        }
+    }
+    resp
+}
+
+fn rate_limited_response(
+    retry_after_secs: u64,
+    request_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let h_ra =
+        Header::from_bytes(&b"Retry-After"[..], retry_after_secs.to_string().as_bytes()).unwrap();
+    let resp = json_response(
+        429,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code: "rate_limited",
+                message: "rate_limited".to_string(),
+                request_id,
+            },
+            retry_after_secs: Some(retry_after_secs),
+        },
+    );
+    resp.with_header(h_ra)
+}
+
+fn fin_action_actor(req: &hub_fin::FinActionRequestV1) -> String {
+    match req {
+        hub_fin::FinActionRequestV1::CreateAssetV1(a) => {
+            a.actor.as_ref().unwrap_or(&a.issuer).0.clone()
+        }
+        hub_fin::FinActionRequestV1::MintUnitsV1(a) => {
+            a.actor.as_ref().unwrap_or(&a.to_account).0.clone()
+        }
+        hub_fin::FinActionRequestV1::TransferUnitsV1(a) => {
+            a.actor.as_ref().unwrap_or(&a.from_account).0.clone()
+        }
+    }
+}
+
+fn enforce_actor_rate_limit(
+    limiter: &Arc<RateLimiter<SystemTimeSource>>,
+    actor: &str,
+    request_id: &str,
+) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    if !limiter.enabled() {
+        return None;
+    }
+    let d = limiter.check_actor(actor);
+    if d.allowed {
+        None
+    } else {
+        metrics::RATE_LIMITED_TOTAL
+            .with_label_values(&["actor"])
+            .inc();
+        Some(rate_limited_response(d.retry_after_secs, request_id))
+    }
+}
+
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge,
+    Io(std::io::Error),
+}
+
+fn read_body_limited(
+    req: &mut tiny_http::Request,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BodyReadError> {
+    read_to_end_limited(req.as_reader(), max_bytes).map_err(|e| match e {
+        ReadToEndLimitedError::TooLarge => BodyReadError::TooLarge,
+        ReadToEndLimitedError::Io(io) => BodyReadError::Io(io),
+    })
+}
+
+#[derive(Debug)]
+enum ReadToEndLimitedError {
+    TooLarge,
+    Io(std::io::Error),
+}
+
+fn read_to_end_limited<R: std::io::Read>(
+    mut r: R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ReadToEndLimitedError> {
+    let mut body = Vec::new();
+    let mut limited = (&mut r).take((max_bytes.saturating_add(1)) as u64);
+    limited
+        .read_to_end(&mut body)
+        .map_err(ReadToEndLimitedError::Io)?;
+    if body.len() > max_bytes {
+        return Err(ReadToEndLimitedError::TooLarge);
+    }
+    Ok(body)
+}
+
+fn payload_too_large_response(request_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    metrics::PAYLOAD_REJECTED_TOTAL
+        .with_label_values(&["body_too_large"])
+        .inc();
+    error_response(413, "payload_too_large", "payload_too_large", request_id)
+}
+
+fn validate_json_depth(body: &[u8], max_depth: usize) -> Result<(), String> {
+    if max_depth == 0 {
+        return Ok(());
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "invalid_json".to_string())?;
+    let depth = json_depth(&v);
+    if depth > max_depth {
+        return Err(format!("json_too_deep (max_depth={max_depth})"));
+    }
+    Ok(())
+}
+
+fn json_depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => 1,
+        serde_json::Value::Array(a) => 1 + a.iter().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Object(m) => 1 + m.values().map(json_depth).max().unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_to_end_limited_rejects_oversize() {
+        let max = 10usize;
+        let body = vec![b'a'; max + 1];
+        let r = std::io::Cursor::new(body);
+        let err = read_to_end_limited(r, max).unwrap_err();
+        assert!(matches!(err, ReadToEndLimitedError::TooLarge));
+    }
+
+    #[test]
+    fn payload_too_large_response_is_413() {
+        let r = payload_too_large_response("test-req");
+        assert_eq!(r.status_code(), 413);
+    }
 }
 
 fn json_response<T: Serialize>(code: u16, v: &T) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -498,53 +1004,80 @@ fn json_response<T: Serialize>(code: u16, v: &T) -> Response<std::io::Cursor<Vec
         .with_header(h)
 }
 
-fn api_error_response(e: ApiError) -> Response<std::io::Cursor<Vec<u8>>> {
+#[derive(Debug, Serialize)]
+struct ErrorEnvelope<'a> {
+    error: ErrorBody<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody<'a> {
+    code: &'a str,
+    message: String,
+    request_id: &'a str,
+}
+
+fn sanitize_message(s: &str) -> String {
+    let mut out = s.replace(['\n', '\r', '\t'], " ");
+    out = out.trim().to_string();
+    const MAX: usize = 256;
+    if out.len() > MAX {
+        out.truncate(MAX);
+    }
+    out
+}
+
+fn error_response(
+    http_status: u16,
+    code: &'static str,
+    message: &str,
+    request_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(
+        http_status,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code,
+                message: sanitize_message(message),
+                request_id,
+            },
+            retry_after_secs: None,
+        },
+    )
+}
+
+fn api_error_response(e: ApiError, request_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     match e {
-        ApiError::BadRequest(msg) => {
-            json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
-        ApiError::PolicyDenied(p) => json_response(
-            403,
-            &serde_json::json!({"schema_version": 1, "error": "policy_denied", "policy": p}),
-        ),
-        ApiError::Upstream(msg) => {
-            json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
-        ApiError::Internal(msg) => {
-            json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
+        ApiError::BadRequest(msg) => error_response(400, "bad_request", &msg, request_id),
+        ApiError::PolicyDenied(p) => error_response(403, "policy_denied", &p.message, request_id),
+        ApiError::Upstream(msg) => error_response(502, "upstream", &msg, request_id),
+        ApiError::Internal(msg) => error_response(500, "internal", &msg, request_id),
     }
 }
 
-fn data_api_error_response(e: DataApiError) -> Response<std::io::Cursor<Vec<u8>>> {
+fn data_api_error_response(
+    e: DataApiError,
+    request_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     match e {
-        DataApiError::BadRequest(msg) => {
-            json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
+        DataApiError::BadRequest(msg) => error_response(400, "bad_request", &msg, request_id),
+        DataApiError::PolicyDenied(p) => {
+            error_response(403, "policy_denied", &p.message, request_id)
         }
-        DataApiError::PolicyDenied(p) => json_response(
-            403,
-            &serde_json::json!({"schema_version": 1, "error": "policy_denied", "policy": p}),
-        ),
-        DataApiError::Upstream(msg) => {
-            json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
-        DataApiError::Internal(msg) => {
-            json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
+        DataApiError::Upstream(msg) => error_response(502, "upstream", &msg, request_id),
+        DataApiError::Internal(msg) => error_response(500, "internal", &msg, request_id),
     }
 }
 
-fn linkage_api_error_response(e: LinkageApiError) -> Response<std::io::Cursor<Vec<u8>>> {
+fn linkage_api_error_response(
+    e: LinkageApiError,
+    request_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     match e {
-        LinkageApiError::BadRequest(msg) => {
-            json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
-        LinkageApiError::Upstream(msg) => {
-            json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
-        LinkageApiError::Internal(msg) => {
-            json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
-        }
+        LinkageApiError::BadRequest(msg) => error_response(400, "bad_request", &msg, request_id),
+        LinkageApiError::Upstream(msg) => error_response(502, "upstream", &msg, request_id),
+        LinkageApiError::Internal(msg) => error_response(500, "internal", &msg, request_id),
     }
 }
 
@@ -626,6 +1159,54 @@ fn from_hex(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+fn route_label(method: &str, path: &str) -> &'static str {
+    match (method, path) {
+        ("GET", "/healthz") => "GET /healthz",
+        ("GET", "/readyz") => "GET /readyz",
+        ("GET", "/metrics") => "GET /metrics",
+        ("GET", "/recon/pending") => "GET /recon/pending",
+        ("POST", "/fin/actions") => "POST /fin/actions",
+        ("POST", "/data/datasets") => "POST /data/datasets",
+        ("POST", "/data/licenses") => "POST /data/licenses",
+        ("POST", "/data/attestations") => "POST /data/attestations",
+        ("POST", "/data/listings") => "POST /data/listings",
+        ("POST", "/data/allowlist/licensors") => "POST /data/allowlist/licensors",
+        ("POST", "/data/allowlist/attestors") => "POST /data/allowlist/attestors",
+        ("GET", "/data/listings") => "GET /data/listings",
+        ("GET", "/data/entitlements") => "GET /data/entitlements",
+        ("POST", "/linkage/buy-license") => "POST /linkage/buy-license",
+        _ => {
+            if method == "GET" && path.starts_with("/data/datasets/") && path.ends_with("/licenses")
+            {
+                "GET /data/datasets/:id/licenses"
+            } else if method == "GET"
+                && path.starts_with("/data/datasets/")
+                && path.ends_with("/attestations")
+            {
+                "GET /data/datasets/:id/attestations"
+            } else if method == "GET" && path.starts_with("/data/datasets/") {
+                "GET /data/datasets/:id"
+            } else if method == "GET" && path.starts_with("/data/licenses/") {
+                "GET /data/licenses/:id"
+            } else if method == "GET" && path.starts_with("/fin/assets/") {
+                "GET /fin/assets/:id"
+            } else if method == "GET" && path.starts_with("/fin/receipts/") {
+                "GET /fin/receipts/:action_id"
+            } else if method == "GET" && path.starts_with("/receipts/fin/") {
+                "GET /receipts/fin/:action_id"
+            } else if method == "GET" && path.starts_with("/data/receipts/") {
+                "GET /data/receipts/:action_id"
+            } else if method == "GET" && path.starts_with("/receipts/data/") {
+                "GET /receipts/data/:action_id"
+            } else if method == "GET" && path.starts_with("/linkage/purchase/") {
+                "GET /linkage/purchase/:purchase_id"
+            } else {
+                "unknown"
+            }
+        }
     }
 }
 

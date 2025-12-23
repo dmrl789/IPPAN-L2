@@ -1,11 +1,8 @@
 #![forbid(unsafe_code)]
 
 use base64::Engine as _;
-use hub_fin::apply::ApplyError;
-use hub_fin::{
-    apply_with_policy, ApplyOutcome, FinActionRequestV1, FinActionV1, FinEnvelopeV1, FinStore,
-    Hex32,
-};
+use hub_fin::apply::{apply_with_policy_and_limits, ApplyError};
+use hub_fin::{ApplyOutcome, FinActionV1, FinEnvelopeV1, FinStore, Hex32};
 use l2_core::finality::SubmitState;
 use l2_core::l1_contract::{
     FixedAmountV1, HubPayloadEnvelopeV1, L1Client, L1SubmitResult, L2BatchEnvelopeV1,
@@ -18,6 +15,7 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
+use crate::metrics;
 use crate::policy_runtime::PolicyRuntime;
 use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
 
@@ -28,6 +26,7 @@ pub struct FinApi {
     receipts_dir: PathBuf,
     policy: PolicyRuntime,
     recon: Option<ReconStore>,
+    limits: hub_fin::validation::ValidationLimits,
 }
 
 impl FinApi {
@@ -43,6 +42,7 @@ impl FinApi {
             receipts_dir,
             policy: PolicyRuntime::default(),
             recon: None,
+            limits: hub_fin::validation::ValidationLimits::default(),
         }
     }
 
@@ -63,19 +63,32 @@ impl FinApi {
         policy: PolicyRuntime,
         recon: Option<ReconStore>,
     ) -> Self {
+        Self::new_with_policy_recon_and_limits(
+            l1,
+            store,
+            receipts_dir,
+            policy,
+            recon,
+            hub_fin::validation::ValidationLimits::default(),
+        )
+    }
+
+    pub fn new_with_policy_recon_and_limits(
+        l1: Arc<dyn L1Client + Send + Sync>,
+        store: FinStore,
+        receipts_dir: PathBuf,
+        policy: PolicyRuntime,
+        recon: Option<ReconStore>,
+        limits: hub_fin::validation::ValidationLimits,
+    ) -> Self {
         Self {
             l1,
             store,
             receipts_dir,
             policy,
             recon,
+            limits,
         }
-    }
-
-    pub fn submit_action(&self, body: &[u8]) -> Result<SubmitActionResponseV1, ApiError> {
-        let req: FinActionRequestV1 =
-            serde_json::from_slice(body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        self.submit_action_obj(req.into_action())
     }
 
     pub fn submit_action_obj(
@@ -95,24 +108,29 @@ impl FinApi {
         self.enforce_compliance(&env.action, &context_id)?;
 
         // 1) Apply locally (sled)
-        let local =
-            match apply_with_policy(&env, &self.store, self.policy.mode, &self.policy.admins) {
-                Ok(x) => x,
-                Err(e) => {
-                    let api_err = ApiError::from_apply_with_context(e, context_id.clone());
-                    if let ApiError::PolicyDenied(p) = &api_err {
-                        warn!(
-                            event = "action_denied",
-                            hub = "fin",
-                            action_kind = %fin_action_kind(&env.action),
-                            action_id = %context_id,
-                            code = ?p.code,
-                            message = %p.message
-                        );
-                    }
-                    return Err(api_err);
+        let local = match apply_with_policy_and_limits(
+            &env,
+            &self.store,
+            self.policy.mode,
+            &self.policy.admins,
+            &self.limits,
+        ) {
+            Ok(x) => x,
+            Err(e) => {
+                let api_err = ApiError::from_apply_with_context(e, context_id.clone());
+                if let ApiError::PolicyDenied(p) = &api_err {
+                    warn!(
+                        event = "action_denied",
+                        hub = "fin",
+                        action_kind = %fin_action_kind(&env.action),
+                        action_id = %context_id,
+                        code = ?p.code,
+                        message = %p.message
+                    );
                 }
-            };
+                return Err(api_err);
+            }
+        };
 
         info!(
             event = "action_applied",
@@ -246,11 +264,22 @@ impl FinApi {
             .ok_or_else(|| ApiError::Internal("missing fin receipt".to_string()))?;
         r.submit_state = submit_state;
         let _ = self.persist_action_receipt(&r)?;
+        metrics::RECEIPTS_TOTAL
+            .with_label_values(&["fin", submit_state_label(&r.submit_state)])
+            .inc();
         Ok(())
     }
 
     pub fn persist_receipt_typed(&self, receipt: &FinActionReceiptV1) -> Result<(), ApiError> {
         let _ = self.persist_action_receipt(receipt)?;
+        Ok(())
+    }
+
+    /// Flush underlying stores to disk (best-effort).
+    pub fn flush(&self) -> Result<(), ApiError> {
+        self.store
+            .flush()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -276,6 +305,10 @@ impl FinApi {
         self.store
             .put_final_receipt(action_id, &bytes)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        metrics::RECEIPTS_TOTAL
+            .with_label_values(&["fin", "written"])
+            .inc();
 
         Ok(out)
     }
@@ -487,6 +520,9 @@ pub struct FinActionReceiptV1 {
     #[serde(default)]
     pub submit_state: SubmitState,
     pub written_at: String,
+    /// Unix seconds when the receipt was written (for retention/pruning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at_unix_secs: Option<u64>,
 }
 
 impl FinActionReceiptV1 {
@@ -500,6 +536,7 @@ impl FinActionReceiptV1 {
         let written_at = time::OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
+        let written_at_unix_secs = unix_now_secs();
         let batch_canonical_hash = b64url32(
             &batch
                 .canonical_hash_blake3()
@@ -524,6 +561,7 @@ impl FinActionReceiptV1 {
                 l1_tx_id: submit.l1_tx_id.as_ref().map(|x| x.0.clone()),
             },
             written_at,
+            written_at_unix_secs: Some(written_at_unix_secs),
         }
     }
 }
@@ -537,4 +575,14 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn submit_state_label(s: &SubmitState) -> &'static str {
+    match s {
+        SubmitState::NotSubmitted => "not_submitted",
+        SubmitState::Submitted { .. } => "submitted",
+        SubmitState::Included { .. } => "included",
+        SubmitState::Finalized { .. } => "finalized",
+        SubmitState::Failed { .. } => "failed",
+    }
 }

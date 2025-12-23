@@ -202,6 +202,12 @@ impl FinStore {
     pub(crate) fn tree(&self) -> &sled::Tree {
         &self.tree
     }
+
+    /// Flush pending writes to disk (best-effort).
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.tree.flush()?;
+        Ok(())
+    }
 }
 
 pub mod keys {

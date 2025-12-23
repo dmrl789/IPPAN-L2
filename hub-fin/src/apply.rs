@@ -8,8 +8,9 @@ use crate::envelope::FinEnvelopeV1;
 use crate::store::{keys, FinStore, StoreError};
 use crate::types::{ActionId, AmountU128, AssetId32};
 use crate::validation::{
-    validate_amount_addition, validate_amount_subtraction, validate_create_asset_v1,
-    validate_mint_units_v1, validate_transfer_units_v1, ValidationError,
+    validate_amount_addition, validate_amount_subtraction, validate_create_asset_v1_with_limits,
+    validate_mint_units_v1_with_limits, validate_transfer_units_v1_with_limits, ValidationError,
+    ValidationLimits,
 };
 use l2_core::hub_linkage::PurchaseId;
 use l2_core::policy::{PolicyDenyCode, PolicyMode};
@@ -61,12 +62,28 @@ pub fn apply_with_policy(
     mode: PolicyMode,
     admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ApplyError> {
+    apply_with_policy_and_limits(
+        env,
+        store,
+        mode,
+        admin_accounts,
+        &ValidationLimits::default(),
+    )
+}
+
+pub fn apply_with_policy_and_limits(
+    env: &FinEnvelopeV1,
+    store: &FinStore,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
+) -> Result<ApplyReceipt, ApplyError> {
     let action = env.action.clone();
     let action_id = env.action_id;
 
     let r = store
         .tree()
-        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts));
+        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts, limits));
 
     match r {
         Ok(receipt) => Ok(receipt),
@@ -104,6 +121,7 @@ fn apply_tx(
     action: &FinActionV1,
     mode: PolicyMode,
     admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Idempotency: already applied => success/no-op.
     if tree
@@ -131,13 +149,13 @@ fn apply_tx(
 
     let receipt = match action {
         FinActionV1::CreateAssetV1(a) => {
-            apply_create_asset_v1_tx(tree, action_id, a, mode, admin_accounts)?
+            apply_create_asset_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
         }
         FinActionV1::MintUnitsV1(a) => {
-            apply_mint_units_v1_tx(tree, action_id, a, mode, admin_accounts)?
+            apply_mint_units_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
         }
         FinActionV1::TransferUnitsV1(a) => {
-            apply_transfer_units_v1_tx(tree, action_id, a, mode, admin_accounts)?
+            apply_transfer_units_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
         }
     };
 
@@ -157,8 +175,9 @@ fn apply_create_asset_v1_tx(
     a: &CreateAssetV1,
     mode: PolicyMode,
     admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    validate_create_asset_v1(a)
+    validate_create_asset_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     // Policy: actor must equal issuer (or admin in strict).
@@ -199,8 +218,10 @@ fn apply_mint_units_v1_tx(
     a: &MintUnitsV1,
     mode: PolicyMode,
     admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    validate_mint_units_v1(a).map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+    validate_mint_units_v1_with_limits(a, limits)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     let asset = get_asset_tx(tree, a.asset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("asset_id not found".to_string()))
@@ -255,8 +276,9 @@ fn apply_transfer_units_v1_tx(
     a: &TransferUnitsV1,
     mode: PolicyMode,
     admin_accounts: &[AccountId],
+    limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    validate_transfer_units_v1(a)
+    validate_transfer_units_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     let asset = get_asset_tx(tree, a.asset_id)?.ok_or_else(|| {

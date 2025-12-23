@@ -10,6 +10,8 @@ mod linkage;
 mod metrics;
 mod policy_runtime;
 mod policy_store;
+mod pruning;
+mod rate_limit;
 mod recon;
 mod recon_store;
 
@@ -25,6 +27,7 @@ use l2_core::AccountId;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
@@ -86,6 +89,9 @@ enum Command {
         #[command(subcommand)]
         cmd: PolicyCommand,
     },
+
+    /// Prune old receipts / state (retention).
+    Prune(PruneArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -190,6 +196,16 @@ struct GenExampleArgs {
     /// Output path for the generated `L2BatchEnvelopeV1` JSON.
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+struct PruneArgs {
+    /// Execute deletion (default is dry-run).
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    execute: bool,
+    /// Dry run only (prints what would be deleted).
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -332,23 +348,50 @@ fn main() {
             let store =
                 hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_fin(&store);
-            let fin_api = fin_api::FinApi::new_with_policy_and_recon(
+            let limits_cfg = cfg.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
+            let fin_limits = hub_fin::validation::ValidationLimits {
+                max_string_bytes: limits_cfg.max_string_bytes,
+                name_max_len: limits_cfg.max_string_bytes,
+                symbol_max_len: limits_cfg.max_string_bytes,
+                metadata_uri_max_len: limits_cfg.max_string_bytes,
+                memo_max_len: limits_cfg.max_string_bytes,
+                client_tx_id_max_len: limits_cfg.max_string_bytes,
+                max_account_bytes: 128,
+            };
+            let data_limits = hub_data::validation::ValidationLimits {
+                max_string_bytes: limits_cfg.max_string_bytes,
+                name_max_len: limits_cfg.max_string_bytes,
+                description_max_len: limits_cfg.max_string_bytes,
+                pointer_uri_max_len: limits_cfg.max_string_bytes,
+                mime_type_max_len: limits_cfg.max_string_bytes,
+                terms_uri_max_len: limits_cfg.max_string_bytes,
+                nonce_max_len: limits_cfg.max_string_bytes,
+                statement_max_len: limits_cfg.max_string_bytes,
+                ref_uri_max_len: limits_cfg.max_string_bytes,
+                max_tags: limits_cfg.max_tags,
+                max_tag_bytes: limits_cfg.max_tag_bytes,
+                max_account_bytes: 128,
+            };
+
+            let fin_api = fin_api::FinApi::new_with_policy_recon_and_limits(
                 l1.clone(),
                 store,
                 PathBuf::from(receipts_dir),
                 policy.clone(),
                 recon_store.clone(),
+                fin_limits,
             );
 
             let data_store =
                 hub_data::DataStore::open(data_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_data(&data_store);
-            let data_api = data_api::DataApi::new_with_policy_and_recon(
+            let data_api = data_api::DataApi::new_with_policy_recon_and_limits(
                 l1.clone(),
                 data_store,
                 PathBuf::from(receipts_dir),
                 policy,
                 recon_store.clone(),
+                data_limits,
             );
 
             let linkage_policy = cfg
@@ -372,9 +415,19 @@ fn main() {
                 recon_store.clone(),
             );
 
+            // Graceful shutdown: SIGINT/SIGTERM sets a shared stop flag.
+            let stop = Arc::new(AtomicBool::new(false));
+            {
+                let stop = stop.clone();
+                let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
+                let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop);
+            }
+
             // Start the reconciliation loop (bounded, persistent, restart-safe).
+            let mut bg_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
             if let (Some(store), Some(rcfg)) = (recon_store.clone(), recon_cfg.clone()) {
                 if rcfg.enabled {
+                    let stop = stop.clone();
                     let reconciler = recon::Reconciler::new(
                         l1.clone(),
                         fin_api.clone(),
@@ -390,26 +443,93 @@ fn main() {
                             max_delay_secs: rcfg.max_delay_secs,
                         },
                     );
-                    std::thread::spawn(move || {
+                    bg_threads.push(std::thread::spawn(move || {
                         info!(
                             event = "recon_loop_started",
                             interval_secs = rcfg.interval_secs
                         );
                         let interval =
                             std::time::Duration::from_secs(u64::max(1, rcfg.interval_secs));
-                        loop {
+                        while !stop.load(Ordering::Relaxed) {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
                             reconciler.tick(now);
-                            std::thread::sleep(interval);
+                            // Sleep in small chunks so shutdown is responsive.
+                            let mut slept = std::time::Duration::from_secs(0);
+                            while slept < interval && !stop.load(Ordering::Relaxed) {
+                                let step = std::time::Duration::from_millis(250);
+                                std::thread::sleep(step);
+                                slept += step;
+                            }
                         }
-                    });
+                        info!(event = "recon_loop_stopped");
+                    }));
                 }
             }
 
-            http_server::serve(
+            // Background pruning loop (optional).
+            if cfg.as_ref().map(|c| c.pruning.enabled).unwrap_or(false) {
+                let stop = stop.clone();
+                let retention = cfg
+                    .as_ref()
+                    .map(|c| c.retention.clone())
+                    .unwrap_or_default();
+                let limits = cfg.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
+                let receipts_dir = PathBuf::from(receipts_dir);
+                let interval = cfg
+                    .as_ref()
+                    .map(|c| c.pruning.interval_secs)
+                    .unwrap_or(86_400);
+                bg_threads.push(std::thread::spawn(move || {
+                    info!(event = "pruning_loop_started", interval_secs = interval);
+                    let interval = std::time::Duration::from_secs(u64::max(60, interval));
+                    while !stop.load(Ordering::Relaxed) {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        match pruning::plan_prune_receipts_dir(
+                            &receipts_dir,
+                            &retention,
+                            &limits,
+                            now_secs,
+                        ) {
+                            Ok(plan) => {
+                                let delete_count = plan.deletions.len();
+                                if delete_count > 0 {
+                                    if let Err(e) = pruning::execute_prune(&plan) {
+                                        warn!(event = "pruning_failed", error = %e);
+                                    } else {
+                                        info!(event = "pruning_completed", deleted = delete_count);
+                                        metrics::PRUNING_DELETED_TOTAL
+                                            .with_label_values(&["receipt_file"])
+                                            .inc_by(delete_count as u64);
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(event = "pruning_failed", error = %e),
+                        }
+                        // Sleep in chunks for responsive shutdown.
+                        let mut slept = std::time::Duration::from_secs(0);
+                        while slept < interval && !stop.load(Ordering::Relaxed) {
+                            let step = std::time::Duration::from_secs(1);
+                            std::thread::sleep(step);
+                            slept += step;
+                        }
+                    }
+                    info!(event = "pruning_loop_stopped");
+                }));
+            }
+
+            // Keep clones for best-effort flush after shutdown.
+            let fin_api_shutdown = fin_api.clone();
+            let data_api_shutdown = data_api.clone();
+            let recon_shutdown = recon_store.clone();
+            let stop_main = stop.clone();
+
+            let r = http_server::serve(
                 bind,
                 l1,
                 expected,
@@ -418,8 +538,33 @@ fn main() {
                 data_api,
                 linkage_api,
                 recon_store,
-            )
-            .unwrap_or_else(|e| exit_err(&e));
+                cfg.as_ref().map(|c| c.limits.clone()).unwrap_or_default(),
+                cfg.as_ref()
+                    .map(|c| c.pagination.clone())
+                    .unwrap_or_default(),
+                cfg.as_ref()
+                    .map(|c| c.rate_limit.clone())
+                    .unwrap_or_default(),
+                cfg.as_ref().map(|c| c.cors.clone()).unwrap_or_default(),
+                cfg.as_ref()
+                    .map(|c| c.server.max_inflight_requests)
+                    .unwrap_or(64),
+                stop,
+            );
+
+            // Ensure background threads stop, then flush stores.
+            if let Err(e) = r {
+                exit_err(&e);
+            }
+            stop_main.store(true, Ordering::Relaxed);
+            for h in bg_threads {
+                let _ = h.join();
+            }
+            let _ = fin_api_shutdown.flush();
+            let _ = data_api_shutdown.flush();
+            if let Some(r) = recon_shutdown.as_ref() {
+                let _ = r.flush();
+            }
         }
         Command::L1 { cmd } => match cmd {
             L1Command::Status => {
@@ -497,6 +642,17 @@ fn main() {
             env.validate().unwrap_or_else(|e| exit_err(&e.to_string()));
             if !cmd.hub.matches_envelope(&env) {
                 exit_err("hub selector does not match envelope.hub");
+            }
+            let max_batch_items = cfg
+                .as_ref()
+                .map(|c| c.limits.max_batch_items)
+                .unwrap_or_else(|| config::LimitsConfig::default().max_batch_items);
+            let max_batch_items_u64 = u64::try_from(max_batch_items).unwrap_or(u64::MAX);
+            if env.tx_count > max_batch_items_u64 {
+                exit_err(&format!(
+                    "batch too large: tx_count={} exceeds max_batch_items={}",
+                    env.tx_count, max_batch_items
+                ));
             }
 
             let canonical_hash = b64url32(
@@ -631,6 +787,55 @@ fn main() {
                     );
                 }
             }
+        }
+        Command::Prune(cmd) => {
+            let receipts_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.receipts_dir.as_str())
+                .unwrap_or("receipts");
+            let retention = cfg
+                .as_ref()
+                .map(|c| c.retention.clone())
+                .unwrap_or_default();
+            let limits = cfg.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let plan = pruning::plan_prune_receipts_dir(
+                std::path::Path::new(receipts_dir),
+                &retention,
+                &limits,
+                now_secs,
+            )
+            .unwrap_or_else(|e| exit_err(&e));
+
+            let execute = cmd.execute;
+            if execute {
+                pruning::execute_prune(&plan).unwrap_or_else(|e| exit_err(&e));
+            }
+
+            let out = serde_json::json!({
+                "schema_version": 1,
+                "mode": if execute { "execute" } else { "dry_run" },
+                "receipts_dir": receipts_dir,
+                "now_secs": plan.now_secs,
+                "cutoff_secs": plan.cutoff_secs,
+                "scanned_files": plan.scanned_files,
+                "deletions": plan.deletions.len(),
+                "skipped_unknown_timestamp": plan.skipped_unknown_timestamp,
+                "skipped_too_large": plan.skipped_too_large,
+                "kept_due_to_min_keep": plan.kept_due_to_min_keep,
+                "sample_delete_paths": plan
+                    .deletions
+                    .iter()
+                    .take(10)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
     }
 }

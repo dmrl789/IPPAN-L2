@@ -37,6 +37,39 @@ get_finality = ""
 bind_address = "127.0.0.1:3000"
 # Enable metrics endpoint
 metrics_enabled = true
+max_inflight_requests = 256
+
+[limits]
+# Local dev: permissive defaults.
+max_body_bytes = 2097152
+max_string_bytes = 4096
+max_tags = 128
+max_tag_bytes = 128
+max_batch_items = 1024
+max_receipt_bytes = 2097152
+max_json_depth = 128
+
+[rate_limit]
+enabled = false
+requests_per_minute = 0
+burst = 0
+
+[pagination]
+default_limit = 50
+max_limit = 200
+
+[retention]
+receipts_days = 7
+recon_failed_days = 7
+min_receipts_keep = 100
+
+[pruning]
+enabled = false
+interval_secs = 86400
+
+[cors]
+enabled = false
+allow_origins = []
 
 [hubs]
 # Enable FIN Hub

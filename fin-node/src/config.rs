@@ -16,6 +16,18 @@ pub struct FinNodeConfig {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub pagination: PaginationConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
+    pub pruning: PruningConfig,
+    #[serde(default)]
+    pub cors: CorsConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -59,6 +71,10 @@ pub struct ServerConfig {
     pub bind_address: String,
     #[serde(default = "default_metrics_enabled")]
     pub metrics_enabled: bool,
+    /// Best-effort overload protection. If `inflight_requests >= max_inflight_requests`, the
+    /// server rejects new requests with HTTP 503.
+    #[serde(default = "default_max_inflight_requests")]
+    pub max_inflight_requests: usize,
 }
 
 fn default_bind_address() -> String {
@@ -69,13 +85,202 @@ fn default_metrics_enabled() -> bool {
     true
 }
 
+fn default_max_inflight_requests() -> usize {
+    64
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
             metrics_enabled: default_metrics_enabled(),
+            max_inflight_requests: default_max_inflight_requests(),
         }
     }
+}
+
+/// Admission/abuse-resistance limits.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LimitsConfig {
+    /// Max HTTP request body size (bytes). Oversized bodies return HTTP 413.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Max string size for user-provided fields (UTF-8 bytes).
+    #[serde(default = "default_max_string_bytes")]
+    pub max_string_bytes: usize,
+    /// Max number of tags in requests that include tags.
+    #[serde(default = "default_max_tags")]
+    pub max_tags: usize,
+    /// Max length of an individual tag (UTF-8 bytes).
+    #[serde(default = "default_max_tag_bytes")]
+    pub max_tag_bytes: usize,
+    /// Max number of items in batch-like inputs (CLI/API) where applicable.
+    #[serde(default = "default_max_batch_items")]
+    pub max_batch_items: usize,
+    /// Max size of receipt blobs returned or processed (bytes).
+    #[serde(default = "default_max_receipt_bytes")]
+    pub max_receipt_bytes: usize,
+    /// Best-effort JSON depth limit for request bodies.
+    #[serde(default = "default_max_json_depth")]
+    pub max_json_depth: usize,
+}
+
+fn default_max_body_bytes() -> usize {
+    256 * 1024
+}
+fn default_max_string_bytes() -> usize {
+    1024
+}
+fn default_max_tags() -> usize {
+    32
+}
+fn default_max_tag_bytes() -> usize {
+    48
+}
+fn default_max_batch_items() -> usize {
+    256
+}
+fn default_max_receipt_bytes() -> usize {
+    256 * 1024
+}
+fn default_max_json_depth() -> usize {
+    64
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: default_max_body_bytes(),
+            max_string_bytes: default_max_string_bytes(),
+            max_tags: default_max_tags(),
+            max_tag_bytes: default_max_tag_bytes(),
+            max_batch_items: default_max_batch_items(),
+            max_receipt_bytes: default_max_receipt_bytes(),
+            max_json_depth: default_max_json_depth(),
+        }
+    }
+}
+
+/// In-memory token bucket rate limiting (best-effort).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_requests_per_minute")]
+    pub requests_per_minute: u32,
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst: u32,
+}
+
+fn default_rate_limit_enabled() -> bool {
+    false
+}
+fn default_requests_per_minute() -> u32 {
+    120
+}
+fn default_rate_limit_burst() -> u32 {
+    60
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rate_limit_enabled(),
+            requests_per_minute: default_requests_per_minute(),
+            burst: default_rate_limit_burst(),
+        }
+    }
+}
+
+/// Cursor pagination defaults for list endpoints.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaginationConfig {
+    #[serde(default = "default_pagination_default_limit")]
+    pub default_limit: usize,
+    #[serde(default = "default_pagination_max_limit")]
+    pub max_limit: usize,
+}
+
+fn default_pagination_default_limit() -> usize {
+    50
+}
+fn default_pagination_max_limit() -> usize {
+    200
+}
+
+impl Default for PaginationConfig {
+    fn default() -> Self {
+        Self {
+            default_limit: default_pagination_default_limit(),
+            max_limit: default_pagination_max_limit(),
+        }
+    }
+}
+
+/// Retention policy for bounded growth.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    #[serde(default = "default_receipts_days")]
+    pub receipts_days: u32,
+    #[serde(default = "default_recon_failed_days")]
+    pub recon_failed_days: u32,
+    #[serde(default = "default_min_receipts_keep")]
+    pub min_receipts_keep: usize,
+}
+
+fn default_receipts_days() -> u32 {
+    30
+}
+fn default_recon_failed_days() -> u32 {
+    7
+}
+fn default_min_receipts_keep() -> usize {
+    1000
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            receipts_days: default_receipts_days(),
+            recon_failed_days: default_recon_failed_days(),
+            min_receipts_keep: default_min_receipts_keep(),
+        }
+    }
+}
+
+/// Background pruning job configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PruningConfig {
+    #[serde(default = "default_pruning_enabled")]
+    pub enabled: bool,
+    /// Interval between pruning runs (seconds).
+    #[serde(default = "default_pruning_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_pruning_enabled() -> bool {
+    false
+}
+fn default_pruning_interval_secs() -> u64 {
+    86_400
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pruning_enabled(),
+            interval_secs: default_pruning_interval_secs(),
+        }
+    }
+}
+
+/// Basic CORS configuration (default deny).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
