@@ -104,10 +104,7 @@ impl LeaderLock {
     pub fn try_acquire(&self) -> Result<Role, LeaderLockError> {
         let now = self.clock.now_ms();
         let cur = self.tree.get(LOCK_KEY)?;
-        let cur_lease = cur
-            .as_ref()
-            .map(|v| decode_lease(v.as_ref()))
-            .transpose()?;
+        let cur_lease = cur.as_ref().map(|v| decode_lease(v.as_ref())).transpose()?;
 
         let can_acquire = match &cur_lease {
             None => true,
