@@ -5,7 +5,7 @@ use crate::actions::{
 };
 use crate::canonical::canonical_json_bytes;
 use crate::envelope::FinEnvelopeV1;
-use crate::store::{keys, FinStore, StoreError};
+use crate::store::{keys, ChangelogTxCtx, FinStore, StoreError};
 use crate::types::{ActionId, AmountU128, AssetId32};
 use crate::validation::{
     validate_amount_addition, validate_amount_subtraction, validate_create_asset_v1_with_limits,
@@ -17,6 +17,7 @@ use l2_core::policy::{PolicyDenyCode, PolicyMode};
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
+use sled::Transactional;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,9 +82,23 @@ pub fn apply_with_policy_and_limits(
     let action = env.action.clone();
     let action_id = env.action_id;
 
-    let r = store
-        .tree()
-        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts, limits));
+    let r = (store.tree(), store.changelog_tree()).transaction(|(tree, clog)| {
+        let mut ctx = ChangelogTxCtx::load(clog)
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        let receipt = apply_tx_with_changelog(
+            tree,
+            clog,
+            &mut ctx,
+            action_id,
+            &action,
+            mode,
+            admin_accounts,
+            limits,
+        )?;
+        ctx.store(clog)
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        Ok(receipt)
+    });
 
     match r {
         Ok(receipt) => Ok(receipt),
@@ -115,8 +130,11 @@ impl From<StoreError> for TxError {
     }
 }
 
-fn apply_tx(
+#[allow(clippy::too_many_arguments)]
+fn apply_tx_with_changelog(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     action: &FinActionV1,
     mode: PolicyMode,
@@ -148,15 +166,36 @@ fn apply_tx(
     }
 
     let receipt = match action {
-        FinActionV1::CreateAssetV1(a) => {
-            apply_create_asset_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
-        }
-        FinActionV1::MintUnitsV1(a) => {
-            apply_mint_units_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
-        }
-        FinActionV1::TransferUnitsV1(a) => {
-            apply_transfer_units_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
-        }
+        FinActionV1::CreateAssetV1(a) => apply_create_asset_v1_tx(
+            tree,
+            changelog,
+            ctx,
+            action_id,
+            a,
+            mode,
+            admin_accounts,
+            limits,
+        )?,
+        FinActionV1::MintUnitsV1(a) => apply_mint_units_v1_tx(
+            tree,
+            changelog,
+            ctx,
+            action_id,
+            a,
+            mode,
+            admin_accounts,
+            limits,
+        )?,
+        FinActionV1::TransferUnitsV1(a) => apply_transfer_units_v1_tx(
+            tree,
+            changelog,
+            ctx,
+            action_id,
+            a,
+            mode,
+            admin_accounts,
+            limits,
+        )?,
     };
 
     let receipt_bytes = canonical_json_bytes(&receipt).map_err(|e| {
@@ -164,13 +203,21 @@ fn apply_tx(
             "receipt canonicalization failed: {e}"
         )))
     })?;
-    tree.insert(keys::apply_receipt(action_id), receipt_bytes)?;
+    tree.insert(keys::apply_receipt(action_id), receipt_bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::apply_receipt(action_id), &receipt_bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(keys::applied(action_id), sled::IVec::from(&b"1"[..]))?;
+    ctx.record_put(changelog, &keys::applied(action_id), b"1")
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(receipt)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_create_asset_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &CreateAssetV1,
     mode: PolicyMode,
@@ -199,7 +246,9 @@ fn apply_create_asset_v1_tx(
     }
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::asset(a.asset_id), bytes)?;
+    tree.insert(keys::asset(a.asset_id), bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::asset(a.asset_id), &bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
         schema_version: 1,
         outcome: ApplyOutcome::Applied,
@@ -212,8 +261,11 @@ fn apply_create_asset_v1_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_mint_units_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &MintUnitsV1,
     mode: PolicyMode,
@@ -256,7 +308,10 @@ fn apply_mint_units_v1_tx(
     };
     let new = validate_amount_addition(old, a.amount)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Rejected(e)))?;
-    tree.insert(bal_key, encode_u128_be(new.0).to_vec())?;
+    let bal_bytes = encode_u128_be(new.0).to_vec();
+    tree.insert(bal_key.as_slice(), bal_bytes.as_slice())?;
+    ctx.record_put(changelog, &bal_key, &bal_bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
     Ok(ApplyReceipt {
         schema_version: 1,
@@ -270,8 +325,11 @@ fn apply_mint_units_v1_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_transfer_units_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &TransferUnitsV1,
     mode: PolicyMode,
@@ -345,8 +403,14 @@ fn apply_transfer_units_v1_tx(
     let to_new = validate_amount_addition(to_old, a.amount)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Rejected(e)))?;
 
-    tree.insert(from_key, encode_u128_be(from_new.0).to_vec())?;
-    tree.insert(to_key, encode_u128_be(to_new.0).to_vec())?;
+    let from_bytes = encode_u128_be(from_new.0).to_vec();
+    let to_bytes = encode_u128_be(to_new.0).to_vec();
+    tree.insert(from_key.as_slice(), from_bytes.as_slice())?;
+    ctx.record_put(changelog, &from_key, &from_bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+    tree.insert(to_key.as_slice(), to_bytes.as_slice())?;
+    ctx.record_put(changelog, &to_key, &to_bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
     Ok(ApplyReceipt {
         schema_version: 1,

@@ -6,7 +6,7 @@ use crate::actions::{
 };
 use crate::canonical::canonical_json_bytes;
 use crate::envelope::DataEnvelopeV1;
-use crate::store::{keys, DataStore, StoreError};
+use crate::store::{keys, ChangelogTxCtx, DataStore, StoreError};
 use crate::types::{ActionId, AttestationId, DatasetId, LicenseId, ListingId};
 use crate::validation::{
     validate_append_attestation_v1_with_limits, validate_create_listing_v1_with_limits,
@@ -17,6 +17,7 @@ use l2_core::policy::{PolicyDenyCode, PolicyMode};
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
+use sled::Transactional;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,9 +82,23 @@ pub fn apply_with_policy_and_limits(
     let action = env.action.clone();
     let action_id = env.action_id;
 
-    let r = store
-        .tree()
-        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts, limits));
+    let r = (store.tree(), store.changelog_tree()).transaction(|(tree, clog)| {
+        let mut ctx = ChangelogTxCtx::load(clog)
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        let receipt = apply_tx(
+            tree,
+            clog,
+            &mut ctx,
+            action_id,
+            &action,
+            mode,
+            admin_accounts,
+            limits,
+        )?;
+        ctx.store(clog)
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        Ok(receipt)
+    });
 
     match r {
         Ok(receipt) => Ok(receipt),
@@ -115,8 +130,11 @@ impl From<StoreError> for TxError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     action: &DataActionV1,
     mode: PolicyMode,
@@ -152,22 +170,40 @@ fn apply_tx(
 
     let receipt = match action {
         DataActionV1::RegisterDatasetV1(a) => {
-            apply_register_dataset_v1_tx(tree, action_id, a, limits)?
+            apply_register_dataset_v1_tx(tree, changelog, ctx, action_id, a, limits)?
         }
-        DataActionV1::IssueLicenseV1(a) => {
-            apply_issue_license_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
-        }
+        DataActionV1::IssueLicenseV1(a) => apply_issue_license_v1_tx(
+            tree,
+            changelog,
+            ctx,
+            action_id,
+            a,
+            mode,
+            admin_accounts,
+            limits,
+        )?,
         DataActionV1::AppendAttestationV1(a) => {
-            apply_append_attestation_v1_tx(tree, action_id, a, mode, limits)?
+            apply_append_attestation_v1_tx(tree, changelog, ctx, action_id, a, mode, limits)?
         }
         DataActionV1::CreateListingV1(a) => {
-            apply_create_listing_v1_tx(tree, action_id, a, mode, limits)?
+            apply_create_listing_v1_tx(tree, changelog, ctx, action_id, a, mode, limits)?
         }
-        DataActionV1::GrantEntitlementV1(a) => {
-            apply_grant_entitlement_v1_tx(tree, action_id, a, mode, admin_accounts, limits)?
+        DataActionV1::GrantEntitlementV1(a) => apply_grant_entitlement_v1_tx(
+            tree,
+            changelog,
+            ctx,
+            action_id,
+            a,
+            mode,
+            admin_accounts,
+            limits,
+        )?,
+        DataActionV1::AddLicensorV1(a) => {
+            apply_add_licensor_v1_tx(tree, changelog, ctx, action_id, a, mode)?
         }
-        DataActionV1::AddLicensorV1(a) => apply_add_licensor_v1_tx(tree, action_id, a, mode)?,
-        DataActionV1::AddAttestorV1(a) => apply_add_attestor_v1_tx(tree, action_id, a, mode)?,
+        DataActionV1::AddAttestorV1(a) => {
+            apply_add_attestor_v1_tx(tree, changelog, ctx, action_id, a, mode)?
+        }
     };
 
     let receipt_bytes = canonical_json_bytes(&receipt).map_err(|e| {
@@ -175,13 +211,20 @@ fn apply_tx(
             "receipt canonicalization failed: {e}"
         )))
     })?;
-    tree.insert(keys::apply_receipt(action_id), receipt_bytes)?;
+    tree.insert(keys::apply_receipt(action_id), receipt_bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::apply_receipt(action_id), &receipt_bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(keys::applied(action_id), sled::IVec::from(&b"1"[..]))?;
+    ctx.record_put(changelog, &keys::applied(action_id), b"1")
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(receipt)
 }
 
 fn apply_register_dataset_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &RegisterDatasetV1,
     limits: &ValidationLimits,
@@ -195,7 +238,9 @@ fn apply_register_dataset_v1_tx(
     }
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::dataset(a.dataset_id), bytes)?;
+    tree.insert(keys::dataset(a.dataset_id), bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::dataset(a.dataset_id), &bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
         schema_version: 1,
         outcome: ApplyOutcome::Applied,
@@ -208,8 +253,11 @@ fn apply_register_dataset_v1_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_issue_license_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &IssueLicenseV1,
     mode: PolicyMode,
@@ -257,11 +305,20 @@ fn apply_issue_license_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::license(a.license_id), bytes)?;
+    tree.insert(keys::license(a.license_id), bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::license(a.license_id), &bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(
         keys::license_by_dataset(a.dataset_id, a.license_id),
         sled::IVec::from(&b"1"[..]),
     )?;
+    ctx.record_put(
+        changelog,
+        &keys::license_by_dataset(a.dataset_id, a.license_id),
+        b"1",
+    )
+    .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
         schema_version: 1,
         outcome: ApplyOutcome::Applied,
@@ -276,6 +333,8 @@ fn apply_issue_license_v1_tx(
 
 fn apply_append_attestation_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &crate::actions::AppendAttestationV1,
     mode: PolicyMode,
@@ -321,11 +380,20 @@ fn apply_append_attestation_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::attestation(a.attestation_id), bytes)?;
+    tree.insert(keys::attestation(a.attestation_id), bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::attestation(a.attestation_id), &bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(
         keys::attestation_by_dataset(a.dataset_id, a.attestation_id),
         sled::IVec::from(&b"1"[..]),
     )?;
+    ctx.record_put(
+        changelog,
+        &keys::attestation_by_dataset(a.dataset_id, a.attestation_id),
+        b"1",
+    )
+    .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
         schema_version: 1,
         outcome: ApplyOutcome::Applied,
@@ -340,6 +408,8 @@ fn apply_append_attestation_v1_tx(
 
 fn apply_create_listing_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &CreateListingV1,
     mode: PolicyMode,
@@ -393,11 +463,20 @@ fn apply_create_listing_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::listing(a.listing_id), bytes)?;
+    tree.insert(keys::listing(a.listing_id), bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::listing(a.listing_id), &bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(
         keys::listing_by_dataset(a.dataset_id, a.listing_id),
         sled::IVec::from(&b"1"[..]),
     )?;
+    ctx.record_put(
+        changelog,
+        &keys::listing_by_dataset(a.dataset_id, a.listing_id),
+        b"1",
+    )
+    .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
         schema_version: 1,
         outcome: ApplyOutcome::Applied,
@@ -410,8 +489,11 @@ fn apply_create_listing_v1_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_grant_entitlement_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &GrantEntitlementV1,
     mode: PolicyMode,
@@ -477,15 +559,31 @@ fn apply_grant_entitlement_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::entitlement(a.purchase_id), bytes)?;
+    tree.insert(keys::entitlement(a.purchase_id), bytes.as_slice())?;
+    ctx.record_put(changelog, &keys::entitlement(a.purchase_id), &bytes)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(
         keys::ent_by_dataset(a.dataset_id, a.purchase_id),
         sled::IVec::from(&b"1"[..]),
     )?;
+    ctx.record_put(
+        changelog,
+        &keys::ent_by_dataset(a.dataset_id, a.purchase_id),
+        b"1",
+    )
+    .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+
     tree.insert(
         keys::ent_by_licensee(&a.licensee.0, a.purchase_id),
         sled::IVec::from(&b"1"[..]),
     )?;
+    ctx.record_put(
+        changelog,
+        &keys::ent_by_licensee(&a.licensee.0, a.purchase_id),
+        b"1",
+    )
+    .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
     Ok(ApplyReceipt {
         schema_version: 1,
@@ -501,6 +599,8 @@ fn apply_grant_entitlement_v1_tx(
 
 fn apply_add_licensor_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &AddLicensorV1,
     mode: PolicyMode,
@@ -518,6 +618,12 @@ fn apply_add_licensor_v1_tx(
     let already = tree.get(&key)?.is_some();
     if !already {
         tree.insert(key, sled::IVec::from(&b"1"[..]))?;
+        ctx.record_put(
+            changelog,
+            &keys::licensor_allow(a.dataset_id, &a.licensor.0),
+            b"1",
+        )
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     }
     Ok(ApplyReceipt {
         schema_version: 1,
@@ -537,6 +643,8 @@ fn apply_add_licensor_v1_tx(
 
 fn apply_add_attestor_v1_tx(
     tree: &TransactionalTree,
+    changelog: &TransactionalTree,
+    ctx: &mut ChangelogTxCtx,
     action_id: ActionId,
     a: &AddAttestorV1,
     mode: PolicyMode,
@@ -554,6 +662,12 @@ fn apply_add_attestor_v1_tx(
     let already = tree.get(&key)?.is_some();
     if !already {
         tree.insert(key, sled::IVec::from(&b"1"[..]))?;
+        ctx.record_put(
+            changelog,
+            &keys::attestor_allow(a.dataset_id, &a.attestor.0),
+            b"1",
+        )
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     }
     Ok(ApplyReceipt {
         schema_version: 1,

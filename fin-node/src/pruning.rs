@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use crate::bootstrap_store::BootstrapStore;
 use crate::config::{LimitsConfig, RetentionConfig};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -107,12 +108,36 @@ pub fn execute_prune(plan: &PrunePlan) -> Result<(), String> {
     Ok(())
 }
 
+pub fn execute_prune_with_bootstrap(
+    receipts_dir: &Path,
+    plan: &PrunePlan,
+    bootstrap: Option<&BootstrapStore>,
+) -> Result<(), String> {
+    for p in &plan.deletions {
+        fs::remove_file(p).map_err(|e| format!("failed deleting {}: {e}", p.display()))?;
+        if let Some(b) = bootstrap {
+            if let Ok(rel) = p.strip_prefix(receipts_dir) {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                // Mirror base snapshot split: linkage/* vs the rest.
+                let store = if rel_s.starts_with("linkage/") {
+                    "linkage"
+                } else {
+                    "receipts"
+                };
+                let _ = b.record_del(store, rel_s.as_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct PruningLoop {
     pub receipts_dir: PathBuf,
     pub retention: RetentionConfig,
     pub limits: LimitsConfig,
     pub interval_secs: u64,
+    pub bootstrap: Option<BootstrapStore>,
 }
 
 impl PruningLoop {
@@ -137,7 +162,11 @@ impl PruningLoop {
                     Ok(plan) => {
                         let delete_count = plan.deletions.len();
                         if delete_count > 0 {
-                            if let Err(e) = execute_prune(&plan) {
+                            if let Err(e) = execute_prune_with_bootstrap(
+                                &self.receipts_dir,
+                                &plan,
+                                self.bootstrap.as_ref(),
+                            ) {
                                 warn!(event = "pruning_failed", error = %e);
                             } else {
                                 info!(event = "pruning_completed", deleted = delete_count);

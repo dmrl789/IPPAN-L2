@@ -184,9 +184,7 @@ fn snapshot_roundtrip_restores_identical_state() {
         enabled: true,
         output_dir: tmp.path().join("snapshots").to_string_lossy().to_string(),
         max_snapshots: 10,
-        post_snapshot_hook: None,
-        pre_restore_hook: None,
-        schedule: fin_node::config::SnapshotScheduleConfig::default(),
+        ..SnapshotsConfig::default()
     };
     let snapshot_path = tmp.path().join("snapshots").join("roundtrip.tar");
     let _manifest = create_snapshot_v1_tar(
@@ -285,9 +283,7 @@ fn snapshot_detects_corruption_via_hash_mismatch() {
         enabled: true,
         output_dir: tmp.path().join("snapshots").to_string_lossy().to_string(),
         max_snapshots: 10,
-        post_snapshot_hook: None,
-        pre_restore_hook: None,
-        schedule: fin_node::config::SnapshotScheduleConfig::default(),
+        ..SnapshotsConfig::default()
     };
     let snapshot_path = tmp.path().join("snapshots").join("corrupt.tar");
     let _ = create_snapshot_v1_tar(
@@ -385,9 +381,7 @@ fn restore_preserves_idempotency_keys_and_l1_deduplication() {
         enabled: true,
         output_dir: tmp.path().join("snapshots").to_string_lossy().to_string(),
         max_snapshots: 10,
-        post_snapshot_hook: None,
-        pre_restore_hook: None,
-        schedule: fin_node::config::SnapshotScheduleConfig::default(),
+        ..SnapshotsConfig::default()
     };
     let snapshot_path = tmp.path().join("snapshots").join("idem.tar");
     let _ = create_snapshot_v1_tar(

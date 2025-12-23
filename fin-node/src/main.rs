@@ -2,6 +2,8 @@
 #![deny(clippy::float_arithmetic)]
 #![deny(clippy::float_cmp)]
 
+mod bootstrap;
+mod bootstrap_store;
 mod config;
 mod data_api;
 mod fin_api;
@@ -100,6 +102,12 @@ enum Command {
         #[command(subcommand)]
         cmd: SnapshotCommand,
     },
+
+    /// Bootstrap a node from a base snapshot + delta chain.
+    Bootstrap {
+        #[command(subcommand)]
+        cmd: BootstrapCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -112,6 +120,30 @@ enum SnapshotCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Create a base snapshot tar archive (SnapshotV1).
+    ///
+    /// This also advances the snapshot epoch so subsequent delta snapshots start from a clean boundary.
+    Base {
+        /// Output path for the snapshot tar.
+        ///
+        /// If omitted, uses `[snapshots].output_dir` and a date-based name.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Create a delta snapshot tar archive (DeltaSnapshotV1) from the current epoch.
+    Delta {
+        /// Output path for the delta tar.
+        ///
+        /// If omitted, uses `[snapshots].output_dir` and `delta-<from>-<to>.tar`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Generate/update a bootstrap index (`index.json`) for a snapshots directory.
+    PublishIndex {
+        /// Directory containing base/delta artifacts.
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// Restore from a snapshot tar archive (SnapshotV1).
     Restore {
         /// Path to the snapshot tar.
@@ -120,6 +152,31 @@ enum SnapshotCommand {
         /// Overwrite existing local state (dangerous).
         #[arg(long, default_value_t = false)]
         force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BootstrapCommand {
+    /// Restore from a base snapshot + ordered deltas (resume-capable).
+    Restore {
+        /// Base snapshot tar (SnapshotV1).
+        #[arg(long)]
+        base: PathBuf,
+        /// Delta snapshot tars (DeltaSnapshotV1). Provide in any order; they will be sorted by epoch.
+        #[arg(long)]
+        deltas: Vec<PathBuf>,
+        /// Overwrite existing local state (dangerous).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Progress file path (for resume). Default: ./bootstrap_progress.json
+        #[arg(long, default_value = "bootstrap_progress.json")]
+        progress: PathBuf,
+    },
+    /// Print bootstrap restore status (from the progress file).
+    Status {
+        /// Progress file path (default: ./bootstrap_progress.json)
+        #[arg(long, default_value = "bootstrap_progress.json")]
+        progress: PathBuf,
     },
 }
 
@@ -338,6 +395,10 @@ fn main() {
                 .as_ref()
                 .map(|c| c.storage.recon_db_dir.clone())
                 .unwrap_or_else(|| "recon_db".to_string());
+            let bootstrap_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.bootstrap_db_dir.clone())
+                .unwrap_or_else(|| "bootstrap_db".to_string());
 
             let recon_cfg = cfg.as_ref().map(|c| c.recon.clone());
             let recon_store = if recon_cfg.as_ref().map(|c| c.enabled).unwrap_or(false) {
@@ -402,6 +463,10 @@ fn main() {
                 max_account_bytes: 128,
             };
 
+            let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir.as_str())
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+            let bootstrap_opt = Some(bootstrap.clone());
+
             let fin_api = fin_api::FinApi::new_with_policy_recon_and_limits(
                 l1.clone(),
                 store,
@@ -409,7 +474,8 @@ fn main() {
                 policy.clone(),
                 recon_store.clone(),
                 fin_limits,
-            );
+            )
+            .with_bootstrap(bootstrap_opt.clone());
 
             let data_store = hub_data::DataStore::open(data_db_dir.as_str())
                 .unwrap_or_else(|e| exit_err(&e.to_string()));
@@ -421,7 +487,8 @@ fn main() {
                 policy,
                 recon_store.clone(),
                 data_limits,
-            );
+            )
+            .with_bootstrap(bootstrap_opt.clone());
 
             let linkage_policy = cfg
                 .as_ref()
@@ -442,7 +509,8 @@ fn main() {
                 PathBuf::from(&receipts_dir),
                 linkage_policy,
                 recon_store.clone(),
-            );
+            )
+            .with_bootstrap(bootstrap_opt.clone());
 
             let snapshots_cfg = cfg
                 .as_ref()
@@ -498,6 +566,7 @@ fn main() {
                     retention,
                     limits,
                     interval_secs: interval,
+                    bootstrap: bootstrap_opt.clone(),
                 });
             }
 
@@ -525,6 +594,7 @@ fn main() {
                 let snapshot_pause_for_tasks = snapshot_pause.clone();
                 let receipts_dir_for_tasks = receipts_dir.clone();
                 let ha_node_id_for_tasks = ha_cfg.node_id.clone();
+                let bootstrap_for_tasks = bootstrap.clone();
 
                 supervisor_handle = Some(supervisor.spawn(move |leader_stop| {
                     let mut hs = Vec::new();
@@ -540,6 +610,7 @@ fn main() {
                             fin_api_for_tasks.clone(),
                             data_api_for_tasks.clone(),
                             recon_store_for_tasks.clone(),
+                            bootstrap_for_tasks.clone(),
                             PathBuf::from(&receipts_dir_for_tasks),
                             ha_node_id_for_tasks.clone(),
                             snapshot_pause_for_tasks.clone(),
@@ -562,6 +633,7 @@ fn main() {
                         fin_api.clone(),
                         data_api.clone(),
                         recon_store.clone(),
+                        bootstrap.clone(),
                         PathBuf::from(&receipts_dir),
                         node_label.to_string(),
                         snapshot_pause.clone(),
@@ -889,6 +961,237 @@ fn main() {
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
+        Command::Bootstrap { cmd } => {
+            let cfg = cfg.as_ref().unwrap_or_else(|| {
+                exit_err(
+                    "bootstrap commands require a config: pass --config or set IPPAN_L2_CONFIG",
+                )
+            });
+            let receipts_dir = cfg.storage.receipts_dir.as_str();
+            let fin_db_dir = cfg.storage.fin_db_dir.as_str();
+            let data_db_dir = cfg.storage.data_db_dir.as_str();
+            let recon_db_dir = cfg.storage.recon_db_dir.as_str();
+            let bootstrap_db_dir = cfg.storage.bootstrap_db_dir.as_str();
+
+            match cmd {
+                BootstrapCommand::Status { progress } => {
+                    let p = crate::bootstrap::read_progress(&progress)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "progress_file": progress.display().to_string(),
+                            "progress": p
+                        }))
+                        .unwrap()
+                    );
+                }
+                BootstrapCommand::Restore {
+                    base,
+                    deltas,
+                    force,
+                    progress,
+                } => {
+                    if !cfg.snapshots.enabled {
+                        exit_err("snapshots are disabled: set [snapshots].enabled = true");
+                    }
+
+                    let fin = hub_fin::FinStore::open(fin_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open(data_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+                    let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    // 1) Restore base (SnapshotV1)
+                    let base_manifest = snapshot::restore_snapshot_v1_tar(
+                        &cfg.snapshots,
+                        &base,
+                        &fin,
+                        &data,
+                        recon.as_ref(),
+                        Path::new(receipts_dir),
+                        force,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let base_snapshot_id = base_manifest.hash.clone();
+                    let _ = bootstrap.set_base_snapshot_id(&base_snapshot_id);
+
+                    // Compatibility guards (override with --force).
+                    let cur_mm = version_major_minor(env!("CARGO_PKG_VERSION"));
+                    let base_mm = version_major_minor(&base_manifest.ippan_l2_version);
+                    if cur_mm != base_mm {
+                        if force {
+                            warn!(
+                                event = "bootstrap_restore_version_mismatch_forced",
+                                current = env!("CARGO_PKG_VERSION"),
+                                snapshot = %base_manifest.ippan_l2_version
+                            );
+                        } else {
+                            exit_err("incompatible ippan_l2_version (use --force to override)");
+                        }
+                    }
+                    if base_manifest.snapshot_version != crate::snapshot::SNAPSHOT_VERSION_V1 {
+                        if force {
+                            warn!(
+                                event = "bootstrap_restore_snapshot_version_forced",
+                                snapshot_version = base_manifest.snapshot_version
+                            );
+                        } else {
+                            exit_err("incompatible snapshot_version (use --force to override)");
+                        }
+                    }
+                    if base_manifest
+                        .state_versions
+                        .get("fin")
+                        .copied()
+                        .unwrap_or(0)
+                        < TARGET_STATE_VERSION
+                    {
+                        if force {
+                            warn!(event = "bootstrap_restore_fin_state_version_forced");
+                        } else {
+                            exit_err("incompatible fin state_version (use --force to override)");
+                        }
+                    }
+                    if base_manifest
+                        .state_versions
+                        .get("data")
+                        .copied()
+                        .unwrap_or(0)
+                        < TARGET_STATE_VERSION
+                    {
+                        if force {
+                            warn!(event = "bootstrap_restore_data_state_version_forced");
+                        } else {
+                            exit_err("incompatible data state_version (use --force to override)");
+                        }
+                    }
+
+                    // Initialize / validate progress.
+                    let mut prog = crate::bootstrap::read_progress(&progress)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()))
+                        .unwrap_or(crate::bootstrap::BootstrapProgressV1 {
+                            schema_version: 1,
+                            base_snapshot_id: base_snapshot_id.clone(),
+                            // Base restore represents a boundary; deltas start at epoch 1.
+                            last_applied_to_epoch: 1,
+                        });
+                    if prog.base_snapshot_id != base_snapshot_id {
+                        exit_err("progress file base_snapshot_id mismatch (refusing resume)");
+                    }
+                    if prog.last_applied_to_epoch < 1 {
+                        prog.last_applied_to_epoch = 1;
+                    }
+                    crate::bootstrap::write_progress_atomic(&progress, &prog)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    // 2) Parse + sort deltas by from_epoch.
+                    let mut parsed: Vec<(PathBuf, crate::bootstrap::ParsedDeltaV1)> = Vec::new();
+                    for p in deltas {
+                        let d = crate::bootstrap::parse_delta_snapshot_v1_tar(&p)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        if d.manifest.base_snapshot_id != base_snapshot_id {
+                            exit_err("delta base_snapshot_id mismatch (refusing restore)");
+                        }
+                        if d.manifest.delta_version != crate::bootstrap::DELTA_SNAPSHOT_VERSION_V1 {
+                            exit_err("unsupported delta_version");
+                        }
+                        let delta_mm = version_major_minor(&d.manifest.ippan_l2_version);
+                        if delta_mm != cur_mm {
+                            if force {
+                                warn!(
+                                    event = "bootstrap_restore_delta_version_mismatch_forced",
+                                    current = env!("CARGO_PKG_VERSION"),
+                                    delta = %d.manifest.ippan_l2_version
+                                );
+                            } else {
+                                exit_err(
+                                    "incompatible delta ippan_l2_version (use --force to override)",
+                                );
+                            }
+                        }
+                        parsed.push((p, d));
+                    }
+                    parsed.sort_by(|a, b| {
+                        (
+                            a.1.manifest.from_epoch,
+                            a.1.manifest.to_epoch,
+                            a.1.manifest.created_at,
+                        )
+                            .cmp(&(
+                                b.1.manifest.from_epoch,
+                                b.1.manifest.to_epoch,
+                                b.1.manifest.created_at,
+                            ))
+                    });
+
+                    // 3) Apply deltas in order, resume-capable.
+                    let mut cur_epoch = prog.last_applied_to_epoch;
+                    let started = std::time::Instant::now();
+                    for (_path, d) in parsed {
+                        if d.manifest.to_epoch <= cur_epoch {
+                            continue;
+                        }
+                        if d.manifest.from_epoch != cur_epoch {
+                            exit_err("delta epoch chain mismatch (missing or out-of-order delta)");
+                        }
+                        match crate::bootstrap::apply_delta_changes_v1(
+                            &d.changes,
+                            &fin,
+                            &data,
+                            recon.as_ref(),
+                            Path::new(receipts_dir),
+                        ) {
+                            Ok(()) => {
+                                crate::metrics::DELTAS_APPLIED_TOTAL
+                                    .with_label_values(&["ok"])
+                                    .inc();
+                            }
+                            Err(e) => {
+                                crate::metrics::DELTA_APPLY_FAILURES_TOTAL
+                                    .with_label_values(&["apply_failed"])
+                                    .inc();
+                                crate::metrics::DELTAS_APPLIED_TOTAL
+                                    .with_label_values(&["err"])
+                                    .inc();
+                                exit_err(&e.to_string());
+                            }
+                        }
+                        cur_epoch = d.manifest.to_epoch;
+                        prog.last_applied_to_epoch = cur_epoch;
+                        crate::bootstrap::write_progress_atomic(&progress, &prog)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    }
+
+                    // 4) Set epochs for subsequent delta cuts.
+                    let _ = fin.set_changelog_epoch(cur_epoch);
+                    let _ = data.set_changelog_epoch(cur_epoch);
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.set_changelog_epoch(cur_epoch);
+                    }
+                    let _ = bootstrap.set_epoch(cur_epoch);
+
+                    crate::metrics::BOOTSTRAP_RESTORE_SECONDS
+                        .with_label_values(&["ok"])
+                        .observe(started.elapsed().as_secs_f64());
+
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "base_snapshot_id": base_snapshot_id,
+                            "applied_to_epoch": cur_epoch,
+                            "progress_file": progress.display().to_string(),
+                            "restore_seconds": started.elapsed().as_secs_f64(),
+                        }))
+                        .unwrap()
+                    );
+                }
+            }
+        }
         Command::Snapshot { cmd } => {
             let cfg = cfg.as_ref().unwrap_or_else(|| {
                 exit_err("snapshot commands require a config: pass --config or set IPPAN_L2_CONFIG")
@@ -901,9 +1204,120 @@ fn main() {
             let fin_db_dir = cfg.storage.fin_db_dir.as_str();
             let data_db_dir = cfg.storage.data_db_dir.as_str();
             let recon_db_dir = cfg.storage.recon_db_dir.as_str();
+            let bootstrap_db_dir = cfg.storage.bootstrap_db_dir.as_str();
 
             match cmd {
                 SnapshotCommand::Create { out } => {
+                    // Create is a legacy alias for Base.
+                    let cmd = SnapshotCommand::Base { out };
+                    // Re-enter the match with Base.
+                    // NOTE: keep this as a direct tail-call style to avoid duplicating logic.
+                    match cmd {
+                        SnapshotCommand::Base { out } => {
+                            // Leader-only enforcement (when HA is enabled).
+                            let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
+                                exit_err(&format!("failed to init HA lock provider: {e}"))
+                            });
+                            if let Some(lock) = lock.as_ref() {
+                                match lock.try_acquire(&cfg.ha.node_id) {
+                                    Ok(crate::ha::lock_provider::LockState::Acquired) => {}
+                                    Ok(_) => exit_err(
+                                        "not leader: failed to acquire snapshot leadership lock",
+                                    ),
+                                    Err(e) => {
+                                        exit_err(&format!("failed acquiring leader lock: {e}"))
+                                    }
+                                }
+                            }
+
+                            let fin = hub_fin::FinStore::open(fin_db_dir)
+                                .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            let data = hub_data::DataStore::open(data_db_dir)
+                                .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+                            let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
+                                .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                            let out_path = out.unwrap_or_else(|| {
+                                let dir = PathBuf::from(&cfg.snapshots.output_dir);
+                                let now = time::OffsetDateTime::now_utc();
+                                dir.join(format!(
+                                    "base-{:04}{:02}{:02}.tar",
+                                    now.year(),
+                                    u8::from(now.month()),
+                                    now.day()
+                                ))
+                            });
+
+                            let manifest = snapshot::create_snapshot_v1_tar(
+                                &cfg.snapshots,
+                                &out_path,
+                                snapshot::SnapshotSources {
+                                    fin: &fin,
+                                    data: &data,
+                                    recon: recon.as_ref(),
+                                    receipts_dir: Path::new(receipts_dir),
+                                    node_id: if cfg.ha.enabled {
+                                        cfg.ha.node_id.as_str()
+                                    } else {
+                                        cfg.node.label.as_str()
+                                    },
+                                },
+                            )
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                            // Set base snapshot id for subsequent deltas.
+                            let _ = bootstrap.set_base_snapshot_id(&manifest.hash);
+
+                            // Advance epoch boundary and clear current epoch logs (base snapshot is authoritative).
+                            let fin_epoch = fin.changelog_epoch().unwrap_or(0);
+                            let data_epoch = data.changelog_epoch().unwrap_or(0);
+                            let recon_epoch = recon
+                                .as_ref()
+                                .and_then(|r| r.changelog_epoch().ok())
+                                .unwrap_or(fin_epoch);
+                            let boot_epoch = bootstrap.epoch().unwrap_or(fin_epoch);
+                            if !(fin_epoch == data_epoch
+                                && fin_epoch == recon_epoch
+                                && fin_epoch == boot_epoch)
+                            {
+                                exit_err(
+                                    "snapshot epoch mismatch across stores (refusing base cut)",
+                                );
+                            }
+                            let next_epoch = fin_epoch.saturating_add(1);
+                            let _ = fin.delete_changelog_epoch(fin_epoch);
+                            let _ = data.delete_changelog_epoch(fin_epoch);
+                            if let Some(r) = recon.as_ref() {
+                                let _ = r.delete_changelog_epoch(fin_epoch);
+                            }
+                            let _ = bootstrap.delete_changelog_epoch(fin_epoch);
+                            let _ = fin.set_changelog_epoch(next_epoch);
+                            let _ = data.set_changelog_epoch(next_epoch);
+                            if let Some(r) = recon.as_ref() {
+                                let _ = r.set_changelog_epoch(next_epoch);
+                            }
+                            let _ = bootstrap.set_epoch(next_epoch);
+
+                            // Release lock best-effort.
+                            if let Some(lock) = lock.as_ref() {
+                                let _ = lock.release(&cfg.ha.node_id);
+                            }
+
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "snapshot_version": manifest.snapshot_version,
+                                    "path": out_path.display().to_string(),
+                                    "hash": manifest.hash,
+                                }))
+                                .unwrap()
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                SnapshotCommand::Base { out } => {
                     // Leader-only enforcement (when HA is enabled).
                     let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
                         exit_err(&format!("failed to init HA lock provider: {e}"))
@@ -923,20 +1337,18 @@ fn main() {
                     let data = hub_data::DataStore::open(data_db_dir)
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                     let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+                    let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
 
                     let out_path = out.unwrap_or_else(|| {
                         let dir = PathBuf::from(&cfg.snapshots.output_dir);
                         let now = time::OffsetDateTime::now_utc();
-                        let ts = format!(
-                            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+                        dir.join(format!(
+                            "base-{:04}{:02}{:02}.tar",
                             now.year(),
                             u8::from(now.month()),
-                            now.day(),
-                            now.hour(),
-                            now.minute(),
-                            now.second()
-                        );
-                        dir.join(format!("l2-snapshot-{ts}.tar"))
+                            now.day()
+                        ))
                     });
 
                     let manifest = snapshot::create_snapshot_v1_tar(
@@ -956,6 +1368,37 @@ fn main() {
                     )
                     .unwrap_or_else(|e| exit_err(&e.to_string()));
 
+                    // Set base snapshot id for subsequent deltas.
+                    let _ = bootstrap.set_base_snapshot_id(&manifest.hash);
+
+                    // Advance epoch boundary and clear current epoch logs.
+                    let fin_epoch = fin.changelog_epoch().unwrap_or(0);
+                    let data_epoch = data.changelog_epoch().unwrap_or(0);
+                    let recon_epoch = recon
+                        .as_ref()
+                        .and_then(|r| r.changelog_epoch().ok())
+                        .unwrap_or(fin_epoch);
+                    let boot_epoch = bootstrap.epoch().unwrap_or(fin_epoch);
+                    if !(fin_epoch == data_epoch
+                        && fin_epoch == recon_epoch
+                        && fin_epoch == boot_epoch)
+                    {
+                        exit_err("snapshot epoch mismatch across stores (refusing base cut)");
+                    }
+                    let next_epoch = fin_epoch.saturating_add(1);
+                    let _ = fin.delete_changelog_epoch(fin_epoch);
+                    let _ = data.delete_changelog_epoch(fin_epoch);
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.delete_changelog_epoch(fin_epoch);
+                    }
+                    let _ = bootstrap.delete_changelog_epoch(fin_epoch);
+                    let _ = fin.set_changelog_epoch(next_epoch);
+                    let _ = data.set_changelog_epoch(next_epoch);
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.set_changelog_epoch(next_epoch);
+                    }
+                    let _ = bootstrap.set_epoch(next_epoch);
+
                     // Release lock best-effort.
                     if let Some(lock) = lock.as_ref() {
                         let _ = lock.release(&cfg.ha.node_id);
@@ -970,6 +1413,119 @@ fn main() {
                         }))
                         .unwrap()
                     );
+                }
+                SnapshotCommand::Delta { out } => {
+                    // Leader-only enforcement (when HA is enabled).
+                    let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
+                        exit_err(&format!("failed to init HA lock provider: {e}"))
+                    });
+                    if let Some(lock) = lock.as_ref() {
+                        match lock.try_acquire(&cfg.ha.node_id) {
+                            Ok(crate::ha::lock_provider::LockState::Acquired) => {}
+                            Ok(_) => {
+                                exit_err("not leader: failed to acquire snapshot leadership lock")
+                            }
+                            Err(e) => exit_err(&format!("failed acquiring leader lock: {e}")),
+                        }
+                    }
+
+                    let fin = hub_fin::FinStore::open(fin_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open(data_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+                    let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    let Some(base_snapshot_id) = bootstrap
+                        .base_snapshot_id()
+                        .unwrap_or(None)
+                        .filter(|s| !s.trim().is_empty())
+                    else {
+                        exit_err("missing base_snapshot_id (cut a base snapshot first)");
+                    };
+
+                    let fin_epoch = fin.changelog_epoch().unwrap_or(0);
+                    let data_epoch = data.changelog_epoch().unwrap_or(0);
+                    let recon_epoch = recon
+                        .as_ref()
+                        .and_then(|r| r.changelog_epoch().ok())
+                        .unwrap_or(fin_epoch);
+                    let boot_epoch = bootstrap.epoch().unwrap_or(fin_epoch);
+                    if !(fin_epoch == data_epoch
+                        && fin_epoch == recon_epoch
+                        && fin_epoch == boot_epoch)
+                    {
+                        exit_err("snapshot epoch mismatch across stores (refusing delta cut)");
+                    }
+                    let from_epoch = fin_epoch;
+                    let to_epoch = from_epoch.saturating_add(1);
+
+                    let out_path = out.unwrap_or_else(|| {
+                        let dir = PathBuf::from(&cfg.snapshots.output_dir).join("deltas");
+                        dir.join(format!("delta-{from_epoch}-{to_epoch}.tar"))
+                    });
+
+                    let manifest = crate::bootstrap::create_delta_snapshot_v1_tar(
+                        &out_path,
+                        &base_snapshot_id,
+                        from_epoch,
+                        to_epoch,
+                        crate::bootstrap::DeltaSources {
+                            fin: &fin,
+                            data: &data,
+                            recon: recon.as_ref(),
+                            bootstrap: &bootstrap,
+                        },
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    // Clear epoch logs + advance to next epoch boundary.
+                    let _ = fin.delete_changelog_epoch(from_epoch);
+                    let _ = data.delete_changelog_epoch(from_epoch);
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.delete_changelog_epoch(from_epoch);
+                    }
+                    let _ = bootstrap.delete_changelog_epoch(from_epoch);
+                    let _ = fin.set_changelog_epoch(to_epoch);
+                    let _ = data.set_changelog_epoch(to_epoch);
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.set_changelog_epoch(to_epoch);
+                    }
+                    let _ = bootstrap.set_epoch(to_epoch);
+
+                    // Release lock best-effort.
+                    if let Some(lock) = lock.as_ref() {
+                        let _ = lock.release(&cfg.ha.node_id);
+                    }
+
+                    crate::metrics::SNAPSHOT_DELTA_CREATED_TOTAL
+                        .with_label_values(&["ok"])
+                        .inc();
+                    if let Ok(meta) = std::fs::metadata(&out_path) {
+                        let size_i64 = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+                        crate::metrics::SNAPSHOT_DELTA_SIZE_BYTES
+                            .with_label_values(&["cli"])
+                            .set(size_i64);
+                    }
+
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "delta_version": manifest.delta_version,
+                            "path": out_path.display().to_string(),
+                            "base_snapshot_id": manifest.base_snapshot_id,
+                            "from_epoch": manifest.from_epoch,
+                            "to_epoch": manifest.to_epoch,
+                            "hash": manifest.hash,
+                        }))
+                        .unwrap()
+                    );
+                }
+                SnapshotCommand::PublishIndex { dir } => {
+                    crate::bootstrap::publish_index_v1(&dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!("{}", dir.join("index.json").display());
                 }
                 SnapshotCommand::Restore { from, force } => {
                     let fin = hub_fin::FinStore::open(fin_db_dir)
@@ -1103,96 +1659,318 @@ fn spawn_snapshot_scheduler(
     fin_api: crate::fin_api::FinApi,
     data_api: crate::data_api::DataApi,
     recon: Option<crate::recon_store::ReconStore>,
+    bootstrap: crate::bootstrap_store::BootstrapStore,
     receipts_dir: PathBuf,
     node_id: String,
     pause_writes: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let cron = snapshots_cfg
-            .schedule
-            .cron
+        let out_dir = PathBuf::from(&snapshots_cfg.output_dir);
+
+        let base_every = snapshots_cfg
+            .base_every
             .as_deref()
-            .unwrap_or("0 2 * * *")
-            .trim();
-        let (minute, hour) = match parse_daily_cron_min_hour(cron) {
-            Ok(x) => x,
-            Err(e) => {
-                warn!(event = "snapshot_schedule_invalid_cron", cron, error = %e);
-                return;
-            }
-        };
-        info!(
-            event = "snapshot_scheduler_started",
-            enabled = snapshots_cfg.enabled,
-            minute,
-            hour,
-            output_dir = %snapshots_cfg.output_dir
-        );
+            .and_then(|s| parse_duration_spec(s).ok());
+        let delta_every = snapshots_cfg
+            .delta_every
+            .as_deref()
+            .and_then(|s| parse_duration_spec(s).ok());
 
-        let mut last_run_date: Option<time::Date> = None;
-        while !stop.load(Ordering::Relaxed) {
-            let now = time::OffsetDateTime::now_utc();
-            let today = now.date();
-            if now.minute() == minute && now.hour() == hour && last_run_date != Some(today) {
-                last_run_date = Some(today);
-                let out_dir = PathBuf::from(&snapshots_cfg.output_dir);
-                let out_path = out_dir.join(format!(
-                    "l2-snapshot-{:04}{:02}{:02}-{:02}{:02}{:02}.tar",
-                    now.year(),
-                    u8::from(now.month()),
-                    now.day(),
-                    now.hour(),
-                    now.minute(),
-                    now.second()
-                ));
+        if base_every.is_some() || delta_every.is_some() {
+            info!(
+                event = "snapshot_scheduler_started",
+                mode = "interval",
+                base_every = snapshots_cfg.base_every.as_deref().unwrap_or(""),
+                delta_every = snapshots_cfg.delta_every.as_deref().unwrap_or(""),
+                output_dir = %snapshots_cfg.output_dir
+            );
 
-                pause_writes.store(true, Ordering::Relaxed);
-                // Ensure pause is lifted even on error/stop.
-                let _pause_guard = PauseGuard {
-                    flag: pause_writes.clone(),
-                };
+            let mut last_base_at: Option<u64> = None;
+            let mut last_delta_at: Option<u64> = None;
 
-                let _ = fin_api.flush();
-                let _ = data_api.flush();
-                if let Some(r) = recon.as_ref() {
-                    let _ = r.flush();
+            while !stop.load(Ordering::Relaxed) {
+                let now = time::OffsetDateTime::now_utc();
+                let now_secs = u64::try_from(now.unix_timestamp()).unwrap_or(0);
+
+                // Cut a base if none exists yet (bootstrap safety), or interval elapsed.
+                let need_base = bootstrap.base_snapshot_id().ok().flatten().is_none();
+                let due_base = base_every
+                    .map(|d| {
+                        last_base_at
+                            .map(|t| now_secs.saturating_sub(t) >= d.as_secs())
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false);
+                if need_base || due_base {
+                    pause_writes.store(true, Ordering::Relaxed);
+                    let _pause_guard = PauseGuard {
+                        flag: pause_writes.clone(),
+                    };
+
+                    let _ = fin_api.flush();
+                    let _ = data_api.flush();
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.flush();
+                    }
+
+                    let base_path = out_dir.join(format!(
+                        "base-{:04}{:02}{:02}.tar",
+                        now.year(),
+                        u8::from(now.month()),
+                        now.day()
+                    ));
+                    match crate::snapshot::create_snapshot_v1_tar(
+                        &snapshots_cfg,
+                        &base_path,
+                        crate::snapshot::SnapshotSources {
+                            fin: fin_api.store(),
+                            data: data_api.store(),
+                            recon: recon.as_ref(),
+                            receipts_dir: &receipts_dir,
+                            node_id: &node_id,
+                        },
+                    ) {
+                        Ok(manifest) => {
+                            let _ = bootstrap.set_base_snapshot_id(&manifest.hash);
+                            // Advance epoch boundary and clear current epoch logs.
+                            let fin_epoch = fin_api.store().changelog_epoch().unwrap_or(0);
+                            let data_epoch = data_api.store().changelog_epoch().unwrap_or(0);
+                            let recon_epoch = recon
+                                .as_ref()
+                                .and_then(|r| r.changelog_epoch().ok())
+                                .unwrap_or(fin_epoch);
+                            let boot_epoch = bootstrap.epoch().unwrap_or(fin_epoch);
+                            if fin_epoch == data_epoch
+                                && fin_epoch == recon_epoch
+                                && fin_epoch == boot_epoch
+                            {
+                                let next_epoch = fin_epoch.saturating_add(1);
+                                let _ = fin_api.store().delete_changelog_epoch(fin_epoch);
+                                let _ = data_api.store().delete_changelog_epoch(fin_epoch);
+                                if let Some(r) = recon.as_ref() {
+                                    let _ = r.delete_changelog_epoch(fin_epoch);
+                                }
+                                let _ = bootstrap.delete_changelog_epoch(fin_epoch);
+                                let _ = fin_api.store().set_changelog_epoch(next_epoch);
+                                let _ = data_api.store().set_changelog_epoch(next_epoch);
+                                if let Some(r) = recon.as_ref() {
+                                    let _ = r.set_changelog_epoch(next_epoch);
+                                }
+                                let _ = bootstrap.set_epoch(next_epoch);
+                            }
+                            last_base_at = Some(now_secs);
+                            last_delta_at = Some(now_secs);
+                            info!(
+                                event = "snapshot_base_created",
+                                path = %base_path.display(),
+                                hash = %manifest.hash
+                            );
+                            crate::bootstrap::rotate_bootstrap_dir_v1(
+                                &out_dir,
+                                snapshots_cfg.retain_bases,
+                                snapshots_cfg.retain_deltas_per_base,
+                            );
+                        }
+                        Err(e) => warn!(event = "snapshot_base_create_failed", error = %e),
+                    }
                 }
 
-                match crate::snapshot::create_snapshot_v1_tar(
-                    &snapshots_cfg,
-                    &out_path,
-                    crate::snapshot::SnapshotSources {
-                        fin: fin_api.store(),
-                        data: data_api.store(),
-                        recon: recon.as_ref(),
-                        receipts_dir: &receipts_dir,
-                        node_id: &node_id,
-                    },
-                ) {
-                    Ok(manifest) => {
-                        info!(
-                            event = "snapshot_created",
-                            path = %out_path.display(),
-                            hash = %manifest.hash
-                        );
-                        rotate_snapshots(&out_dir, snapshots_cfg.max_snapshots);
+                // Cut delta if interval elapsed and base exists.
+                let have_base = bootstrap.base_snapshot_id().ok().flatten().is_some();
+                let due_delta = delta_every
+                    .map(|d| {
+                        last_delta_at
+                            .map(|t| now_secs.saturating_sub(t) >= d.as_secs())
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false);
+                if have_base && due_delta {
+                    pause_writes.store(true, Ordering::Relaxed);
+                    let _pause_guard = PauseGuard {
+                        flag: pause_writes.clone(),
+                    };
+                    let _ = fin_api.flush();
+                    let _ = data_api.flush();
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.flush();
                     }
-                    Err(e) => {
-                        warn!(event = "snapshot_create_failed", error = %e);
+
+                    let Some(base_snapshot_id) = bootstrap.base_snapshot_id().ok().flatten() else {
+                        continue;
+                    };
+                    let fin_epoch = fin_api.store().changelog_epoch().unwrap_or(0);
+                    let data_epoch = data_api.store().changelog_epoch().unwrap_or(0);
+                    let recon_epoch = recon
+                        .as_ref()
+                        .and_then(|r| r.changelog_epoch().ok())
+                        .unwrap_or(fin_epoch);
+                    let boot_epoch = bootstrap.epoch().unwrap_or(fin_epoch);
+                    if !(fin_epoch == data_epoch
+                        && fin_epoch == recon_epoch
+                        && fin_epoch == boot_epoch)
+                    {
+                        warn!(event = "snapshot_delta_epoch_mismatch");
+                    } else {
+                        let from_epoch = fin_epoch;
+                        let to_epoch = from_epoch.saturating_add(1);
+                        let delta_dir = out_dir.join("deltas");
+                        let delta_path =
+                            delta_dir.join(format!("delta-{from_epoch}-{to_epoch}.tar"));
+                        match crate::bootstrap::create_delta_snapshot_v1_tar(
+                            &delta_path,
+                            &base_snapshot_id,
+                            from_epoch,
+                            to_epoch,
+                            crate::bootstrap::DeltaSources {
+                                fin: fin_api.store(),
+                                data: data_api.store(),
+                                recon: recon.as_ref(),
+                                bootstrap: &bootstrap,
+                            },
+                        ) {
+                            Ok(manifest) => {
+                                let _ = fin_api.store().delete_changelog_epoch(from_epoch);
+                                let _ = data_api.store().delete_changelog_epoch(from_epoch);
+                                if let Some(r) = recon.as_ref() {
+                                    let _ = r.delete_changelog_epoch(from_epoch);
+                                }
+                                let _ = bootstrap.delete_changelog_epoch(from_epoch);
+                                let _ = fin_api.store().set_changelog_epoch(to_epoch);
+                                let _ = data_api.store().set_changelog_epoch(to_epoch);
+                                if let Some(r) = recon.as_ref() {
+                                    let _ = r.set_changelog_epoch(to_epoch);
+                                }
+                                let _ = bootstrap.set_epoch(to_epoch);
+
+                                last_delta_at = Some(now_secs);
+                                crate::metrics::SNAPSHOT_DELTA_CREATED_TOTAL
+                                    .with_label_values(&["ok"])
+                                    .inc();
+                                if let Ok(meta) = std::fs::metadata(&delta_path) {
+                                    let size_i64 = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+                                    crate::metrics::SNAPSHOT_DELTA_SIZE_BYTES
+                                        .with_label_values(&["scheduler"])
+                                        .set(size_i64);
+                                }
+                                info!(
+                                    event = "snapshot_delta_created",
+                                    path = %delta_path.display(),
+                                    hash = %manifest.hash,
+                                    from_epoch = manifest.from_epoch,
+                                    to_epoch = manifest.to_epoch
+                                );
+                                crate::bootstrap::rotate_bootstrap_dir_v1(
+                                    &out_dir,
+                                    snapshots_cfg.retain_bases,
+                                    snapshots_cfg.retain_deltas_per_base,
+                                );
+                            }
+                            Err(e) => {
+                                crate::metrics::SNAPSHOT_DELTA_CREATED_TOTAL
+                                    .with_label_values(&["err"])
+                                    .inc();
+                                warn!(event = "snapshot_delta_create_failed", error = %e)
+                            }
+                        }
                     }
                 }
-            }
 
-            // Sleep in small chunks for responsive shutdown/step-down.
-            let mut slept = std::time::Duration::from_secs(0);
-            while slept < std::time::Duration::from_secs(30) && !stop.load(Ordering::Relaxed) {
-                let step = std::time::Duration::from_millis(250);
-                std::thread::sleep(step);
-                slept += step;
+                // Sleep in chunks for responsive shutdown/step-down.
+                let mut slept = std::time::Duration::from_secs(0);
+                while slept < std::time::Duration::from_secs(5) && !stop.load(Ordering::Relaxed) {
+                    let step = std::time::Duration::from_millis(250);
+                    std::thread::sleep(step);
+                    slept += step;
+                }
             }
+            info!(event = "snapshot_scheduler_stopped");
+        } else {
+            // Legacy daily cron mode (SnapshotV1 only).
+            let cron = snapshots_cfg
+                .schedule
+                .cron
+                .as_deref()
+                .unwrap_or("0 2 * * *")
+                .trim();
+            let (minute, hour) = match parse_daily_cron_min_hour(cron) {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!(event = "snapshot_schedule_invalid_cron", cron, error = %e);
+                    return;
+                }
+            };
+            info!(
+                event = "snapshot_scheduler_started",
+                mode = "daily_cron",
+                minute,
+                hour,
+                output_dir = %snapshots_cfg.output_dir
+            );
+
+            let mut last_run_date: Option<time::Date> = None;
+            while !stop.load(Ordering::Relaxed) {
+                let now = time::OffsetDateTime::now_utc();
+                let today = now.date();
+                if now.minute() == minute && now.hour() == hour && last_run_date != Some(today) {
+                    last_run_date = Some(today);
+                    let out_path = out_dir.join(format!(
+                        "l2-snapshot-{:04}{:02}{:02}-{:02}{:02}{:02}.tar",
+                        now.year(),
+                        u8::from(now.month()),
+                        now.day(),
+                        now.hour(),
+                        now.minute(),
+                        now.second()
+                    ));
+
+                    pause_writes.store(true, Ordering::Relaxed);
+                    // Ensure pause is lifted even on error/stop.
+                    let _pause_guard = PauseGuard {
+                        flag: pause_writes.clone(),
+                    };
+
+                    let _ = fin_api.flush();
+                    let _ = data_api.flush();
+                    if let Some(r) = recon.as_ref() {
+                        let _ = r.flush();
+                    }
+
+                    match crate::snapshot::create_snapshot_v1_tar(
+                        &snapshots_cfg,
+                        &out_path,
+                        crate::snapshot::SnapshotSources {
+                            fin: fin_api.store(),
+                            data: data_api.store(),
+                            recon: recon.as_ref(),
+                            receipts_dir: &receipts_dir,
+                            node_id: &node_id,
+                        },
+                    ) {
+                        Ok(manifest) => {
+                            info!(
+                                event = "snapshot_created",
+                                path = %out_path.display(),
+                                hash = %manifest.hash
+                            );
+                            rotate_snapshots(&out_dir, snapshots_cfg.max_snapshots);
+                        }
+                        Err(e) => {
+                            warn!(event = "snapshot_create_failed", error = %e);
+                        }
+                    }
+                }
+
+                // Sleep in small chunks for responsive shutdown/step-down.
+                let mut slept = std::time::Duration::from_secs(0);
+                while slept < std::time::Duration::from_secs(30) && !stop.load(Ordering::Relaxed) {
+                    let step = std::time::Duration::from_millis(250);
+                    std::thread::sleep(step);
+                    slept += step;
+                }
+            }
+            info!(event = "snapshot_scheduler_stopped");
         }
-        info!(event = "snapshot_scheduler_stopped");
     })
 }
 
@@ -1224,6 +2002,36 @@ fn parse_daily_cron_min_hour(cron: &str) -> Result<(u8, u8), String> {
         return Err("hour out of range (0-23)".to_string());
     }
     Ok((minute, hour))
+}
+
+fn parse_duration_spec(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    // Support suffixes: s, m, h, d
+    let (num_s, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c),
+        _ => (s, 's'),
+    };
+    let n: u64 = num_s
+        .parse()
+        .map_err(|_| format!("invalid duration number: {num_s}"))?;
+    let secs = match unit {
+        's' | 'S' => n,
+        'm' | 'M' => n.saturating_mul(60),
+        'h' | 'H' => n.saturating_mul(3600),
+        'd' | 'D' => n.saturating_mul(86_400),
+        _ => return Err(format!("invalid duration unit: {unit} (use s|m|h|d)")),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+fn version_major_minor(v: &str) -> (u64, u64) {
+    let mut it = v.split('.');
+    let major = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let minor = it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    (major, minor)
 }
 
 fn rotate_snapshots(dir: &Path, max_keep: usize) {

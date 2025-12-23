@@ -2,9 +2,19 @@
 
 use crate::actions::CreateAssetV1;
 use crate::types::{ActionId, AmountU128, AssetId32};
+use base64::Engine as _;
+use sled::transaction::ConflictableTransactionError;
+use sled::transaction::TransactionError;
 use sled::IVec;
+use sled::Transactional;
 use std::io::Write;
 use std::path::Path;
+
+pub const CHANGELOG_VERSION_V1: u32 = 1;
+
+const CHANGELOG_EPOCH_KEY: &[u8] = b"changelog_epoch";
+const CHANGELOG_SEQ_KEY: &[u8] = b"changelog_seq";
+const CHANGELOG_PREFIX: &[u8] = b"changelog:";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -14,16 +24,51 @@ pub enum StoreError {
     Decode(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogOp {
+    Put,
+    Del,
+}
+
+impl ChangelogOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChangelogOp::Put => "put",
+            ChangelogOp::Del => "del",
+        }
+    }
+}
+
+/// A single deterministic change record written to the changelog.
+///
+/// This is an operational artifact used for incremental snapshots / bootstrap.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChangelogEntryV1 {
+    pub schema_version: u32,
+    pub epoch: u64,
+    pub seq: u64,
+    pub op: String,
+    /// Raw sled key bytes (hex-encoded).
+    pub key_hex: String,
+    /// Present only for `put`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_b64: Option<String>,
+    /// blake3 hash of value bytes (empty for deletes).
+    pub value_hash: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FinStore {
     tree: sled::Tree,
+    changelog: sled::Tree,
 }
 
 impl FinStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db = sled::open(path)?;
         let tree = db.open_tree("hub-fin")?;
-        Ok(Self { tree })
+        let changelog = db.open_tree("hub-fin-changelog")?;
+        Ok(Self { tree, changelog })
     }
 
     pub fn get_asset(&self, asset_id: AssetId32) -> Result<Option<CreateAssetV1>, StoreError> {
@@ -40,7 +85,7 @@ impl FinStore {
         let key = keys::asset(asset.asset_id);
         let bytes = serde_json::to_vec(asset)
             .map_err(|e| StoreError::Decode(format!("failed encoding asset json: {e}")))?;
-        self.tree.insert(key, bytes)?;
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -65,7 +110,8 @@ impl FinStore {
         amount: AmountU128,
     ) -> Result<(), StoreError> {
         let key = keys::balance(asset_id, account);
-        self.tree.insert(key, encode_u128_be(amount.0).to_vec())?;
+        let bytes = encode_u128_be(amount.0).to_vec();
+        self.tx_put(&key, &bytes)?;
         Ok(())
     }
 
@@ -86,8 +132,9 @@ impl FinStore {
     }
 
     pub fn set_state_version(&self, v: u32) -> Result<(), StoreError> {
-        self.tree
-            .insert(keys::state_version(), v.to_string().into_bytes())?;
+        let key = keys::state_version();
+        let bytes = v.to_string().into_bytes();
+        self.tx_put(key, &bytes)?;
         Ok(())
     }
 
@@ -98,10 +145,8 @@ impl FinStore {
         operator_account: &str,
         asset_id: AssetId32,
     ) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::delegation(from_account, operator_account, asset_id),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::delegation(from_account, operator_account, asset_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -112,9 +157,8 @@ impl FinStore {
         operator_account: &str,
         asset_id: AssetId32,
     ) -> Result<(), StoreError> {
-        let _ = self
-            .tree
-            .remove(keys::delegation(from_account, operator_account, asset_id))?;
+        let key = keys::delegation(from_account, operator_account, asset_id);
+        self.tx_del(&key)?;
         Ok(())
     }
 
@@ -131,19 +175,15 @@ impl FinStore {
 
     /// Add an account to the transfer allowlist for an asset.
     pub fn add_transfer_allow(&self, asset_id: AssetId32, account: &str) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::transfer_allow(asset_id, account),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::transfer_allow(asset_id, account);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
     /// Add an account to the transfer denylist for an asset.
     pub fn add_transfer_deny(&self, asset_id: AssetId32, account: &str) -> Result<(), StoreError> {
-        self.tree.insert(
-            keys::transfer_deny(asset_id, account),
-            IVec::from(&b"1"[..]),
-        )?;
+        let key = keys::transfer_deny(asset_id, account);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
@@ -168,14 +208,14 @@ impl FinStore {
     }
 
     pub fn mark_applied(&self, action_id: ActionId) -> Result<(), StoreError> {
-        self.tree
-            .insert(keys::applied(action_id), IVec::from(&b"1"[..]))?;
+        let key = keys::applied(action_id);
+        self.tx_put(&key, b"1")?;
         Ok(())
     }
 
     pub fn put_receipt(&self, action_id: ActionId, receipt_json: &[u8]) -> Result<(), StoreError> {
-        self.tree
-            .insert(keys::apply_receipt(action_id), receipt_json)?;
+        let key = keys::apply_receipt(action_id);
+        self.tx_put(&key, receipt_json)?;
         Ok(())
     }
 
@@ -192,7 +232,8 @@ impl FinStore {
         action_id: ActionId,
         receipt_json: &[u8],
     ) -> Result<(), StoreError> {
-        self.tree.insert(keys::receipt(action_id), receipt_json)?;
+        let key = keys::receipt(action_id);
+        self.tx_put(&key, receipt_json)?;
         Ok(())
     }
 
@@ -200,8 +241,65 @@ impl FinStore {
         Ok(self.tree.get(keys::receipt(action_id))?.map(|v| v.to_vec()))
     }
 
+    /// Low-level write used by bootstrap restore (bypasses changelog).
+    pub fn raw_put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.tree.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Low-level delete used by bootstrap restore (bypasses changelog).
+    pub fn raw_del(&self, key: &[u8]) -> Result<(), StoreError> {
+        let _ = self.tree.remove(key)?;
+        Ok(())
+    }
+
+    pub fn changelog_epoch(&self) -> Result<u64, StoreError> {
+        Ok(changelog_epoch_get(&self.changelog)?)
+    }
+
+    pub fn set_changelog_epoch(&self, epoch: u64) -> Result<(), StoreError> {
+        self.changelog
+            .insert(CHANGELOG_EPOCH_KEY, epoch.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    /// Drain all changelog entries for a specific epoch.
+    ///
+    /// Ordering is deterministic by `(epoch, seq)` as encoded in the changelog key.
+    pub fn export_changelog_epoch_v1(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<ChangelogEntryV1>, StoreError> {
+        let mut out = Vec::new();
+        let prefix = changelog_epoch_prefix(epoch);
+        for r in self.changelog.scan_prefix(prefix) {
+            let (_k, v) = r?;
+            let e: ChangelogEntryV1 = serde_json::from_slice(&v)
+                .map_err(|e| StoreError::Decode(format!("changelog decode failed: {e}")))?;
+            out.push(e);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_changelog_epoch(&self, epoch: u64) -> Result<(), StoreError> {
+        let prefix = changelog_epoch_prefix(epoch);
+        let keys: Vec<Vec<u8>> = self
+            .changelog
+            .scan_prefix(prefix)
+            .filter_map(|r| r.ok().map(|(k, _)| k.to_vec()))
+            .collect();
+        for k in keys {
+            let _ = self.changelog.remove(k)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn tree(&self) -> &sled::Tree {
         &self.tree
+    }
+
+    pub(crate) fn changelog_tree(&self) -> &sled::Tree {
+        &self.changelog
     }
 
     /// Flush pending writes to disk (best-effort).
@@ -250,6 +348,7 @@ impl FinStore {
         for (k, v) in read_kv_records_v1(bytes)
             .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
         {
+            // Snapshot import must not emit changelog entries (bootstrap deltas are separate).
             store.tree.insert(k, v)?;
         }
         Ok(store)
@@ -260,9 +359,52 @@ impl FinStore {
         for (k, v) in read_kv_records_v1(bytes)
             .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
         {
+            // Snapshot import must not emit changelog entries (bootstrap deltas are separate).
             self.tree.insert(k, v)?;
         }
         Ok(())
+    }
+
+    fn tx_put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        let r: Result<(), TransactionError<String>> =
+            (&self.tree, &self.changelog).transaction(|(t, c)| {
+                let mut ctx = ChangelogTxCtx::load(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                t.insert(key, value)?;
+                ctx.record_put(c, key, value)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                ctx.store(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                Ok(())
+            });
+        match r {
+            Ok(()) => Ok(()),
+            Err(TransactionError::Storage(e)) => Err(StoreError::Db(e)),
+            Err(TransactionError::Abort(e)) => {
+                Err(StoreError::Decode(format!("changelog tx aborted: {e}")))
+            }
+        }
+    }
+
+    fn tx_del(&self, key: &[u8]) -> Result<(), StoreError> {
+        let r: Result<(), TransactionError<String>> =
+            (&self.tree, &self.changelog).transaction(|(t, c)| {
+                let mut ctx = ChangelogTxCtx::load(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                let _ = t.remove(key)?;
+                ctx.record_del(c, key)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                ctx.store(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                Ok(())
+            });
+        match r {
+            Ok(()) => Ok(()),
+            Err(TransactionError::Storage(e)) => Err(StoreError::Db(e)),
+            Err(TransactionError::Abort(e)) => {
+                Err(StoreError::Decode(format!("changelog tx aborted: {e}")))
+            }
+        }
     }
 }
 
@@ -323,6 +465,119 @@ fn decode_u128_be(v: &IVec) -> Result<u128, String> {
     Ok(u128::from_be_bytes(b))
 }
 
+fn changelog_epoch_get(changelog: &sled::Tree) -> Result<u64, sled::Error> {
+    let Some(v) = changelog.get(CHANGELOG_EPOCH_KEY)? else {
+        return Ok(0);
+    };
+    if v.len() != 8 {
+        return Ok(0);
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(v.as_ref());
+    Ok(u64::from_be_bytes(b))
+}
+
+fn changelog_epoch_prefix(epoch: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(CHANGELOG_PREFIX.len() + 8 + 1);
+    p.extend_from_slice(CHANGELOG_PREFIX);
+    p.extend_from_slice(&epoch.to_be_bytes());
+    p.push(b':');
+    p
+}
+
+fn changelog_entry_key(epoch: u64, seq: u64) -> Vec<u8> {
+    let mut k = changelog_epoch_prefix(epoch);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+pub(crate) struct ChangelogTxCtx {
+    epoch: u64,
+    next_seq: u64,
+}
+
+impl ChangelogTxCtx {
+    pub(crate) fn load(
+        changelog: &sled::transaction::TransactionalTree,
+    ) -> Result<Self, sled::transaction::UnabortableTransactionError> {
+        let epoch = changelog
+            .get(CHANGELOG_EPOCH_KEY)?
+            .and_then(|v| (v.len() == 8).then_some(v))
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(v.as_ref());
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+
+        let seq = changelog
+            .get(CHANGELOG_SEQ_KEY)?
+            .and_then(|v| (v.len() == 8).then_some(v))
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(v.as_ref());
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+        Ok(Self {
+            epoch,
+            next_seq: seq,
+        })
+    }
+
+    pub(crate) fn store(
+        &self,
+        changelog: &sled::transaction::TransactionalTree,
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        changelog.insert(CHANGELOG_SEQ_KEY, self.next_seq.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    pub(crate) fn record_put(
+        &mut self,
+        changelog: &sled::transaction::TransactionalTree,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry_key = changelog_entry_key(self.epoch, self.next_seq);
+        let value_hash = blake3::hash(value).to_hex().to_string();
+        let entry = ChangelogEntryV1 {
+            schema_version: CHANGELOG_VERSION_V1,
+            epoch: self.epoch,
+            seq: self.next_seq,
+            op: ChangelogOp::Put.as_str().to_string(),
+            key_hex: hex::encode(key),
+            value_b64: Some(base64::engine::general_purpose::STANDARD.encode(value)),
+            value_hash,
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap_or_default();
+        changelog.insert(entry_key, bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn record_del(
+        &mut self,
+        changelog: &sled::transaction::TransactionalTree,
+        key: &[u8],
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry_key = changelog_entry_key(self.epoch, self.next_seq);
+        let entry = ChangelogEntryV1 {
+            schema_version: CHANGELOG_VERSION_V1,
+            epoch: self.epoch,
+            seq: self.next_seq,
+            op: ChangelogOp::Del.as_str().to_string(),
+            key_hex: hex::encode(key),
+            value_b64: None,
+            value_hash: String::new(),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap_or_default();
+        changelog.insert(entry_key, bytes)?;
+        Ok(())
+    }
+}
+
 fn write_kv_record_v1<W: Write>(w: &mut W, k: &[u8], v: &[u8]) -> std::io::Result<()> {
     let k_len = u32::try_from(k.len()).unwrap_or(u32::MAX);
     let v_len = u32::try_from(v.len()).unwrap_or(u32::MAX);
@@ -353,4 +608,31 @@ fn read_kv_records_v1(mut bytes: &[u8]) -> Result<KvPairs, String> {
         out.push((k, v));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod changelog_tests {
+    use super::*;
+
+    #[test]
+    fn writes_emit_deterministic_changelog_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = FinStore::open(tmp.path()).expect("open");
+
+        store.set_changelog_epoch(7).expect("epoch");
+        store
+            .add_transfer_allow(crate::types::Hex32([1u8; 32]), "acc-a")
+            .expect("put");
+        store
+            .add_transfer_deny(crate::types::Hex32([1u8; 32]), "acc-b")
+            .expect("put2");
+
+        let entries = store.export_changelog_epoch_v1(7).expect("export");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].seq < entries[1].seq);
+        assert_eq!(entries[0].epoch, 7);
+        assert_eq!(entries[0].op, "put");
+        assert!(!entries[0].key_hex.is_empty());
+        assert!(entries[0].value_b64.is_some());
+    }
 }

@@ -2,11 +2,20 @@
 #![deny(clippy::float_arithmetic)]
 #![deny(clippy::float_cmp)]
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use sled::IVec;
+use sled::transaction::ConflictableTransactionError;
+use sled::transaction::TransactionError;
+use sled::Transactional;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+
+pub const RECON_CHANGELOG_VERSION_V1: u32 = 1;
+
+const CHANGELOG_EPOCH_KEY: &[u8] = b"changelog_epoch";
+const CHANGELOG_SEQ_KEY: &[u8] = b"changelog_seq";
+const CHANGELOG_PREFIX: &[u8] = b"changelog:";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconStoreError {
@@ -14,6 +23,21 @@ pub enum ReconStoreError {
     Db(#[from] sled::Error),
     #[error("serde error: {0}")]
     Serde(String),
+}
+
+/// A single deterministic change record written to the recon changelog.
+///
+/// This is an operational artifact used for incremental snapshots / bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconChangelogEntryV1 {
+    pub schema_version: u32,
+    pub epoch: u64,
+    pub seq: u64,
+    pub op: String,
+    pub key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_b64: Option<String>,
+    pub value_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -65,20 +89,23 @@ pub struct ReconItem {
 #[derive(Debug, Clone)]
 pub struct ReconStore {
     tree: sled::Tree,
+    changelog: sled::Tree,
 }
 
 impl ReconStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReconStoreError> {
         let db = sled::open(path)?;
         let tree = db.open_tree("fin-node-recon")?;
-        Ok(Self { tree })
+        let changelog = db.open_tree("fin-node-recon-changelog")?;
+        Ok(Self { tree, changelog })
     }
 
     #[allow(dead_code)]
     pub fn open_temporary() -> Result<Self, ReconStoreError> {
         let db = sled::Config::new().temporary(true).open()?;
         let tree = db.open_tree("fin-node-recon")?;
-        Ok(Self { tree })
+        let changelog = db.open_tree("fin-node-recon-changelog")?;
+        Ok(Self { tree, changelog })
     }
 
     pub fn enqueue(
@@ -87,8 +114,9 @@ impl ReconStore {
         id: &str,
         meta: &ReconMetadata,
     ) -> Result<(), ReconStoreError> {
-        self.tree
-            .insert(key_pending(kind, id), IVec::from(encode_meta(meta)?))?;
+        let k = key_pending(kind, id);
+        let v = encode_meta(meta)?;
+        self.tx_put(&k, &v)?;
         Ok(())
     }
 
@@ -120,7 +148,8 @@ impl ReconStore {
     }
 
     pub fn dequeue(&self, kind: ReconKind, id: &str) -> Result<(), ReconStoreError> {
-        let _ = self.tree.remove(key_pending(kind, id))?;
+        let k = key_pending(kind, id);
+        self.tx_del(&k)?;
         Ok(())
     }
 
@@ -264,6 +293,98 @@ impl ReconStore {
         }
         Ok(())
     }
+
+    /// Low-level write used by bootstrap restore (bypasses changelog).
+    pub fn raw_put(&self, key: &[u8], value: &[u8]) -> Result<(), ReconStoreError> {
+        self.tree.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Low-level delete used by bootstrap restore (bypasses changelog).
+    pub fn raw_del(&self, key: &[u8]) -> Result<(), ReconStoreError> {
+        let _ = self.tree.remove(key)?;
+        Ok(())
+    }
+
+    pub fn changelog_epoch(&self) -> Result<u64, ReconStoreError> {
+        Ok(changelog_epoch_get(&self.changelog)?)
+    }
+
+    pub fn set_changelog_epoch(&self, epoch: u64) -> Result<(), ReconStoreError> {
+        self.changelog
+            .insert(CHANGELOG_EPOCH_KEY, epoch.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    pub fn export_changelog_epoch_v1(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<ReconChangelogEntryV1>, ReconStoreError> {
+        let mut out = Vec::new();
+        let prefix = changelog_epoch_prefix(epoch);
+        for r in self.changelog.scan_prefix(prefix) {
+            let (_k, v) = r?;
+            let e: ReconChangelogEntryV1 = serde_json::from_slice(&v)
+                .map_err(|e| ReconStoreError::Serde(format!("changelog decode failed: {e}")))?;
+            out.push(e);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_changelog_epoch(&self, epoch: u64) -> Result<(), ReconStoreError> {
+        let prefix = changelog_epoch_prefix(epoch);
+        let keys: Vec<Vec<u8>> = self
+            .changelog
+            .scan_prefix(prefix)
+            .filter_map(|r| r.ok().map(|(k, _)| k.to_vec()))
+            .collect();
+        for k in keys {
+            let _ = self.changelog.remove(k)?;
+        }
+        Ok(())
+    }
+
+    fn tx_put(&self, key: &[u8], value: &[u8]) -> Result<(), ReconStoreError> {
+        let r: Result<(), TransactionError<String>> =
+            (&self.tree, &self.changelog).transaction(|(t, c)| {
+                let mut ctx = ReconChangelogTxCtx::load(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                t.insert(key, value)?;
+                ctx.record_put(c, key, value)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                ctx.store(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                Ok(())
+            });
+        match r {
+            Ok(()) => Ok(()),
+            Err(TransactionError::Storage(e)) => Err(ReconStoreError::Db(e)),
+            Err(TransactionError::Abort(e)) => {
+                Err(ReconStoreError::Serde(format!("changelog tx aborted: {e}")))
+            }
+        }
+    }
+
+    fn tx_del(&self, key: &[u8]) -> Result<(), ReconStoreError> {
+        let r: Result<(), TransactionError<String>> =
+            (&self.tree, &self.changelog).transaction(|(t, c)| {
+                let mut ctx = ReconChangelogTxCtx::load(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                let _ = t.remove(key)?;
+                ctx.record_del(c, key)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                ctx.store(c)
+                    .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+                Ok(())
+            });
+        match r {
+            Ok(()) => Ok(()),
+            Err(TransactionError::Storage(e)) => Err(ReconStoreError::Db(e)),
+            Err(TransactionError::Abort(e)) => {
+                Err(ReconStoreError::Serde(format!("changelog tx aborted: {e}")))
+            }
+        }
+    }
 }
 
 fn key_pending(kind: ReconKind, id: &str) -> Vec<u8> {
@@ -291,6 +412,118 @@ fn encode_meta(meta: &ReconMetadata) -> Result<Vec<u8>, ReconStoreError> {
 
 fn decode_meta(v: &[u8]) -> Result<ReconMetadata, ReconStoreError> {
     serde_json::from_slice(v).map_err(|e| ReconStoreError::Serde(e.to_string()))
+}
+
+fn changelog_epoch_get(changelog: &sled::Tree) -> Result<u64, sled::Error> {
+    let Some(v) = changelog.get(CHANGELOG_EPOCH_KEY)? else {
+        return Ok(0);
+    };
+    if v.len() != 8 {
+        return Ok(0);
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(v.as_ref());
+    Ok(u64::from_be_bytes(b))
+}
+
+fn changelog_epoch_prefix(epoch: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(CHANGELOG_PREFIX.len() + 8 + 1);
+    p.extend_from_slice(CHANGELOG_PREFIX);
+    p.extend_from_slice(&epoch.to_be_bytes());
+    p.push(b':');
+    p
+}
+
+fn changelog_entry_key(epoch: u64, seq: u64) -> Vec<u8> {
+    let mut k = changelog_epoch_prefix(epoch);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
+}
+
+struct ReconChangelogTxCtx {
+    epoch: u64,
+    next_seq: u64,
+}
+
+impl ReconChangelogTxCtx {
+    fn load(
+        changelog: &sled::transaction::TransactionalTree,
+    ) -> Result<Self, sled::transaction::UnabortableTransactionError> {
+        let epoch = changelog
+            .get(CHANGELOG_EPOCH_KEY)?
+            .and_then(|v| (v.len() == 8).then_some(v))
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(v.as_ref());
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+        let seq = changelog
+            .get(CHANGELOG_SEQ_KEY)?
+            .and_then(|v| (v.len() == 8).then_some(v))
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(v.as_ref());
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+        Ok(Self {
+            epoch,
+            next_seq: seq,
+        })
+    }
+
+    fn store(
+        &self,
+        changelog: &sled::transaction::TransactionalTree,
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        changelog.insert(CHANGELOG_SEQ_KEY, self.next_seq.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    fn record_put(
+        &mut self,
+        changelog: &sled::transaction::TransactionalTree,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry_key = changelog_entry_key(self.epoch, self.next_seq);
+        let value_hash = blake3::hash(value).to_hex().to_string();
+        let entry = ReconChangelogEntryV1 {
+            schema_version: RECON_CHANGELOG_VERSION_V1,
+            epoch: self.epoch,
+            seq: self.next_seq,
+            op: "put".to_string(),
+            key_hex: hex::encode(key),
+            value_b64: Some(base64::engine::general_purpose::STANDARD.encode(value)),
+            value_hash,
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap_or_default();
+        changelog.insert(entry_key, bytes)?;
+        Ok(())
+    }
+
+    fn record_del(
+        &mut self,
+        changelog: &sled::transaction::TransactionalTree,
+        key: &[u8],
+    ) -> Result<(), sled::transaction::UnabortableTransactionError> {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry_key = changelog_entry_key(self.epoch, self.next_seq);
+        let entry = ReconChangelogEntryV1 {
+            schema_version: RECON_CHANGELOG_VERSION_V1,
+            epoch: self.epoch,
+            seq: self.next_seq,
+            op: "del".to_string(),
+            key_hex: hex::encode(key),
+            value_b64: None,
+            value_hash: String::new(),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap_or_default();
+        changelog.insert(entry_key, bytes)?;
+        Ok(())
+    }
 }
 
 fn write_kv_record_v1<W: Write>(w: &mut W, k: &[u8], v: &[u8]) -> std::io::Result<()> {

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
+use crate::bootstrap_store::BootstrapStore;
 use crate::metrics;
 use crate::policy_runtime::{ComplianceStrategy, PolicyRuntime};
 use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
@@ -32,6 +33,7 @@ pub struct DataApi {
     policy: PolicyRuntime,
     recon: Option<ReconStore>,
     limits: hub_data::validation::ValidationLimits,
+    bootstrap: Option<BootstrapStore>,
 }
 
 impl DataApi {
@@ -48,6 +50,7 @@ impl DataApi {
             policy: PolicyRuntime::default(),
             recon: None,
             limits: hub_data::validation::ValidationLimits::default(),
+            bootstrap: None,
         }
     }
 
@@ -93,7 +96,13 @@ impl DataApi {
             policy,
             recon,
             limits,
+            bootstrap: None,
         }
+    }
+
+    pub fn with_bootstrap(mut self, bootstrap: Option<BootstrapStore>) -> Self {
+        self.bootstrap = bootstrap;
+        self
     }
 
     pub fn submit_register_dataset(
@@ -578,6 +587,13 @@ impl DataApi {
         let bytes =
             serde_json::to_vec_pretty(receipt).map_err(|e| ApiError::Internal(e.to_string()))?;
         fs::write(&out, &bytes).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        if let Some(b) = self.bootstrap.as_ref() {
+            if let Ok(rel) = out.strip_prefix(&self.receipts_dir) {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                let _ = b.record_put("receipts", rel_s.as_bytes(), &bytes);
+            }
+        }
 
         // Store a copy in sled under `receipt:<action_id>`
         let action_id = Hex32::from_hex(&receipt.action_id)
