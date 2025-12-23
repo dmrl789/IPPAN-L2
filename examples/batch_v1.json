@@ -1,0 +1,18 @@
+{
+  "contract_version": "v1",
+  "hub": "Fin",
+  "batch_id": "batch-fixture-001",
+  "sequence": 7,
+  "tx_count": 1,
+  "commitment": null,
+  "fee": 1000000,
+  "payload": {
+    "contract_version": "v1",
+    "hub": "Fin",
+    "schema_version": "hub-fin.payload.v1",
+    "content_type": "application/json",
+    "payload": "eyJ0eHMiOlt7InR4X2lkIjoidHgtMDAxIiwia2luZCI6ImRlbW8ifV19"
+  },
+  "idempotency_key": "Xiii74zil-899z8QwBF8uLHv7fumyEPcT1Gf23UPzlQ"
+}
+

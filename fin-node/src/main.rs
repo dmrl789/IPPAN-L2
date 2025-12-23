@@ -8,8 +8,12 @@ use hub_fin::{
     HUB_ID,
 };
 use l2_core::{
-    AccountId, AssetId, FixedAmount, L1EndpointConfig, L1SettlementClient, L2BatchId,
-    SettlementError, SettlementRequest, SettlementResult,
+    l1_contract::{
+        http_client::{HttpL1Client, L1RpcConfig},
+        mock_client::MockL1Client,
+        L1Client, L2BatchEnvelopeV1,
+    },
+    AccountId, AssetId, FixedAmount, L2BatchId,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,9 +25,27 @@ use std::fs;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "IPPAN FIN Hub (dev stub)")]
 struct Args {
+    /// L1 mode:
+    /// - mock: offline deterministic mock client (default)
+    /// - http: real HTTP adapter (requires endpoint map in config)
+    #[arg(long, value_enum, default_value_t = L1Mode::Mock)]
+    l1_mode: L1Mode,
+
+    /// Print L1 chain status (smoke path) and exit.
+    #[arg(long, default_value_t = false)]
+    smoke_l1: bool,
+
+    /// Submit a prebuilt contract envelope (v1) JSON file to L1 and exit.
+    #[arg(long)]
+    submit_batch: Option<String>,
+
     /// Batch identifier to use for the demo batch.
     #[arg(long, default_value = "demo-batch-001")]
     batch_id: String,
+
+    /// Monotonic sequence number for the demo batch envelope.
+    #[arg(long, default_value_t = 0)]
+    sequence: u64,
 
     /// Path to a TOML config file describing the L1 endpoint (optional).
     #[arg(long)]
@@ -60,96 +82,96 @@ struct Args {
 
 #[derive(Debug, serde::Deserialize)]
 struct FinNodeConfig {
-    pub l1: L1EndpointConfig,
+    #[serde(default)]
+    pub l1: Option<L1RpcConfig>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum L1Mode {
+    Mock,
+    Http,
+}
+
+fn resolve_env_refs(mut v: toml::Value) -> Result<toml::Value, String> {
+    fn walk(v: &mut toml::Value) -> Result<(), String> {
+        match v {
+            toml::Value::String(s) => {
+                if let Some(var) = s.strip_prefix("env:") {
+                    let var = var.trim();
+                    if var.is_empty() {
+                        return Err("invalid env: reference (empty var name)".to_string());
+                    }
+                    let val = std::env::var(var)
+                        .map_err(|_| format!("missing required environment variable: {var}"))?;
+                    *s = val;
+                }
+            }
+            toml::Value::Array(arr) => {
+                for x in arr {
+                    walk(x)?;
+                }
+            }
+            toml::Value::Table(map) => {
+                for (_, x) in map.iter_mut() {
+                    walk(x)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    walk(&mut v)?;
+    Ok(v)
 }
 
 fn load_config(path: &str) -> Result<FinNodeConfig, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
-    toml::from_str::<FinNodeConfig>(&raw).map_err(|e| format!("failed to parse config {path}: {e}"))
-}
-
-/// Dummy L1 client that simulates successful settlement.
-struct DummyL1Client;
-
-impl L1SettlementClient for DummyL1Client {
-    fn submit_settlement(
-        &self,
-        request: SettlementRequest,
-    ) -> Result<SettlementResult, SettlementError> {
-        let batch_id = request.batch.batch_id;
-        Ok(SettlementResult {
-            hub: request.hub,
-            batch_id,
-            l1_reference: "dummy-l1-tx".to_string(),
-            finalised: true,
-        })
-    }
-}
-
-/// HTTP-based L1 client that sends settlement requests to IPPAN CORE.
-///
-/// This is a simple, blocking implementation for early integration.
-struct HttpL1Client {
-    config: L1EndpointConfig,
-}
-
-impl HttpL1Client {
-    pub fn new(config: L1EndpointConfig) -> Self {
-        Self { config }
-    }
-
-    fn endpoint_url(&self) -> String {
-        // For now we assume a generic settlement path.
-        // Example: http://host:port/l2/settle
-        format!("{}/l2/settle", self.config.base_url.trim_end_matches('/'))
-    }
-}
-
-impl L1SettlementClient for HttpL1Client {
-    fn submit_settlement(
-        &self,
-        request: SettlementRequest,
-    ) -> Result<SettlementResult, SettlementError> {
-        // Serialize request to JSON.
-        let url = self.endpoint_url();
-        let client = reqwest::blocking::Client::new();
-
-        let mut req_builder = client.post(url).json(&request);
-
-        if let Some(ref api_key) = self.config.api_key {
-            req_builder = req_builder.header("Authorization", api_key);
-        }
-
-        let resp = req_builder
-            .send()
-            .map_err(|e| SettlementError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(SettlementError::Rejected(format!(
-                "HTTP status {}",
-                resp.status()
-            )));
-        }
-
-        let result: SettlementResult = resp
-            .json()
-            .map_err(|e| SettlementError::Internal(e.to_string()))?;
-
-        Ok(result)
-    }
+    let parsed: toml::Value =
+        toml::from_str(&raw).map_err(|e| format!("failed to parse config {path}: {e}"))?;
+    let resolved = resolve_env_refs(parsed)?;
+    resolved
+        .try_into::<FinNodeConfig>()
+        .map_err(|e| format!("failed to decode config {path}: {e}"))
 }
 
 fn main() {
     let args = Args::parse();
 
-    // NOTE: HttpL1Client is implemented but not yet wired in.
-    // This will be enabled once the L1 /l2/settle endpoint is stable.
-    let _http_client = args.config.as_ref().map(|path| {
-        let cfg = load_config(path).expect("failed to load config");
-        HttpL1Client::new(cfg.l1)
-    });
+    let cfg = args
+        .config
+        .as_deref()
+        .map(load_config)
+        .transpose()
+        .expect("failed to load config");
 
-    let client = DummyL1Client;
+    let client: Box<dyn L1Client> = match args.l1_mode {
+        L1Mode::Mock => Box::new(MockL1Client::default()),
+        L1Mode::Http => {
+            let l1 = cfg
+                .as_ref()
+                .and_then(|c| c.l1.clone())
+                .expect("missing [l1] config for --l1-mode http");
+            Box::new(HttpL1Client::new(l1).expect("invalid L1 HTTP config"))
+        }
+    };
+
+    if args.smoke_l1 {
+        let status = client.chain_status().expect("chain_status");
+        println!("{}", serde_json::to_string_pretty(&status).unwrap());
+        return;
+    }
+
+    if let Some(path) = args.submit_batch.as_deref() {
+        let raw = fs::read_to_string(path).expect("failed to read batch file");
+        let env: L2BatchEnvelopeV1 =
+            serde_json::from_str(&raw).expect("invalid L2BatchEnvelopeV1 JSON");
+        env.validate().expect("envelope validation failed");
+        let result = client.submit_batch(&env).expect("submit_batch");
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        return;
+    }
+
     let asset = AssetId::new(args.asset_id.clone());
     let from = AccountId::new(args.from.clone());
     let to = AccountId::new(args.to.clone());
@@ -167,7 +189,7 @@ fn main() {
         },
     );
     let store = InMemoryFinStateStore::with_state(seeded);
-    let engine = FinHubEngine::new(client, store);
+    let engine = FinHubEngine::new(store);
 
     let txs = vec![
         FinTransaction {
@@ -193,9 +215,11 @@ fn main() {
     let batch_id = L2BatchId(args.batch_id);
     let fee = FixedAmount::from_units(1, 6);
 
-    let result = engine
-        .submit_batch(batch_id.clone(), &txs, fee)
-        .expect("settlement");
+    let env = engine
+        .build_batch_envelope_v1(batch_id.clone(), args.sequence, &txs, fee)
+        .expect("build_batch_envelope_v1");
+
+    let submit = client.submit_batch(&env).expect("submit_batch");
 
     let state = engine.snapshot_state();
     let from_account = AccountId::new(args.from);
@@ -218,8 +242,8 @@ fn main() {
     let output = serde_json::json!({
         "hub": format!("{:?}", HUB_ID),
         "batch_id": batch_id.0,
-        "l1_reference": result.l1_reference,
-        "finalised": result.finalised,
+        "idempotency_key": env.idempotency_key,
+        "l1": submit,
         "asset_id": asset_id.0,
         "decimals": args.decimals,
         "balances": {

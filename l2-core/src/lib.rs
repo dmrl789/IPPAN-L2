@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod l1_contract;
+
 /// Generic transaction envelope shared by all IPPAN L2 hubs.
 ///
 /// This structure provides a deterministic wrapper around a hub identifier,

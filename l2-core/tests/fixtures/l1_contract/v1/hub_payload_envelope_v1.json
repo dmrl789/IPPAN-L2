@@ -1,0 +1,8 @@
+{
+  "contract_version": "v1",
+  "hub": "Fin",
+  "schema_version": "hub-fin.payload.v1",
+  "content_type": "application/json",
+  "payload": "eyJ0eHMiOlt7InR4X2lkIjoidHgtMDAxIiwia2luZCI6ImRlbW8ifV19"
+}
+

@@ -1,3 +1,10 @@
 [l1]
 base_url = "http://127.0.0.1:8080"
 api_key = ""
+timeout_ms = 10000
+
+[l1.endpoints]
+chain_status = ""
+submit_batch = ""
+get_inclusion = ""
+get_finality = ""

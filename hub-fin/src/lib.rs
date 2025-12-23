@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
-use l2_core::{
-    AccountId, AssetId, FixedAmount, L1SettlementClient, L2Batch, L2BatchId, L2HubId,
-    SettlementError, SettlementRequest, SettlementResult,
-};
+use l2_core::l1_contract::{Base64Bytes, FixedAmountV1, HubPayloadEnvelopeV1, L2BatchEnvelopeV1};
+use l2_core::{AccountId, AssetId, FixedAmount, L2BatchId, L2HubId, SettlementError};
 
 /// Logical identifier used for IPPAN FIN batches.
 pub const HUB_ID: L2HubId = L2HubId::Fin;
+pub const FIN_PAYLOAD_SCHEMA_V1: &str = "hub-fin.payload.v1";
+pub const FIN_PAYLOAD_CONTENT_TYPE_V1: &str = "application/json";
 
 /// Represents the balance of multiple assets for a single account.
 #[derive(Debug, Default, Clone)]
@@ -283,17 +283,31 @@ pub struct FinTransaction {
     pub op: FinOperation,
 }
 
+/// Build a hub payload envelope (v1) from FIN transactions.
+pub fn to_hub_payload_envelope_v1(
+    txs: &[FinTransaction],
+) -> Result<HubPayloadEnvelopeV1, SettlementError> {
+    let payload = serde_json::to_vec(txs)
+        .map_err(|e| SettlementError::Internal(format!("failed to serialize fin payload: {e}")))?;
+    Ok(HubPayloadEnvelopeV1 {
+        contract_version: l2_core::l1_contract::ContractVersion::V1,
+        hub: HUB_ID,
+        schema_version: FIN_PAYLOAD_SCHEMA_V1.to_string(),
+        content_type: FIN_PAYLOAD_CONTENT_TYPE_V1.to_string(),
+        payload: Base64Bytes(payload),
+    })
+}
+
 /// Engine responsible for building L2 batches from FIN transactions
-/// and submitting them to IPPAN CORE.
-pub struct FinHubEngine<C: L1SettlementClient, S: FinStateStore> {
-    client: C,
+/// and producing deterministic envelopes for submission to IPPAN CORE.
+pub struct FinHubEngine<S: FinStateStore> {
     store: S,
 }
 
-impl<C: L1SettlementClient, S: FinStateStore> FinHubEngine<C, S> {
-    /// Create a new engine with the given settlement client and state store.
-    pub fn new(client: C, store: S) -> Self {
-        Self { client, store }
+impl<S: FinStateStore> FinHubEngine<S> {
+    /// Create a new engine with the given state store.
+    pub fn new(store: S) -> Self {
+        Self { store }
     }
 
     /// Return a deterministic, read-only snapshot of the current FIN state.
@@ -301,14 +315,15 @@ impl<C: L1SettlementClient, S: FinStateStore> FinHubEngine<C, S> {
         self.store.load_state()
     }
 
-    /// Apply a list of FIN transactions to the state and then submit a batch
-    /// to IPPAN CORE for settlement.
-    pub fn submit_batch(
+    /// Apply a list of FIN transactions to the state and then build an L1-submittable
+    /// contract envelope (v1). The hub does **not** talk to L1 directly.
+    pub fn build_batch_envelope_v1(
         &self,
         batch_id: L2BatchId,
+        sequence: u64,
         txs: &[FinTransaction],
         fee: FixedAmount,
-    ) -> Result<SettlementResult, SettlementError> {
+    ) -> Result<L2BatchEnvelopeV1, SettlementError> {
         // Load current state.
         let mut state = self.store.load_state();
 
@@ -324,14 +339,18 @@ impl<C: L1SettlementClient, S: FinStateStore> FinHubEngine<C, S> {
             .save_state(&state)
             .map_err(|e| SettlementError::Internal(format!("save error: {e}")))?;
 
-        let batch = L2Batch::new(HUB_ID, batch_id, txs.len() as u64);
-        let request = SettlementRequest {
-            hub: HUB_ID,
-            batch,
-            fee,
-        };
-
-        self.client.submit_settlement(request)
+        let payload = to_hub_payload_envelope_v1(txs)?;
+        let fee_v1 = FixedAmountV1(fee.into_scaled());
+        L2BatchEnvelopeV1::new(
+            HUB_ID,
+            batch_id.0,
+            sequence,
+            txs.len() as u64,
+            None,
+            fee_v1,
+            payload,
+        )
+        .map_err(|e| SettlementError::Internal(format!("contract error: {e}")))
     }
 }
 
@@ -339,27 +358,10 @@ impl<C: L1SettlementClient, S: FinStateStore> FinHubEngine<C, S> {
 mod tests {
     use super::*;
 
-    struct DummyClient;
-
-    impl L1SettlementClient for DummyClient {
-        fn submit_settlement(
-            &self,
-            request: SettlementRequest,
-        ) -> Result<SettlementResult, SettlementError> {
-            Ok(SettlementResult {
-                hub: request.hub,
-                batch_id: request.batch.batch_id,
-                l1_reference: "dummy".to_string(),
-                finalised: true,
-            })
-        }
-    }
-
     #[test]
-    fn fin_hub_engine_submits_batch() {
-        let client = DummyClient;
+    fn fin_hub_engine_builds_batch_envelope_and_updates_state() {
         let store = InMemoryFinStateStore::new();
-        let engine = FinHubEngine::new(client, store);
+        let engine = FinHubEngine::new(store);
 
         let asset = AssetId::new("asset-eur-stable");
         let from = AccountId::new("acc-alice");
@@ -397,10 +399,14 @@ mod tests {
         let batch_id = L2BatchId("batch-001".to_string());
         let fee = FixedAmount::from_units(1, 6); // 1.000000
 
-        let result = engine.submit_batch(batch_id.clone(), &txs, fee).unwrap();
-        assert_eq!(result.hub, HUB_ID);
-        assert_eq!(result.batch_id.0, batch_id.0);
-        assert!(result.finalised);
+        let env = engine
+            .build_batch_envelope_v1(batch_id.clone(), 0, &txs, fee)
+            .unwrap();
+        assert_eq!(env.hub, HUB_ID);
+        assert_eq!(env.batch_id, batch_id.0);
+        assert_eq!(env.tx_count, 3);
+        assert_eq!(env.fee.0, 1_000_000);
+        assert!(!env.idempotency_key.as_bytes().iter().all(|b| *b == 0));
 
         let snapshot = engine.snapshot_state();
         let from_balance = snapshot
@@ -417,6 +423,26 @@ mod tests {
             .into_scaled();
         assert_eq!(from_balance, 10_000_000); // 10.000000
         assert_eq!(to_balance, 10_000_000); // 10.000000
+    }
+
+    #[test]
+    fn fin_payload_canonical_hash_is_stable_for_identical_inputs() {
+        let txs = vec![FinTransaction {
+            tx_id: "tx-1".to_string(),
+            op: FinOperation::RegisterFungibleAsset {
+                asset_id: AssetId::new("asset-eurx"),
+                symbol: "EURX".to_string(),
+                name: "Euro Stable".to_string(),
+                decimals: 6,
+            },
+        }];
+
+        let a = to_hub_payload_envelope_v1(&txs).unwrap();
+        let b = to_hub_payload_envelope_v1(&txs).unwrap();
+        assert_eq!(
+            a.canonical_hash_blake3().unwrap(),
+            b.canonical_hash_blake3().unwrap()
+        );
     }
 
     #[test]
