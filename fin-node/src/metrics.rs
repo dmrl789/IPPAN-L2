@@ -3,7 +3,7 @@
 #![allow(clippy::disallowed_types)]
 
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, Gauge, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, Gauge, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use std::time::Instant;
 
 static START: Lazy<Instant> = Lazy::new(Instant::now);
@@ -48,6 +48,36 @@ pub static PROCESS_UPTIME_SECONDS: Lazy<Gauge> = Lazy::new(|| {
     .expect("metric");
     REGISTRY.register(Box::new(g.clone())).expect("register");
     g
+});
+
+pub static RECON_PENDING_TOTAL: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new("recon_pending_total", "Total pending reconciliation items"),
+        &["kind"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+pub static RECON_CHECKS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("recon_checks_total", "Total reconciliation checks"),
+        &["kind", "result"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static RECON_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("recon_failures_total", "Total reconciliation failures"),
+        &["kind", "reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
 });
 
 pub fn gather_text() -> String {

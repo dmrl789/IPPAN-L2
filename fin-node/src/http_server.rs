@@ -4,6 +4,7 @@ use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
 use crate::linkage::{ApiError as LinkageApiError, BuyLicenseRequestV1, LinkageApi};
 use crate::metrics;
+use crate::recon_store::ReconStore;
 use l2_core::l1_contract::{L1ChainStatus, L1Client};
 use serde::Serialize;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ struct L1StatusSummary<'a> {
     error: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     bind: &str,
     l1: Arc<dyn L1Client + Send + Sync>,
@@ -41,6 +43,7 @@ pub fn serve(
     fin_api: FinApi,
     data_api: DataApi,
     linkage_api: LinkageApi,
+    recon: Option<ReconStore>,
 ) -> Result<(), String> {
     let server =
         Server::http(bind).map_err(|e| format!("failed to bind http server on {bind}: {e}"))?;
@@ -77,6 +80,22 @@ pub fn serve(
             }
             ("GET", "/metrics") => {
                 Response::from_string("metrics disabled\n").with_status_code(404)
+            }
+            ("GET", "/recon/pending") => {
+                if let Some(store) = recon.as_ref() {
+                    let list = store
+                        .list_pending(500)
+                        .map_err(|e| format!("failed listing recon pending: {e}"))?;
+                    json_response(
+                        200,
+                        &serde_json::json!({"schema_version": 1, "pending": list}),
+                    )
+                } else {
+                    json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "recon_disabled"}),
+                    )
+                }
             }
             ("POST", "/fin/actions") => {
                 let mut body = Vec::new();
@@ -378,8 +397,42 @@ pub fn serve(
                     Err(e) => api_error_response(e),
                 }
             }
+            ("GET", p) if p.starts_with("/receipts/fin/") => {
+                let action_id = p.trim_start_matches("/receipts/fin/");
+                match fin_api.get_receipt(action_id) {
+                    Ok(Some(raw)) => {
+                        let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                            .unwrap();
+                        Response::from_data(raw)
+                            .with_status_code(200)
+                            .with_header(h)
+                    }
+                    Ok(None) => json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
+                    ),
+                    Err(e) => api_error_response(e),
+                }
+            }
             ("GET", p) if p.starts_with("/data/receipts/") => {
                 let action_id = p.trim_start_matches("/data/receipts/");
+                match data_api.get_receipt(action_id) {
+                    Ok(Some(raw)) => {
+                        let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                            .unwrap();
+                        Response::from_data(raw)
+                            .with_status_code(200)
+                            .with_header(h)
+                    }
+                    Ok(None) => json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
+                    ),
+                    Err(e) => data_api_error_response(e),
+                }
+            }
+            ("GET", p) if p.starts_with("/receipts/data/") => {
+                let action_id = p.trim_start_matches("/receipts/data/");
                 match data_api.get_receipt(action_id) {
                     Ok(Some(raw)) => {
                         let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])

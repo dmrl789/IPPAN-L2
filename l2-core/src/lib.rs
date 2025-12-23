@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod finality;
 pub mod hub_linkage;
 pub mod l1_contract;
 pub mod policy;

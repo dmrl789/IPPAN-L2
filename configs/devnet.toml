@@ -53,6 +53,20 @@ metrics_enabled = true
 [storage]
 # Receipt output directory (relative to working directory or absolute).
 receipts_dir = "receipts"
+recon_db_dir = "recon_db"
+
+[recon]
+enabled = true
+# Devnet defaults: faster polling than prod.
+interval_secs = 10
+batch_limit = 50
+max_scan = 5000
+max_attempts = 50
+base_delay_secs = 2
+max_delay_secs = 300
+
+[linkage]
+entitlement_policy = "optimistic"
 
 [logging]
 level = "info"

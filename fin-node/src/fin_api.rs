@@ -6,6 +6,7 @@ use hub_fin::{
     apply_with_policy, ApplyOutcome, FinActionRequestV1, FinActionV1, FinEnvelopeV1, FinStore,
     Hex32,
 };
+use l2_core::finality::SubmitState;
 use l2_core::l1_contract::{
     FixedAmountV1, HubPayloadEnvelopeV1, L1Client, L1SubmitResult, L2BatchEnvelopeV1,
 };
@@ -18,6 +19,7 @@ use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
 use crate::policy_runtime::PolicyRuntime;
+use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
 
 #[derive(Clone)]
 pub struct FinApi {
@@ -25,6 +27,7 @@ pub struct FinApi {
     store: FinStore,
     receipts_dir: PathBuf,
     policy: PolicyRuntime,
+    recon: Option<ReconStore>,
 }
 
 impl FinApi {
@@ -39,20 +42,33 @@ impl FinApi {
             store,
             receipts_dir,
             policy: PolicyRuntime::default(),
+            recon: None,
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_with_policy(
         l1: Arc<dyn L1Client + Send + Sync>,
         store: FinStore,
         receipts_dir: PathBuf,
         policy: PolicyRuntime,
     ) -> Self {
+        Self::new_with_policy_and_recon(l1, store, receipts_dir, policy, None)
+    }
+
+    pub fn new_with_policy_and_recon(
+        l1: Arc<dyn L1Client + Send + Sync>,
+        store: FinStore,
+        receipts_dir: PathBuf,
+        policy: PolicyRuntime,
+        recon: Option<ReconStore>,
+    ) -> Self {
         Self {
             l1,
             store,
             receipts_dir,
             policy,
+            recon,
         }
     }
 
@@ -144,6 +160,13 @@ impl FinApi {
         // Also persist batch receipt (same format as CLI path) for operator parity.
         let _ = self.persist_batch_receipt(&batch, &submit);
 
+        // Enqueue for reconciliation (restart-safe).
+        if let Some(recon) = self.recon.as_ref() {
+            let now = unix_now_secs();
+            let meta = ReconMetadata::new(now);
+            let _ = recon.enqueue(ReconKind::FinAction, &context_id, &meta);
+        }
+
         Ok(SubmitActionResponseV1 {
             schema_version: 1,
             action_id: env.action_id.to_hex(),
@@ -197,6 +220,38 @@ impl FinApi {
         }
         let raw = fs::read(path).map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok(Some(raw))
+    }
+
+    pub fn get_receipt_typed(
+        &self,
+        action_id_hex: &str,
+    ) -> Result<Option<FinActionReceiptV1>, ApiError> {
+        let raw = match self.get_receipt(action_id_hex)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let v: FinActionReceiptV1 =
+            serde_json::from_slice(&raw).map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(Some(v))
+    }
+
+    #[allow(dead_code)]
+    pub fn update_submit_state(
+        &self,
+        action_id_hex: &str,
+        submit_state: SubmitState,
+    ) -> Result<(), ApiError> {
+        let mut r = self
+            .get_receipt_typed(action_id_hex)?
+            .ok_or_else(|| ApiError::Internal("missing fin receipt".to_string()))?;
+        r.submit_state = submit_state;
+        let _ = self.persist_action_receipt(&r)?;
+        Ok(())
+    }
+
+    pub fn persist_receipt_typed(&self, receipt: &FinActionReceiptV1) -> Result<(), ApiError> {
+        let _ = self.persist_action_receipt(receipt)?;
+        Ok(())
     }
 
     fn action_receipt_path(&self, action_id_hex: &str) -> PathBuf {
@@ -429,6 +484,8 @@ pub struct FinActionReceiptV1 {
     pub idempotency_key: String,
     pub batch_canonical_hash: String,
     pub l1_submit_result: L1SubmitResult,
+    #[serde(default)]
+    pub submit_state: SubmitState,
     pub written_at: String,
 }
 
@@ -448,8 +505,9 @@ impl FinActionReceiptV1 {
                 .canonical_hash_blake3()
                 .expect("batch canonical hash should be infallible"),
         );
+        let idempotency_key = b64url32(batch.idempotency_key.as_bytes());
         Self {
-            schema_version: 1,
+            schema_version: 2,
             action_id: action_id.to_hex(),
             local_apply_outcome: local.outcome,
             asset_id: local.asset_id.map(|x| x.to_hex()),
@@ -458,9 +516,13 @@ impl FinActionReceiptV1 {
             amount: local.amount.map(|x| x.0.to_string()),
             purchase_id: local.purchase_id.map(|x| x.to_hex()),
             batch_id: batch_id.to_string(),
-            idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
+            idempotency_key: idempotency_key.clone(),
             batch_canonical_hash,
             l1_submit_result: submit.clone(),
+            submit_state: SubmitState::Submitted {
+                idempotency_key,
+                l1_tx_id: submit.l1_tx_id.as_ref().map(|x| x.0.clone()),
+            },
             written_at,
         }
     }
@@ -468,4 +530,11 @@ impl FinActionReceiptV1 {
 
 fn b64url32(bytes: &[u8; 32]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

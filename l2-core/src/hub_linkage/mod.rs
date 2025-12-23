@@ -19,6 +19,8 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::finality::SubmitState;
+
 /// 32-byte identifier encoded as lowercase hex in JSON.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hex32(pub [u8; 32]);
@@ -106,6 +108,26 @@ pub enum LinkageStatus {
     FailedRecoverable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EntitlementPolicy {
+    #[default]
+    Optimistic,
+    FinalityRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkageOverallStatus {
+    #[default]
+    Created,
+    PaymentPendingFinality,
+    PaidFinal,
+    EntitlementPendingFinality,
+    EntitledFinal,
+    FailedRecoverable,
+}
+
 /// Resume-safe receipt persisted by fin-node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkageReceiptV1 {
@@ -121,6 +143,21 @@ pub struct LinkageReceiptV1 {
     pub payment_ref: Option<PaymentRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_ref: Option<EntitlementRef>,
+
+    /// L1 finality policy in effect for this purchase.
+    #[serde(default)]
+    pub policy: EntitlementPolicy,
+
+    /// L1 submit state for the FIN payment.
+    #[serde(default)]
+    pub payment_submit_state: SubmitState,
+    /// L1 submit state for the DATA entitlement grant.
+    #[serde(default)]
+    pub entitlement_submit_state: SubmitState,
+
+    /// Extended workflow status (v1).
+    #[serde(default)]
+    pub overall_status: LinkageOverallStatus,
 
     pub status: LinkageStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]

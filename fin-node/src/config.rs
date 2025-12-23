@@ -21,6 +21,10 @@ pub struct FinNodeConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub recon: ReconConfig,
+    #[serde(default)]
+    pub linkage: LinkageConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +88,8 @@ pub struct StorageConfig {
     pub data_db_dir: String,
     #[serde(default = "default_policy_db_dir")]
     pub policy_db_dir: String,
+    #[serde(default = "default_recon_db_dir")]
+    pub recon_db_dir: String,
 }
 
 fn default_receipts_dir() -> String {
@@ -102,6 +108,10 @@ fn default_policy_db_dir() -> String {
     "policy_db".to_string()
 }
 
+fn default_recon_db_dir() -> String {
+    "recon_db".to_string()
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +119,7 @@ impl Default for StorageConfig {
             fin_db_dir: default_fin_db_dir(),
             data_db_dir: default_data_db_dir(),
             policy_db_dir: default_policy_db_dir(),
+            recon_db_dir: default_recon_db_dir(),
         }
     }
 }
@@ -184,6 +195,83 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             format: default_log_format(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReconConfig {
+    #[serde(default = "default_recon_enabled")]
+    pub enabled: bool,
+    /// Base tick interval; due scheduling is still driven by `next_check_at`.
+    #[serde(default = "default_recon_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_recon_batch_limit")]
+    pub batch_limit: usize,
+    #[serde(default = "default_recon_max_scan")]
+    pub max_scan: usize,
+    #[serde(default = "default_recon_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_recon_base_delay_secs")]
+    pub base_delay_secs: u64,
+    #[serde(default = "default_recon_max_delay_secs")]
+    pub max_delay_secs: u64,
+}
+
+fn default_recon_enabled() -> bool {
+    true
+}
+fn default_recon_interval_secs() -> u64 {
+    30
+}
+fn default_recon_batch_limit() -> usize {
+    50
+}
+fn default_recon_max_scan() -> usize {
+    5_000
+}
+fn default_recon_max_attempts() -> u32 {
+    50
+}
+fn default_recon_base_delay_secs() -> u64 {
+    2
+}
+fn default_recon_max_delay_secs() -> u64 {
+    300
+}
+
+impl Default for ReconConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recon_enabled(),
+            interval_secs: default_recon_interval_secs(),
+            batch_limit: default_recon_batch_limit(),
+            max_scan: default_recon_max_scan(),
+            max_attempts: default_recon_max_attempts(),
+            base_delay_secs: default_recon_base_delay_secs(),
+            max_delay_secs: default_recon_max_delay_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkageConfig {
+    #[serde(default)]
+    pub entitlement_policy: LinkageEntitlementPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkageEntitlementPolicy {
+    #[default]
+    Optimistic,
+    FinalityRequired,
+}
+
+impl Default for LinkageConfig {
+    fn default() -> Self {
+        Self {
+            entitlement_policy: LinkageEntitlementPolicy::Optimistic,
         }
     }
 }
