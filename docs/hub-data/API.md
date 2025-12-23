@@ -83,6 +83,34 @@ curl -sS -X POST "http://127.0.0.1:3000/data/attestations" \
 
 Returns `attestation_id` + `action_id` + receipt metadata.
 
+### Create listing (priced sale offer)
+
+`POST /data/listings`
+
+Creates a deterministic listing for a dataset, priced in HUB-FIN microunits.
+
+```bash
+DATASET_ID="<DATASET_ID_HEX>"
+ASSET_ID="<HUB_FIN_ASSET_ID_HEX>"
+
+curl -sS -X POST "http://127.0.0.1:3000/data/listings" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"dataset_id\": \"${DATASET_ID}\",
+    \"licensor\": \"acc-alice\",
+    \"rights\": \"use\",
+    \"price_microunits\": \"1000000\",
+    \"currency_asset_id\": \"${ASSET_ID}\",
+    \"terms_uri\": \"https://example.com/terms/v1\",
+    \"terms_hash\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"
+  }"
+```
+
+Returns:
+- `listing_id` (hex, derived deterministically)
+- `action_id` (hex)
+- local apply outcome + L1 submit result + `receipt_path`
+
 ## Queries
 
 ### Get dataset
@@ -124,4 +152,31 @@ curl -sS "http://127.0.0.1:3000/data/licenses/<LICENSE_ID_HEX>"
 ```bash
 curl -sS "http://127.0.0.1:3000/data/receipts/<ACTION_ID_HEX>"
 ```
+
+### List listings for dataset
+
+`GET /data/listings?dataset_id=...`
+
+```bash
+curl -sS "http://127.0.0.1:3000/data/listings?dataset_id=<DATASET_ID_HEX>"
+```
+
+### List entitlements (who is entitled?)
+
+`GET /data/entitlements?dataset_id=...`
+
+```bash
+curl -sS "http://127.0.0.1:3000/data/entitlements?dataset_id=<DATASET_ID_HEX>&offset=0&limit=100"
+```
+
+`GET /data/entitlements?licensee=...`
+
+```bash
+curl -sS "http://127.0.0.1:3000/data/entitlements?licensee=acc-bob&offset=0&limit=100"
+```
+
+The entitlement rows include:
+- `purchase_id`, `dataset_id`, `listing_id`, `licensee`
+- `price_microunits`, `currency_asset_id`
+- `references` (`fin_action_id`, `fin_receipt_hash`, `data_action_id`, `license_id`)
 

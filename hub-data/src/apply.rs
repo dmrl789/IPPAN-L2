@@ -1,13 +1,15 @@
 #![forbid(unsafe_code)]
 
-use crate::actions::{DataActionV1, IssueLicenseV1, RegisterDatasetV1};
+use crate::actions::{
+    CreateListingV1, DataActionV1, GrantEntitlementV1, IssueLicenseV1, RegisterDatasetV1,
+};
 use crate::canonical::canonical_json_bytes;
 use crate::envelope::DataEnvelopeV1;
 use crate::store::{keys, DataStore, StoreError};
-use crate::types::{ActionId, AttestationId, DatasetId, LicenseId};
+use crate::types::{ActionId, AttestationId, DatasetId, LicenseId, ListingId};
 use crate::validation::{
-    validate_append_attestation_v1, validate_issue_license_v1, validate_register_dataset_v1,
-    ValidationError,
+    validate_append_attestation_v1, validate_create_listing_v1, validate_grant_entitlement_v1,
+    validate_issue_license_v1, validate_register_dataset_v1, ValidationError,
 };
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,10 @@ pub struct ApplyReceipt {
     pub license_id: Option<LicenseId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_id: Option<AttestationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_id: Option<ListingId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +114,8 @@ fn apply_tx(
             dataset_id: None,
             license_id: None,
             attestation_id: None,
+            listing_id: None,
+            purchase_id: None,
         });
     }
 
@@ -115,6 +123,8 @@ fn apply_tx(
         DataActionV1::RegisterDatasetV1(a) => apply_register_dataset_v1_tx(tree, action_id, a)?,
         DataActionV1::IssueLicenseV1(a) => apply_issue_license_v1_tx(tree, action_id, a)?,
         DataActionV1::AppendAttestationV1(a) => apply_append_attestation_v1_tx(tree, action_id, a)?,
+        DataActionV1::CreateListingV1(a) => apply_create_listing_v1_tx(tree, action_id, a)?,
+        DataActionV1::GrantEntitlementV1(a) => apply_grant_entitlement_v1_tx(tree, action_id, a)?,
     };
 
     let receipt_bytes = canonical_json_bytes(&receipt).map_err(|e| {
@@ -149,6 +159,8 @@ fn apply_register_dataset_v1_tx(
         dataset_id: Some(a.dataset_id),
         license_id: None,
         attestation_id: None,
+        listing_id: None,
+        purchase_id: None,
     })
 }
 
@@ -172,6 +184,8 @@ fn apply_issue_license_v1_tx(
             dataset_id: Some(a.dataset_id),
             license_id: Some(a.license_id),
             attestation_id: None,
+            listing_id: None,
+            purchase_id: None,
         });
     }
 
@@ -189,6 +203,8 @@ fn apply_issue_license_v1_tx(
         dataset_id: Some(a.dataset_id),
         license_id: Some(a.license_id),
         attestation_id: None,
+        listing_id: None,
+        purchase_id: None,
     })
 }
 
@@ -214,6 +230,8 @@ fn apply_append_attestation_v1_tx(
             dataset_id: Some(a.dataset_id),
             license_id: None,
             attestation_id: Some(a.attestation_id),
+            listing_id: None,
+            purchase_id: None,
         });
     }
 
@@ -231,6 +249,130 @@ fn apply_append_attestation_v1_tx(
         dataset_id: Some(a.dataset_id),
         license_id: None,
         attestation_id: Some(a.attestation_id),
+        listing_id: None,
+        purchase_id: None,
+    })
+}
+
+fn apply_create_listing_v1_tx(
+    tree: &TransactionalTree,
+    action_id: ActionId,
+    a: &CreateListingV1,
+) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
+    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
+    })?;
+    validate_create_listing_v1(a, &dataset.owner)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    if let Some(existing) = tree.get(keys::listing(a.listing_id))? {
+        let existing_listing: CreateListingV1 = serde_json::from_slice(&existing).map_err(|e| {
+            ConflictableTransactionError::Abort(TxError::Store(format!(
+                "failed decoding existing listing: {e}"
+            )))
+        })?;
+        if existing_listing == *a {
+            return Ok(ApplyReceipt {
+                schema_version: 1,
+                outcome: ApplyOutcome::AlreadyApplied,
+                action_id,
+                dataset_id: Some(a.dataset_id),
+                license_id: None,
+                attestation_id: None,
+                listing_id: Some(a.listing_id),
+                purchase_id: None,
+            });
+        }
+        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
+            "listing_id already exists with different definition".to_string(),
+        )));
+    }
+
+    let bytes = serde_json::to_vec(a)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+    tree.insert(keys::listing(a.listing_id), bytes)?;
+    tree.insert(
+        keys::listing_by_dataset(a.dataset_id, a.listing_id),
+        sled::IVec::from(&b"1"[..]),
+    )?;
+    Ok(ApplyReceipt {
+        schema_version: 1,
+        outcome: ApplyOutcome::Applied,
+        action_id,
+        dataset_id: Some(a.dataset_id),
+        license_id: None,
+        attestation_id: None,
+        listing_id: Some(a.listing_id),
+        purchase_id: None,
+    })
+}
+
+fn apply_grant_entitlement_v1_tx(
+    tree: &TransactionalTree,
+    action_id: ActionId,
+    a: &GrantEntitlementV1,
+) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
+    // Listing must exist (and be consistent with dataset_id).
+    let listing_bytes = tree.get(keys::listing(a.listing_id))?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("listing_id not found".to_string()))
+    })?;
+    let listing: CreateListingV1 = serde_json::from_slice(&listing_bytes).map_err(|e| {
+        ConflictableTransactionError::Abort(TxError::Store(format!("failed decoding listing: {e}")))
+    })?;
+    if listing.dataset_id != a.dataset_id {
+        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
+            "dataset_id does not match listing.dataset_id".to_string(),
+        )));
+    }
+
+    validate_grant_entitlement_v1(a)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    // Idempotency by purchase_id: duplicates are a success/no-op.
+    if let Some(existing) = tree.get(keys::entitlement(a.purchase_id))? {
+        let existing_ent: GrantEntitlementV1 = serde_json::from_slice(&existing).map_err(|e| {
+            ConflictableTransactionError::Abort(TxError::Store(format!(
+                "failed decoding existing entitlement: {e}"
+            )))
+        })?;
+        if existing_ent == *a {
+            return Ok(ApplyReceipt {
+                schema_version: 1,
+                outcome: ApplyOutcome::AlreadyApplied,
+                action_id,
+                dataset_id: Some(a.dataset_id),
+                license_id: Some(a.license_id),
+                attestation_id: None,
+                listing_id: Some(a.listing_id),
+                purchase_id: Some(a.purchase_id.to_hex()),
+            });
+        }
+        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
+            "entitlement already exists with different definition".to_string(),
+        )));
+    }
+
+    let bytes = serde_json::to_vec(a)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+    tree.insert(keys::entitlement(a.purchase_id), bytes)?;
+    tree.insert(
+        keys::ent_by_dataset(a.dataset_id, a.purchase_id),
+        sled::IVec::from(&b"1"[..]),
+    )?;
+    tree.insert(
+        keys::ent_by_licensee(&a.licensee.0, a.purchase_id),
+        sled::IVec::from(&b"1"[..]),
+    )?;
+
+    Ok(ApplyReceipt {
+        schema_version: 1,
+        outcome: ApplyOutcome::Applied,
+        action_id,
+        dataset_id: Some(a.dataset_id),
+        license_id: Some(a.license_id),
+        attestation_id: None,
+        listing_id: Some(a.listing_id),
+        purchase_id: Some(a.purchase_id.to_hex()),
     })
 }
 

@@ -20,14 +20,17 @@ pub mod types;
 pub mod validation;
 
 pub use actions::{
-    AppendAttestationRequestV1, AppendAttestationV1, DataActionRequestV1, DataActionV1,
+    AppendAttestationRequestV1, AppendAttestationV1, CreateListingRequestV1, CreateListingV1,
+    DataActionRequestV1, DataActionV1, GrantEntitlementRequestV1, GrantEntitlementV1,
     IssueLicenseRequestV1, IssueLicenseV1, LicenseRightsV1, RegisterDatasetRequestV1,
     RegisterDatasetV1,
 };
 pub use apply::{apply, ApplyOutcome, ApplyReceipt};
 pub use envelope::DataEnvelopeV1;
 pub use store::{DataStateSnapshotV1, DataStore, DatasetSnapshotV1};
-pub use types::{ActionId, AttestationId, DatasetId, Hex32, LicenseId, PriceMicrounitsU128};
+pub use types::{
+    ActionId, AttestationId, DatasetId, Hex32, LicenseId, ListingId, PriceMicrounitsU128,
+};
 
 use l2_core::l1_contract::{Base64Bytes, ContractVersion, HubPayloadEnvelopeV1};
 use l2_core::L2HubId;

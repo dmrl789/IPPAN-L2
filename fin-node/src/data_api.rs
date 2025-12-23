@@ -3,8 +3,9 @@
 use base64::Engine as _;
 use hub_data::apply::ApplyError as DataApplyError;
 use hub_data::{
-    apply, AppendAttestationRequestV1, ApplyOutcome, DataActionV1, DataEnvelopeV1, DataStore,
-    Hex32, IssueLicenseRequestV1, RegisterDatasetRequestV1,
+    apply, AppendAttestationRequestV1, ApplyOutcome, CreateListingRequestV1, CreateListingV1,
+    DataActionV1, DataEnvelopeV1, DataStore, GrantEntitlementV1, Hex32, IssueLicenseRequestV1,
+    RegisterDatasetRequestV1,
 };
 use l2_core::l1_contract::{
     FixedAmountV1, HubPayloadEnvelopeV1, L1Client, L1SubmitResult, L2BatchEnvelopeV1,
@@ -39,24 +40,36 @@ impl DataApi {
         &self,
         req: RegisterDatasetRequestV1,
     ) -> Result<SubmitDataActionResponseV1, ApiError> {
-        self.submit_action(hub_data::DataActionRequestV1::RegisterDatasetV1(req).into_action())
+        self.submit_action_obj(hub_data::DataActionRequestV1::RegisterDatasetV1(req).into_action())
     }
 
     pub fn submit_issue_license(
         &self,
         req: IssueLicenseRequestV1,
     ) -> Result<SubmitDataActionResponseV1, ApiError> {
-        self.submit_action(hub_data::DataActionRequestV1::IssueLicenseV1(req).into_action())
+        self.submit_action_obj(hub_data::DataActionRequestV1::IssueLicenseV1(req).into_action())
     }
 
     pub fn submit_append_attestation(
         &self,
         req: AppendAttestationRequestV1,
     ) -> Result<SubmitDataActionResponseV1, ApiError> {
-        self.submit_action(hub_data::DataActionRequestV1::AppendAttestationV1(req).into_action())
+        self.submit_action_obj(
+            hub_data::DataActionRequestV1::AppendAttestationV1(req).into_action(),
+        )
     }
 
-    fn submit_action(&self, action: DataActionV1) -> Result<SubmitDataActionResponseV1, ApiError> {
+    pub fn submit_create_listing(
+        &self,
+        req: CreateListingRequestV1,
+    ) -> Result<SubmitDataActionResponseV1, ApiError> {
+        self.submit_action_obj(hub_data::DataActionRequestV1::CreateListingV1(req).into_action())
+    }
+
+    pub fn submit_action_obj(
+        &self,
+        action: DataActionV1,
+    ) -> Result<SubmitDataActionResponseV1, ApiError> {
         let env = DataEnvelopeV1::new(action).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         // 1) Apply locally (sled)
@@ -94,6 +107,8 @@ impl DataApi {
             dataset_id: local.dataset_id.map(|x| x.to_hex()),
             license_id: local.license_id.map(|x| x.to_hex()),
             attestation_id: local.attestation_id.map(|x| x.to_hex()),
+            listing_id: local.listing_id.map(|x| x.to_hex()),
+            purchase_id: local.purchase_id,
             batch_id,
             idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
             l1_submit_result: submit,
@@ -119,6 +134,42 @@ impl DataApi {
             .get_license(license_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok(v.map(|x| serde_json::to_value(x).expect("serde value")))
+    }
+
+    pub fn get_listing_typed(
+        &self,
+        listing_id: Hex32,
+    ) -> Result<Option<CreateListingV1>, ApiError> {
+        self.store
+            .get_listing(listing_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    pub fn list_listings_by_dataset_typed(
+        &self,
+        dataset_id: Hex32,
+    ) -> Result<Vec<CreateListingV1>, ApiError> {
+        self.store
+            .list_listings_by_dataset(dataset_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    pub fn list_entitlements_by_dataset_typed(
+        &self,
+        dataset_id: Hex32,
+    ) -> Result<Vec<GrantEntitlementV1>, ApiError> {
+        self.store
+            .list_entitlements_by_dataset(dataset_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    pub fn list_entitlements_by_licensee_typed(
+        &self,
+        licensee: &str,
+    ) -> Result<Vec<GrantEntitlementV1>, ApiError> {
+        self.store
+            .list_entitlements_by_licensee(licensee)
+            .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
     pub fn list_licenses_by_dataset(
@@ -228,6 +279,10 @@ pub struct SubmitDataActionResponseV1 {
     pub license_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_id: Option<String>,
     pub batch_id: String,
     pub idempotency_key: String,
     pub l1_submit_result: L1SubmitResult,
@@ -245,6 +300,10 @@ pub struct DataActionReceiptV1 {
     pub license_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_id: Option<String>,
     pub batch_id: String,
     pub idempotency_key: String,
     pub batch_canonical_hash: String,
@@ -275,6 +334,8 @@ impl DataActionReceiptV1 {
             dataset_id: local.dataset_id.map(|x| x.to_hex()),
             license_id: local.license_id.map(|x| x.to_hex()),
             attestation_id: local.attestation_id.map(|x| x.to_hex()),
+            listing_id: local.listing_id.map(|x| x.to_hex()),
+            purchase_id: local.purchase_id.clone(),
             batch_id: batch_id.to_string(),
             idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
             batch_canonical_hash,

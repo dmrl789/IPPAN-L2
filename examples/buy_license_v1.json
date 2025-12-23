@@ -1,0 +1,8 @@
+{
+  "dataset_id": "<DATASET_ID_HEX>",
+  "listing_id": "<LISTING_ID_HEX>",
+  "buyer_account": "acc-buyer",
+  "nonce": "nonce-001",
+  "memo": "dataset license purchase"
+}
+

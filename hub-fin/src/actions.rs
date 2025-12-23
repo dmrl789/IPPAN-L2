@@ -2,6 +2,7 @@
 
 use crate::types::{AmountU128, AssetId32};
 use crate::validation::derive_asset_id;
+use l2_core::hub_linkage::PurchaseId;
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 
@@ -34,12 +35,30 @@ pub struct MintUnitsV1 {
     pub memo: Option<String>,
 }
 
+/// TRANSFER_UNITS action (v1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferUnitsV1 {
+    pub asset_id: AssetId32,
+    pub from_account: AccountId,
+    pub to_account: AccountId,
+    /// Scaled integer amount (u128) encoded as a JSON string.
+    pub amount: AmountU128,
+    /// Client-provided idempotency string to prevent duplicates.
+    pub client_tx_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// Optional linkage identifier for cross-hub workflows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_id: Option<PurchaseId>,
+}
+
 /// FIN action enum (v1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FinActionV1 {
     CreateAssetV1(CreateAssetV1),
     MintUnitsV1(MintUnitsV1),
+    TransferUnitsV1(TransferUnitsV1),
 }
 
 /// fin-node request shape for submitting actions.
@@ -50,6 +69,7 @@ pub enum FinActionV1 {
 pub enum FinActionRequestV1 {
     CreateAssetV1(CreateAssetRequestV1),
     MintUnitsV1(MintUnitsV1),
+    TransferUnitsV1(TransferUnitsV1),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +97,7 @@ impl FinActionRequestV1 {
                 })
             }
             FinActionRequestV1::MintUnitsV1(m) => FinActionV1::MintUnitsV1(m),
+            FinActionRequestV1::TransferUnitsV1(t) => FinActionV1::TransferUnitsV1(t),
         }
     }
 }

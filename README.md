@@ -68,18 +68,20 @@ IPPAN-L2/
 - [API.md](docs/API.md) - API reference
 - [HUB-FIN MVP](docs/hub-fin/README.md) - Finance hub MVP v1 docs (actions + API)
 - [HUB-DATA MVP](docs/hub-data/README.md) - Data hub MVP v1 docs (datasets + licenses + attestations)
+- [HUB linkage](docs/hubs/LINKAGE.md) - Cross-hub IDs and invariants
+- [Buy license](docs/hubs/BUY_LICENSE.md) - End-to-end payment → entitlement workflow
 - [architecture.md](docs/architecture.md) - System architecture
 
 ## Status
 
 Production integration phase:
 - ✅ L2 core types (batches, proofs, hub IDs)
-- ✅ FIN Hub MVP v1 (CREATE_ASSET, MINT_UNITS; deterministic state + receipts)
-- ✅ DATA Hub MVP v1 (REGISTER_DATASET, ISSUE_LICENSE, APPEND_ATTESTATION; deterministic state + receipts)
+- ✅ FIN Hub MVP v1 (CREATE_ASSET, MINT_UNITS, TRANSFER_UNITS; deterministic state + receipts)
+- ✅ DATA Hub MVP v1 (REGISTER_DATASET, ISSUE_LICENSE, APPEND_ATTESTATION, CREATE_LISTING, GRANT_ENTITLEMENT; deterministic state + receipts)
 - ✅ Ethereum Oracle integration
 - ✅ CI/CD pipeline
 - ✅ Security baseline
-- ✅ fin-node HTTP endpoints (health/ready/metrics + /fin/* + /data/*)
+- ✅ fin-node HTTP endpoints (health/ready/metrics + /fin/* + /data/* + /linkage/*)
 - 🔄 Production deployment (planned)
 
 This repo does **not** contain IPPAN CORE code. CORE lives in the main IPPAN repository.

@@ -2,7 +2,9 @@
 
 use base64::Engine as _;
 use hub_fin::apply::ApplyError;
-use hub_fin::{apply, ApplyOutcome, FinActionRequestV1, FinEnvelopeV1, FinStore, Hex32};
+use hub_fin::{
+    apply, ApplyOutcome, FinActionRequestV1, FinActionV1, FinEnvelopeV1, FinStore, Hex32,
+};
 use l2_core::l1_contract::{
     FixedAmountV1, HubPayloadEnvelopeV1, L1Client, L1SubmitResult, L2BatchEnvelopeV1,
 };
@@ -35,7 +37,13 @@ impl FinApi {
     pub fn submit_action(&self, body: &[u8]) -> Result<SubmitActionResponseV1, ApiError> {
         let req: FinActionRequestV1 =
             serde_json::from_slice(body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        let action = req.into_action();
+        self.submit_action_obj(req.into_action())
+    }
+
+    pub fn submit_action_obj(
+        &self,
+        action: FinActionV1,
+    ) -> Result<SubmitActionResponseV1, ApiError> {
         let env = FinEnvelopeV1::new(action).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         // 1) Apply locally (sled)
@@ -74,8 +82,10 @@ impl FinApi {
             action_id: env.action_id.to_hex(),
             local_apply_outcome: local.outcome,
             asset_id: local.asset_id.map(|x| x.to_hex()),
+            from_account: local.from_account.map(|x| x.0),
             to_account: local.to_account.map(|x| x.0),
             amount: local.amount.map(|x| x.0.to_string()),
+            purchase_id: local.purchase_id.map(|x| x.to_hex()),
             batch_id,
             idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
             l1_submit_result: submit,
@@ -230,9 +240,13 @@ pub struct SubmitActionResponseV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_id: Option<String>,
     pub batch_id: String,
     pub idempotency_key: String,
     pub l1_submit_result: L1SubmitResult,
@@ -247,9 +261,13 @@ pub struct FinActionReceiptV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_id: Option<String>,
     pub batch_id: String,
     pub idempotency_key: String,
     pub batch_canonical_hash: String,
@@ -278,8 +296,10 @@ impl FinActionReceiptV1 {
             action_id: action_id.to_hex(),
             local_apply_outcome: local.outcome,
             asset_id: local.asset_id.map(|x| x.to_hex()),
+            from_account: local.from_account.clone().map(|x| x.0),
             to_account: local.to_account.clone().map(|x| x.0),
             amount: local.amount.map(|x| x.0.to_string()),
+            purchase_id: local.purchase_id.map(|x| x.to_hex()),
             batch_id: batch_id.to_string(),
             idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
             batch_canonical_hash,

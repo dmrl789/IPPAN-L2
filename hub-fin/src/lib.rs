@@ -19,7 +19,7 @@ pub mod store;
 pub mod types;
 pub mod validation;
 
-pub use actions::{CreateAssetV1, FinActionRequestV1, FinActionV1, MintUnitsV1};
+pub use actions::{CreateAssetV1, FinActionRequestV1, FinActionV1, MintUnitsV1, TransferUnitsV1};
 pub use apply::{apply, ApplyOutcome, ApplyReceipt};
 pub use envelope::FinEnvelopeV1;
 pub use store::FinStore;

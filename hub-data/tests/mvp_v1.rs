@@ -72,6 +72,44 @@ fn golden_append_attestation_v1_action_and_envelope_bytes_are_stable() {
 }
 
 #[test]
+fn golden_create_listing_v1_action_and_envelope_bytes_are_stable() {
+    let action_json = fixture("create_listing_v1.action.canon.json");
+    let env_json = fixture("create_listing_v1.envelope.canon.json");
+    let expected_id = fixture("create_listing_v1.action_id.hex");
+
+    let action: DataActionV1 = serde_json::from_str(&action_json).expect("parse action");
+    let action_bytes = canonical_json_bytes(&action).expect("canonical bytes");
+    assert_eq!(action_bytes, action_json.as_bytes());
+
+    let got_id = hex::encode(blake3::hash(&action_bytes).as_bytes());
+    assert_eq!(got_id, expected_id);
+
+    let env = DataEnvelopeV1::new(action).expect("env");
+    assert_eq!(env.action_id.to_hex(), expected_id);
+    let env_bytes = env.canonical_bytes().expect("env bytes");
+    assert_eq!(env_bytes, env_json.as_bytes());
+}
+
+#[test]
+fn golden_grant_entitlement_v1_action_and_envelope_bytes_are_stable() {
+    let action_json = fixture("grant_entitlement_v1.action.canon.json");
+    let env_json = fixture("grant_entitlement_v1.envelope.canon.json");
+    let expected_id = fixture("grant_entitlement_v1.action_id.hex");
+
+    let action: DataActionV1 = serde_json::from_str(&action_json).expect("parse action");
+    let action_bytes = canonical_json_bytes(&action).expect("canonical bytes");
+    assert_eq!(action_bytes, action_json.as_bytes());
+
+    let got_id = hex::encode(blake3::hash(&action_bytes).as_bytes());
+    assert_eq!(got_id, expected_id);
+
+    let env = DataEnvelopeV1::new(action).expect("env");
+    assert_eq!(env.action_id.to_hex(), expected_id);
+    let env_bytes = env.canonical_bytes().expect("env bytes");
+    assert_eq!(env_bytes, env_json.as_bytes());
+}
+
+#[test]
 fn apply_is_idempotent_and_indexes_are_queryable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = DataStore::open(tmp.path()).expect("open store");
@@ -110,11 +148,50 @@ fn apply_is_idempotent_and_indexes_are_queryable() {
     let atts = store.list_attestations_by_dataset(dataset_id).unwrap();
     assert_eq!(atts.len(), 1);
 
+    // Apply CREATE_LISTING
+    let listing_action: DataActionV1 =
+        serde_json::from_str(&fixture("create_listing_v1.action.canon.json")).unwrap();
+    let listing_env = DataEnvelopeV1::new(listing_action).unwrap();
+    let r7 = apply(&listing_env, &store).expect("apply listing");
+    assert_eq!(r7.outcome, ApplyOutcome::Applied);
+
+    let listing_id = r7.listing_id.unwrap();
+    assert!(store.get_listing(listing_id).unwrap().is_some());
+    let listings = store.list_listings_by_dataset(dataset_id).unwrap();
+    assert_eq!(listings.len(), 1);
+
+    // Apply GRANT_ENTITLEMENT
+    let ent_action: DataActionV1 =
+        serde_json::from_str(&fixture("grant_entitlement_v1.action.canon.json")).unwrap();
+    let ent_env = DataEnvelopeV1::new(ent_action).unwrap();
+    let r8 = apply(&ent_env, &store).expect("apply entitlement");
+    assert_eq!(r8.outcome, ApplyOutcome::Applied);
+    let ent_license_id = r8.license_id.unwrap();
+    let purchase_id = match &ent_env.action {
+        DataActionV1::GrantEntitlementV1(x) => x.purchase_id,
+        _ => panic!("expected grant entitlement action"),
+    };
+    let ent = store.get_entitlement(purchase_id).unwrap();
+    assert!(ent.is_some());
+
+    let ents_by_dataset = store.list_entitlements_by_dataset(dataset_id).unwrap();
+    assert_eq!(ents_by_dataset.len(), 1);
+    assert_eq!(ents_by_dataset[0].license_id, ent_license_id);
+
+    let ents_by_licensee = store.list_entitlements_by_licensee("acc-bob").unwrap();
+    assert_eq!(ents_by_licensee.len(), 1);
+    assert_eq!(ents_by_licensee[0].purchase_id, purchase_id);
+
     // Replays are idempotent
     let r5 = apply(&lic_env, &store).expect("replay license");
     assert_eq!(r5.outcome, ApplyOutcome::AlreadyApplied);
     let r6 = apply(&att_env, &store).expect("replay att");
     assert_eq!(r6.outcome, ApplyOutcome::AlreadyApplied);
+
+    let r9 = apply(&listing_env, &store).expect("replay listing");
+    assert_eq!(r9.outcome, ApplyOutcome::AlreadyApplied);
+    let r10 = apply(&ent_env, &store).expect("replay entitlement");
+    assert_eq!(r10.outcome, ApplyOutcome::AlreadyApplied);
 }
 
 #[test]

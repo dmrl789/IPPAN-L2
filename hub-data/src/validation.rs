@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
-use crate::actions::{AppendAttestationV1, IssueLicenseV1, LicenseRightsV1, RegisterDatasetV1};
-use crate::types::{AttestationId, DatasetId, Hex32, LicenseId};
+use crate::actions::{
+    AppendAttestationV1, CreateListingV1, GrantEntitlementV1, IssueLicenseV1, LicenseRightsV1,
+    RegisterDatasetV1,
+};
+use crate::types::{AttestationId, DatasetId, Hex32, LicenseId, ListingId, PriceMicrounitsU128};
 use l2_core::AccountId;
 
 pub const NAME_MIN_LEN: usize = 1;
@@ -117,6 +120,54 @@ pub fn validate_append_attestation_v1(a: &AppendAttestationV1) -> Result<(), Val
     Ok(())
 }
 
+pub fn validate_create_listing_v1(
+    a: &CreateListingV1,
+    dataset_owner: &AccountId,
+) -> Result<(), ValidationError> {
+    validate_account_id("licensor", &a.licensor)?;
+    if &a.licensor != dataset_owner {
+        return Err(ValidationError::Invalid(
+            "licensor must equal dataset.owner (MVP rule)".to_string(),
+        ));
+    }
+    if a.price_microunits.0 == 0 {
+        return Err(ValidationError::Invalid(
+            "price_microunits must be > 0".to_string(),
+        ));
+    }
+    if let Some(uri) = a.terms_uri.as_deref() {
+        validate_bounded_allow_empty("terms_uri", uri, TERMS_URI_MAX_LEN)?;
+    }
+
+    let expected = derive_listing_id_v1(
+        a.dataset_id,
+        &a.licensor,
+        a.price_microunits,
+        &a.currency_asset_id,
+        a.rights,
+        a.terms_hash.as_ref(),
+    );
+    if expected != a.listing_id {
+        return Err(ValidationError::Invalid(
+            "listing_id does not match blake3(dataset_id || licensor || price || currency_asset_id || rights || terms_hash)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_grant_entitlement_v1(a: &GrantEntitlementV1) -> Result<(), ValidationError> {
+    validate_account_id("licensee", &a.licensee)?;
+    let expected =
+        derive_entitlement_license_id_v1(a.dataset_id, a.listing_id, &a.licensee, &a.purchase_id);
+    if expected != a.license_id {
+        return Err(ValidationError::Invalid(
+            "license_id does not match entitlement derivation rules".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn derive_dataset_id(
     owner: &AccountId,
     name: &str,
@@ -186,6 +237,54 @@ pub fn derive_attestation_id(
     }
     h.update(b"\0");
     h.update(nonce.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    Hex32(out)
+}
+
+pub fn derive_listing_id_v1(
+    dataset_id: DatasetId,
+    licensor: &AccountId,
+    price_microunits: PriceMicrounitsU128,
+    currency_asset_id: &Hex32,
+    rights: LicenseRightsV1,
+    terms_hash: Option<&Hex32>,
+) -> ListingId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"hub-data:listing_id:v1");
+    h.update(dataset_id.as_bytes());
+    h.update(b"\0");
+    h.update(licensor.0.as_bytes());
+    h.update(b"\0");
+    h.update(price_microunits.0.to_be_bytes().as_slice());
+    h.update(b"\0");
+    h.update(currency_asset_id.as_bytes());
+    h.update(b"\0");
+    h.update(rights.as_str().as_bytes());
+    h.update(b"\0");
+    if let Some(th) = terms_hash {
+        h.update(th.as_bytes());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    Hex32(out)
+}
+
+pub fn derive_entitlement_license_id_v1(
+    dataset_id: DatasetId,
+    listing_id: ListingId,
+    licensee: &AccountId,
+    purchase_id: &l2_core::hub_linkage::PurchaseId,
+) -> LicenseId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"hub-data:entitlement_license_id:v1");
+    h.update(dataset_id.as_bytes());
+    h.update(b"\0");
+    h.update(listing_id.as_bytes());
+    h.update(b"\0");
+    h.update(licensee.0.as_bytes());
+    h.update(b"\0");
+    h.update(purchase_id.as_bytes());
     let mut out = [0u8; 32];
     out.copy_from_slice(h.finalize().as_bytes());
     Hex32(out)

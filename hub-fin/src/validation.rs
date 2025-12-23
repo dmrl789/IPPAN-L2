@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::actions::{CreateAssetV1, MintUnitsV1};
+use crate::actions::{CreateAssetV1, MintUnitsV1, TransferUnitsV1};
 use crate::types::{AmountU128, AssetId32, Hex32};
 use l2_core::AccountId;
 
@@ -54,6 +54,19 @@ pub fn validate_mint_units_v1(a: &MintUnitsV1) -> Result<(), ValidationError> {
     Ok(())
 }
 
+pub fn validate_transfer_units_v1(a: &TransferUnitsV1) -> Result<(), ValidationError> {
+    validate_account_id("from_account", &a.from_account)?;
+    validate_account_id("to_account", &a.to_account)?;
+    validate_bounded("client_tx_id", &a.client_tx_id, CLIENT_TX_ID_MAX_LEN)?;
+    if let Some(memo) = a.memo.as_deref() {
+        validate_bounded("memo", memo, MEMO_MAX_LEN)?;
+    }
+    if a.amount.0 == 0 {
+        return Err(ValidationError::Invalid("amount must be > 0".to_string()));
+    }
+    Ok(())
+}
+
 pub fn validate_account_id(field: &str, a: &AccountId) -> Result<(), ValidationError> {
     validate_bounded(field, &a.0, ACCOUNT_MAX_LEN)
 }
@@ -88,4 +101,11 @@ pub fn validate_amount_addition(old: AmountU128, add: AmountU128) -> Result<Amou
         .checked_add(add.0)
         .map(AmountU128)
         .ok_or_else(|| "overflow adding amount".to_string())
+}
+
+pub fn validate_amount_subtraction(old: AmountU128, sub: AmountU128) -> Result<AmountU128, String> {
+    old.0
+        .checked_sub(sub.0)
+        .map(AmountU128)
+        .ok_or_else(|| "insufficient balance".to_string())
 }
