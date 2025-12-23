@@ -40,6 +40,8 @@ pub struct FinNodeConfig {
     pub linkage: LinkageConfig,
     #[serde(default)]
     pub ha: HaConfig,
+    #[serde(default)]
+    pub snapshots: SnapshotsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -780,5 +782,79 @@ impl FinNodeConfig {
             .map_err(|e| format!("invalid [ha] config: {e}"))?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotsConfig {
+    /// Enable snapshot functionality (create/restore/scheduler).
+    #[serde(default = "default_snapshots_enabled")]
+    pub enabled: bool,
+    /// Directory where snapshots are written by the scheduler (and default CLI output).
+    #[serde(default = "default_snapshots_output_dir")]
+    pub output_dir: String,
+    /// Maximum number of snapshots to keep when rotation is enabled.
+    #[serde(default = "default_snapshots_max_snapshots")]
+    pub max_snapshots: usize,
+    /// Optional hook executed after a snapshot is successfully created.
+    ///
+    /// The snapshot path will be passed as the last argument.
+    #[serde(default)]
+    pub post_snapshot_hook: Option<String>,
+    /// Optional hook executed before restore begins.
+    ///
+    /// The snapshot path will be passed as the last argument.
+    #[serde(default)]
+    pub pre_restore_hook: Option<String>,
+    #[serde(default)]
+    pub schedule: SnapshotScheduleConfig,
+}
+
+fn default_snapshots_enabled() -> bool {
+    false
+}
+
+fn default_snapshots_output_dir() -> String {
+    "snapshots".to_string()
+}
+
+fn default_snapshots_max_snapshots() -> usize {
+    10
+}
+
+impl Default for SnapshotsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_snapshots_enabled(),
+            output_dir: default_snapshots_output_dir(),
+            max_snapshots: default_snapshots_max_snapshots(),
+            post_snapshot_hook: None,
+            pre_restore_hook: None,
+            schedule: SnapshotScheduleConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotScheduleConfig {
+    #[serde(default = "default_snapshot_schedule_enabled")]
+    pub enabled: bool,
+    /// Simplified cron string (minute hour * * *).
+    ///
+    /// Supported format: `"M H * * *"` where M and H are integers.
+    #[serde(default)]
+    pub cron: Option<String>,
+}
+
+fn default_snapshot_schedule_enabled() -> bool {
+    false
+}
+
+impl Default for SnapshotScheduleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_snapshot_schedule_enabled(),
+            cron: None,
+        }
     }
 }

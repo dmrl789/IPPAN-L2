@@ -64,6 +64,9 @@ IPPAN-L2/
 - [DEV.md](docs/DEV.md) - Development guide
 - [CONFIG.md](docs/CONFIG.md) - Configuration reference
 - [OPS.md](docs/OPS.md) - Operations guide
+- [SNAPSHOTS.md](docs/SNAPSHOTS.md) - Snapshot format + guarantees
+- [DR.md](docs/DR.md) - Disaster recovery procedures (L2-grade)
+- [WHITEPAPER.md](docs/WHITEPAPER.md) - Whitepaper-ready notes (Limitations & Resilience)
 - [LOCAL_RUN.md](docs/LOCAL_RUN.md) - Running locally
 - [API.md](docs/API.md) - API reference
 - [OpenAPI (fin-node)](docs/openapi/README.md) - Production API contract + SDK stub generation

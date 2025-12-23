@@ -39,3 +39,20 @@ admins = []
 [policy.compliance]
 enabled = false
 strategy = "none"
+
+[snapshots]
+# Enable snapshot create/restore and (optionally) scheduled snapshots.
+enabled = false
+output_dir = "snapshots"
+max_snapshots = 10
+
+# Optional hook executed after snapshot creation (the snapshot path is passed as last arg).
+# post_snapshot_hook = "/usr/local/bin/upload_snapshot.sh"
+
+# Optional hook executed before restore begins (the snapshot path is passed as last arg).
+# pre_restore_hook = "/usr/local/bin/prepare_restore.sh"
+
+[snapshots.schedule]
+enabled = false
+# Daily schedule (UTC), simplified cron: "M H * * *"
+cron = "0 2 * * *"

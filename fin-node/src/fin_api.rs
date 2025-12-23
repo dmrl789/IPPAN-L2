@@ -283,6 +283,10 @@ impl FinApi {
         Ok(())
     }
 
+    pub fn store(&self) -> &FinStore {
+        &self.store
+    }
+
     fn action_receipt_path(&self, action_id_hex: &str) -> PathBuf {
         self.receipts_dir
             .join("fin")

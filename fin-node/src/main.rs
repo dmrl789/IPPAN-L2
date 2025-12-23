@@ -15,6 +15,7 @@ mod pruning;
 mod rate_limit;
 mod recon;
 mod recon_store;
+mod snapshot;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
@@ -93,6 +94,33 @@ enum Command {
 
     /// Prune old receipts / state (retention).
     Prune(PruneArgs),
+
+    /// Deterministic operational state snapshots (DR/migration).
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    /// Create a snapshot tar archive (SnapshotV1).
+    Create {
+        /// Output path for the snapshot tar.
+        ///
+        /// If omitted, uses `[snapshots].output_dir` and a timestamped name.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Restore from a snapshot tar archive (SnapshotV1).
+    Restore {
+        /// Path to the snapshot tar.
+        #[arg(long)]
+        from: PathBuf,
+        /// Overwrite existing local state (dangerous).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -292,36 +320,36 @@ fn main() {
 
             let receipts_dir = cfg
                 .as_ref()
-                .map(|c| c.storage.receipts_dir.as_str())
-                .unwrap_or("receipts");
+                .map(|c| c.storage.receipts_dir.clone())
+                .unwrap_or_else(|| "receipts".to_string());
             let fin_db_dir = cfg
                 .as_ref()
-                .map(|c| c.storage.fin_db_dir.as_str())
-                .unwrap_or("fin_db");
+                .map(|c| c.storage.fin_db_dir.clone())
+                .unwrap_or_else(|| "fin_db".to_string());
             let data_db_dir = cfg
                 .as_ref()
-                .map(|c| c.storage.data_db_dir.as_str())
-                .unwrap_or("data_db");
+                .map(|c| c.storage.data_db_dir.clone())
+                .unwrap_or_else(|| "data_db".to_string());
             let policy_db_dir = cfg
                 .as_ref()
-                .map(|c| c.storage.policy_db_dir.as_str())
-                .unwrap_or("policy_db");
+                .map(|c| c.storage.policy_db_dir.clone())
+                .unwrap_or_else(|| "policy_db".to_string());
             let recon_db_dir = cfg
                 .as_ref()
-                .map(|c| c.storage.recon_db_dir.as_str())
-                .unwrap_or("recon_db");
+                .map(|c| c.storage.recon_db_dir.clone())
+                .unwrap_or_else(|| "recon_db".to_string());
 
             let recon_cfg = cfg.as_ref().map(|c| c.recon.clone());
             let recon_store = if recon_cfg.as_ref().map(|c| c.enabled).unwrap_or(false) {
                 Some(
-                    recon_store::ReconStore::open(recon_db_dir)
+                    recon_store::ReconStore::open(recon_db_dir.as_str())
                         .unwrap_or_else(|e| exit_err(&e.to_string())),
                 )
             } else {
                 None
             };
 
-            let policy_store = policy_store::PolicyStore::open(policy_db_dir)
+            let policy_store = policy_store::PolicyStore::open(policy_db_dir.as_str())
                 .unwrap_or_else(|e| exit_err(&e.to_string()));
             let mut policy = policy_runtime::PolicyRuntime::default();
             if let Some(c) = cfg.as_ref() {
@@ -347,7 +375,7 @@ fn main() {
             policy.store = Some(policy_store);
 
             let store =
-                hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
+                hub_fin::FinStore::open(fin_db_dir.as_str()).unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_fin(&store);
             let limits_cfg = cfg.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
             let fin_limits = hub_fin::validation::ValidationLimits {
@@ -377,19 +405,19 @@ fn main() {
             let fin_api = fin_api::FinApi::new_with_policy_recon_and_limits(
                 l1.clone(),
                 store,
-                PathBuf::from(receipts_dir),
+                PathBuf::from(&receipts_dir),
                 policy.clone(),
                 recon_store.clone(),
                 fin_limits,
             );
 
             let data_store =
-                hub_data::DataStore::open(data_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
+                hub_data::DataStore::open(data_db_dir.as_str()).unwrap_or_else(|e| exit_err(&e.to_string()));
             ensure_state_version_data(&data_store);
             let data_api = data_api::DataApi::new_with_policy_recon_and_limits(
                 l1.clone(),
                 data_store,
-                PathBuf::from(receipts_dir),
+                PathBuf::from(&receipts_dir),
                 policy,
                 recon_store.clone(),
                 data_limits,
@@ -411,10 +439,16 @@ fn main() {
             let linkage_api = linkage::LinkageApi::new_with_policy_and_recon(
                 fin_api.clone(),
                 data_api.clone(),
-                PathBuf::from(receipts_dir),
+                PathBuf::from(&receipts_dir),
                 linkage_policy,
                 recon_store.clone(),
             );
+
+            let snapshots_cfg = cfg
+                .as_ref()
+                .map(|c| c.snapshots.clone())
+                .unwrap_or_default();
+            let snapshot_pause = Arc::new(AtomicBool::new(false));
 
             // Graceful shutdown: SIGINT/SIGTERM sets a shared stop flag.
             let stop = Arc::new(AtomicBool::new(false));
@@ -460,7 +494,7 @@ fn main() {
                     .map(|c| c.pruning.interval_secs)
                     .unwrap_or(86_400);
                 pruning_loop = Some(pruning::PruningLoop {
-                    receipts_dir: PathBuf::from(receipts_dir),
+                    receipts_dir: PathBuf::from(&receipts_dir),
                     retention,
                     limits,
                     interval_secs: interval,
@@ -483,13 +517,34 @@ fn main() {
                 let supervisor =
                     ha::supervisor::HaSupervisor::new(ha_state.clone(), lock, stop.clone());
 
+                // Clone values that must remain available after `spawn(move ...)`.
+                let fin_api_for_tasks = fin_api.clone();
+                let data_api_for_tasks = data_api.clone();
+                let recon_store_for_tasks = recon_store.clone();
+                let snapshots_cfg_for_tasks = snapshots_cfg.clone();
+                let snapshot_pause_for_tasks = snapshot_pause.clone();
+                let receipts_dir_for_tasks = receipts_dir.clone();
+                let ha_node_id_for_tasks = ha_cfg.node_id.clone();
+
                 supervisor_handle = Some(supervisor.spawn(move |leader_stop| {
                     let mut hs = Vec::new();
                     if let Some(loop_) = recon_loop.clone() {
                         hs.push(loop_.start(leader_stop.clone()));
                     }
                     if let Some(loop_) = pruning_loop.clone() {
-                        hs.push(loop_.start(leader_stop));
+                        hs.push(loop_.start(leader_stop.clone()));
+                    }
+                    if snapshots_cfg_for_tasks.enabled && snapshots_cfg_for_tasks.schedule.enabled {
+                        hs.push(spawn_snapshot_scheduler(
+                            snapshots_cfg_for_tasks.clone(),
+                            fin_api_for_tasks.clone(),
+                            data_api_for_tasks.clone(),
+                            recon_store_for_tasks.clone(),
+                            PathBuf::from(&receipts_dir_for_tasks),
+                            ha_node_id_for_tasks.clone(),
+                            snapshot_pause_for_tasks.clone(),
+                            leader_stop,
+                        ));
                     }
                     hs
                 }));
@@ -500,6 +555,18 @@ fn main() {
                 }
                 if let Some(loop_) = pruning_loop {
                     direct_bg_threads.push(loop_.start(stop.clone()));
+                }
+                if snapshots_cfg.enabled && snapshots_cfg.schedule.enabled {
+                    direct_bg_threads.push(spawn_snapshot_scheduler(
+                        snapshots_cfg.clone(),
+                        fin_api.clone(),
+                        data_api.clone(),
+                        recon_store.clone(),
+                        PathBuf::from(&receipts_dir),
+                        node_label.to_string(),
+                        snapshot_pause.clone(),
+                        stop.clone(),
+                    ));
                 }
             }
 
@@ -530,6 +597,7 @@ fn main() {
                     .map(|c| c.server.max_inflight_requests)
                     .unwrap_or(64),
                 ha_state,
+                snapshot_pause,
                 stop,
             );
 
@@ -821,6 +889,118 @@ fn main() {
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
+        Command::Snapshot { cmd } => {
+            let cfg = cfg.as_ref().unwrap_or_else(|| {
+                exit_err("snapshot commands require a config: pass --config or set IPPAN_L2_CONFIG")
+            });
+            if !cfg.snapshots.enabled {
+                exit_err("snapshots are disabled: set [snapshots].enabled = true");
+            }
+
+            let receipts_dir = cfg.storage.receipts_dir.as_str();
+            let fin_db_dir = cfg.storage.fin_db_dir.as_str();
+            let data_db_dir = cfg.storage.data_db_dir.as_str();
+            let recon_db_dir = cfg.storage.recon_db_dir.as_str();
+
+            match cmd {
+                SnapshotCommand::Create { out } => {
+                    // Leader-only enforcement (when HA is enabled).
+                    let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
+                        exit_err(&format!("failed to init HA lock provider: {e}"))
+                    });
+                    if let Some(lock) = lock.as_ref() {
+                        match lock.try_acquire(&cfg.ha.node_id) {
+                            Ok(crate::ha::lock_provider::LockState::Acquired) => {}
+                            Ok(_) => {
+                                exit_err("not leader: failed to acquire snapshot leadership lock")
+                            }
+                            Err(e) => exit_err(&format!("failed acquiring leader lock: {e}")),
+                        }
+                    }
+
+                    let fin = hub_fin::FinStore::open(fin_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open(data_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+
+                    let out_path = out.unwrap_or_else(|| {
+                        let dir = PathBuf::from(&cfg.snapshots.output_dir);
+                        let now = time::OffsetDateTime::now_utc();
+                        let ts = format!(
+                            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+                            now.year(),
+                            u8::from(now.month()),
+                            now.day(),
+                            now.hour(),
+                            now.minute(),
+                            now.second()
+                        );
+                        dir.join(format!("l2-snapshot-{ts}.tar"))
+                    });
+
+                    let manifest = snapshot::create_snapshot_v1_tar(
+                        &cfg.snapshots,
+                        &out_path,
+                        snapshot::SnapshotSources {
+                            fin: &fin,
+                            data: &data,
+                            recon: recon.as_ref(),
+                            receipts_dir: Path::new(receipts_dir),
+                            node_id: if cfg.ha.enabled {
+                                cfg.ha.node_id.as_str()
+                            } else {
+                                cfg.node.label.as_str()
+                            },
+                        },
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    // Release lock best-effort.
+                    if let Some(lock) = lock.as_ref() {
+                        let _ = lock.release(&cfg.ha.node_id);
+                    }
+
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "snapshot_version": manifest.snapshot_version,
+                            "path": out_path.display().to_string(),
+                            "hash": manifest.hash,
+                        }))
+                        .unwrap()
+                    );
+                }
+                SnapshotCommand::Restore { from, force } => {
+                    let fin = hub_fin::FinStore::open(fin_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open(data_db_dir)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+
+                    let manifest = snapshot::restore_snapshot_v1_tar(
+                        &cfg.snapshots,
+                        &from,
+                        &fin,
+                        &data,
+                        recon.as_ref(),
+                        Path::new(receipts_dir),
+                        force,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "snapshot_version": manifest.snapshot_version,
+                            "restored_from": from.display().to_string(),
+                            "hash": manifest.hash,
+                        }))
+                        .unwrap()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -914,6 +1094,169 @@ fn init_logging(cfg: Option<&config::FinNodeConfig>) {
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .init();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_snapshot_scheduler(
+    snapshots_cfg: crate::config::SnapshotsConfig,
+    fin_api: crate::fin_api::FinApi,
+    data_api: crate::data_api::DataApi,
+    recon: Option<crate::recon_store::ReconStore>,
+    receipts_dir: PathBuf,
+    node_id: String,
+    pause_writes: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let cron = snapshots_cfg
+            .schedule
+            .cron
+            .as_deref()
+            .unwrap_or("0 2 * * *")
+            .trim();
+        let (minute, hour) = match parse_daily_cron_min_hour(cron) {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(event = "snapshot_schedule_invalid_cron", cron, error = %e);
+                return;
+            }
+        };
+        info!(
+            event = "snapshot_scheduler_started",
+            enabled = snapshots_cfg.enabled,
+            minute,
+            hour,
+            output_dir = %snapshots_cfg.output_dir
+        );
+
+        let mut last_run_date: Option<time::Date> = None;
+        while !stop.load(Ordering::Relaxed) {
+            let now = time::OffsetDateTime::now_utc();
+            let today = now.date();
+            if now.minute() == minute && now.hour() == hour && last_run_date != Some(today) {
+                last_run_date = Some(today);
+                let out_dir = PathBuf::from(&snapshots_cfg.output_dir);
+                let out_path = out_dir.join(format!(
+                    "l2-snapshot-{:04}{:02}{:02}-{:02}{:02}{:02}.tar",
+                    now.year(),
+                    u8::from(now.month()),
+                    now.day(),
+                    now.hour(),
+                    now.minute(),
+                    now.second()
+                ));
+
+                pause_writes.store(true, Ordering::Relaxed);
+                // Ensure pause is lifted even on error/stop.
+                let _pause_guard = PauseGuard {
+                    flag: pause_writes.clone(),
+                };
+
+                let _ = fin_api.flush();
+                let _ = data_api.flush();
+                if let Some(r) = recon.as_ref() {
+                    let _ = r.flush();
+                }
+
+                match crate::snapshot::create_snapshot_v1_tar(
+                    &snapshots_cfg,
+                    &out_path,
+                    crate::snapshot::SnapshotSources {
+                        fin: fin_api.store(),
+                        data: data_api.store(),
+                        recon: recon.as_ref(),
+                        receipts_dir: &receipts_dir,
+                        node_id: &node_id,
+                    },
+                ) {
+                    Ok(manifest) => {
+                        info!(
+                            event = "snapshot_created",
+                            path = %out_path.display(),
+                            hash = %manifest.hash
+                        );
+                        rotate_snapshots(&out_dir, snapshots_cfg.max_snapshots);
+                    }
+                    Err(e) => {
+                        warn!(event = "snapshot_create_failed", error = %e);
+                    }
+                }
+            }
+
+            // Sleep in small chunks for responsive shutdown/step-down.
+            let mut slept = std::time::Duration::from_secs(0);
+            while slept < std::time::Duration::from_secs(30) && !stop.load(Ordering::Relaxed) {
+                let step = std::time::Duration::from_millis(250);
+                std::thread::sleep(step);
+                slept += step;
+            }
+        }
+        info!(event = "snapshot_scheduler_stopped");
+    })
+}
+
+struct PauseGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for PauseGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
+}
+
+fn parse_daily_cron_min_hour(cron: &str) -> Result<(u8, u8), String> {
+    // Supported: "M H * * *"
+    let parts: Vec<&str> = cron.split_whitespace().collect();
+    if parts.len() != 5 {
+        return Err("expected 5 fields (M H * * *)".to_string());
+    }
+    if parts[2] != "*" || parts[3] != "*" || parts[4] != "*" {
+        return Err("only daily schedules are supported (M H * * *)".to_string());
+    }
+    let minute: u8 = parts[0].parse().map_err(|_| "invalid minute".to_string())?;
+    let hour: u8 = parts[1].parse().map_err(|_| "invalid hour".to_string())?;
+    if minute > 59 {
+        return Err("minute out of range (0-59)".to_string());
+    }
+    if hour > 23 {
+        return Err("hour out of range (0-23)".to_string());
+    }
+    Ok((minute, hour))
+}
+
+fn rotate_snapshots(dir: &Path, max_keep: usize) {
+    if max_keep < 1 {
+        return;
+    }
+    let mut snaps: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !name.starts_with("l2-snapshot-") || !name.ends_with(".tar") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        snaps.push((mtime, p));
+    }
+    snaps.sort_by(|a, b| a.0.cmp(&b.0));
+    if snaps.len() <= max_keep {
+        return;
+    }
+    let to_delete = snaps.len().saturating_sub(max_keep);
+    for (_, p) in snaps.into_iter().take(to_delete) {
+        // Never auto-delete unknown/corrupt snapshots; only delete by name+mtime rotation policy.
+        let _ = fs::remove_file(p);
     }
 }
 

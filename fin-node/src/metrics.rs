@@ -206,6 +206,29 @@ pub static RECEIPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static SNAPSHOTS_CREATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("snapshots_created_total", "Total snapshots created"),
+        &["result"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static SNAPSHOT_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "snapshot_failures_total",
+            "Total snapshot failures (create/restore)",
+        ),
+        &["op", "reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
 pub fn gather_text() -> String {
     PROCESS_UPTIME_SECONDS.set(START.elapsed().as_secs_f64());
     let mf = REGISTRY.gather();
