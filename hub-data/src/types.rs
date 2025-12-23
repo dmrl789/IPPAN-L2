@@ -11,6 +11,7 @@ pub type DatasetId = Hex32;
 pub type LicenseId = Hex32;
 pub type AttestationId = Hex32;
 pub type ActionId = Hex32;
+pub type ListingId = Hex32;
 
 impl Hex32 {
     pub fn as_bytes(&self) -> &[u8; 32] {

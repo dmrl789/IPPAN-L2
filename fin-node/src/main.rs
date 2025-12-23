@@ -6,6 +6,7 @@ mod config;
 mod data_api;
 mod fin_api;
 mod http_server;
+mod linkage;
 mod metrics;
 
 use base64::Engine as _;
@@ -230,8 +231,22 @@ fn main() {
             let data_api =
                 data_api::DataApi::new(l1.clone(), data_store, PathBuf::from(receipts_dir));
 
-            http_server::serve(bind, l1, expected, metrics_enabled, fin_api, data_api)
-                .unwrap_or_else(|e| exit_err(&e));
+            let linkage_api = linkage::LinkageApi::new(
+                fin_api.clone(),
+                data_api.clone(),
+                PathBuf::from(receipts_dir),
+            );
+
+            http_server::serve(
+                bind,
+                l1,
+                expected,
+                metrics_enabled,
+                fin_api,
+                data_api,
+                linkage_api,
+            )
+            .unwrap_or_else(|e| exit_err(&e));
         }
         Command::L1 { cmd } => match cmd {
             L1Command::Status => {

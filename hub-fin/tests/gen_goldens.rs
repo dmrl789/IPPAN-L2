@@ -1,6 +1,6 @@
 use hub_fin::canonical::canonical_json_bytes;
 use hub_fin::{AmountU128, Hex32};
-use hub_fin::{CreateAssetV1, MintUnitsV1};
+use hub_fin::{CreateAssetV1, MintUnitsV1, TransferUnitsV1};
 use hub_fin::{FinActionV1, FinEnvelopeV1};
 use l2_core::AccountId;
 
@@ -34,9 +34,22 @@ fn print_goldens() {
     let mint_action = FinActionV1::MintUnitsV1(mint.clone());
     let mint_env = FinEnvelopeV1::new(mint_action.clone()).unwrap();
 
+    let transfer = TransferUnitsV1 {
+        asset_id: create.asset_id,
+        from_account: AccountId::new("acc-alice"),
+        to_account: AccountId::new("acc-bob"),
+        amount: AmountU128(5_000_000),
+        client_tx_id: "pay-001".to_string(),
+        memo: Some("payment".to_string()),
+        purchase_id: None,
+    };
+    let transfer_action = FinActionV1::TransferUnitsV1(transfer.clone());
+    let transfer_env = FinEnvelopeV1::new(transfer_action.clone()).unwrap();
+
     for (label, action, env) in [
         ("create_asset_v1", create_action.clone(), create_env.clone()),
         ("mint_units_v1", mint_action, mint_env),
+        ("transfer_units_v1", transfer_action, transfer_env),
     ] {
         let action_bytes = canonical_json_bytes(&action).unwrap();
         let action_hash = blake3::hash(&action_bytes);

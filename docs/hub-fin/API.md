@@ -64,6 +64,25 @@ curl -sS -X POST "http://127.0.0.1:3000/fin/actions" \
   }"
 ```
 
+### 3) TRANSFER_UNITS (payments)
+
+```bash
+ASSET_ID="<asset_id_hex>"
+
+curl -sS -X POST "http://127.0.0.1:3000/fin/actions" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"type\": \"transfer_units_v1\",
+    \"asset_id\": \"${ASSET_ID}\",
+    \"from_account\": \"acc-buyer\",
+    \"to_account\": \"acc-seller\",
+    \"amount\": \"1000000\",
+    \"client_tx_id\": \"<64_hex_chars_or_other_id>\",
+    \"memo\": \"dataset license purchase\",
+    \"purchase_id\": \"<purchase_id_hex_optional>\"
+  }"
+```
+
 ### 3) Query asset
 
 ```bash

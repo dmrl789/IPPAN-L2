@@ -51,6 +51,25 @@ fn golden_mint_units_v1_action_and_envelope_bytes_are_stable() {
 }
 
 #[test]
+fn golden_transfer_units_v1_action_and_envelope_bytes_are_stable() {
+    let action_json = fixture("transfer_units_v1.action.canon.json");
+    let env_json = fixture("transfer_units_v1.envelope.canon.json");
+    let expected_id = fixture("transfer_units_v1.action_id.hex");
+
+    let action: FinActionV1 = serde_json::from_str(&action_json).expect("parse action");
+    let action_bytes = canonical_json_bytes(&action).expect("canonical bytes");
+    assert_eq!(action_bytes, action_json.as_bytes());
+
+    let got_id = hex::encode(blake3::hash(&action_bytes).as_bytes());
+    assert_eq!(got_id, expected_id);
+
+    let env = FinEnvelopeV1::new(action).expect("env");
+    assert_eq!(env.action_id.to_hex(), expected_id);
+    let env_bytes = env.canonical_bytes().expect("env bytes");
+    assert_eq!(env_bytes, env_json.as_bytes());
+}
+
+#[test]
 fn apply_is_idempotent_and_updates_balances() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = FinStore::open(tmp.path()).expect("open store");
@@ -85,6 +104,30 @@ fn apply_is_idempotent_and_updates_balances() {
     assert_eq!(r4.outcome, ApplyOutcome::AlreadyApplied);
     let bal2 = store.get_balance(asset_id, &account.0).unwrap();
     assert_eq!(bal2, AmountU128(20_000_000));
+
+    // Apply TRANSFER_UNITS (alice -> bob)
+    let transfer_action: FinActionV1 =
+        serde_json::from_str(&fixture("transfer_units_v1.action.canon.json")).unwrap();
+    let transfer_env = FinEnvelopeV1::new(transfer_action).unwrap();
+
+    // Seed alice balance (from mint fixture).
+    let r5 = apply(&transfer_env, &store).expect("apply transfer");
+    assert_eq!(r5.outcome, ApplyOutcome::Applied);
+
+    let alice = AccountId::new("acc-alice");
+    let bob = AccountId::new("acc-bob");
+    let bal_alice = store.get_balance(asset_id, &alice.0).unwrap();
+    let bal_bob = store.get_balance(asset_id, &bob.0).unwrap();
+    assert_eq!(bal_alice, AmountU128(15_000_000));
+    assert_eq!(bal_bob, AmountU128(5_000_000));
+
+    // Replay transfer is idempotent (no double charge).
+    let r6 = apply(&transfer_env, &store).expect("replay transfer");
+    assert_eq!(r6.outcome, ApplyOutcome::AlreadyApplied);
+    let bal_alice2 = store.get_balance(asset_id, &alice.0).unwrap();
+    let bal_bob2 = store.get_balance(asset_id, &bob.0).unwrap();
+    assert_eq!(bal_alice2, AmountU128(15_000_000));
+    assert_eq!(bal_bob2, AmountU128(5_000_000));
 }
 
 #[test]

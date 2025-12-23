@@ -1,0 +1,10 @@
+{
+  "dataset_id": "<DATASET_ID_HEX>",
+  "licensor": "acc-alice",
+  "rights": "use",
+  "price_microunits": "1000000",
+  "currency_asset_id": "<HUB_FIN_ASSET_ID_HEX>",
+  "terms_uri": "https://example.com/terms/v1",
+  "terms_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+

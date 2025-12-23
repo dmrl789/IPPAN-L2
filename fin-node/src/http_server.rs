@@ -2,6 +2,7 @@
 
 use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
+use crate::linkage::{ApiError as LinkageApiError, BuyLicenseRequestV1, LinkageApi};
 use crate::metrics;
 use l2_core::l1_contract::{L1ChainStatus, L1Client};
 use serde::Serialize;
@@ -39,6 +40,7 @@ pub fn serve(
     metrics_enabled: bool,
     fin_api: FinApi,
     data_api: DataApi,
+    linkage_api: LinkageApi,
 ) -> Result<(), String> {
     let server =
         Server::http(bind).map_err(|e| format!("failed to bind http server on {bind}: {e}"))?;
@@ -134,6 +136,22 @@ pub fn serve(
                     ),
                 }
             }
+            ("POST", "/data/listings") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<hub_data::CreateListingRequestV1>(&body) {
+                    Ok(req) => match data_api.submit_create_listing(req) {
+                        Ok(out) => json_response(200, &out),
+                        Err(e) => data_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
             ("GET", p) if p.starts_with("/data/datasets/") && p.ends_with("/licenses") => {
                 let dataset_id = p
                     .trim_start_matches("/data/datasets/")
@@ -156,6 +174,98 @@ pub fn serve(
                         &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "attestations": list}),
                     ),
                     Err(e) => data_api_error_response(e),
+                }
+            }
+            ("GET", "/data/listings") => {
+                let params = parse_query(query);
+                let dataset_id = params.get("dataset_id").map(String::as_str).unwrap_or("");
+                if dataset_id.is_empty() {
+                    json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": "missing dataset_id"}),
+                    )
+                } else {
+                    match hub_data::Hex32::from_hex(dataset_id) {
+                        Ok(did) => match data_api.list_listings_by_dataset_typed(did) {
+                            Ok(list) => {
+                                let v: Vec<serde_json::Value> = list
+                                    .into_iter()
+                                    .map(|x| serde_json::to_value(x).expect("serde value"))
+                                    .collect();
+                                json_response(
+                                    200,
+                                    &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "listings": v}),
+                                )
+                            }
+                            Err(e) => data_api_error_response(e),
+                        },
+                        Err(e) => json_response(
+                            400,
+                            &serde_json::json!({"schema_version": 1, "error": format!("invalid dataset_id: {e}")}),
+                        ),
+                    }
+                }
+            }
+            ("GET", "/data/entitlements") => {
+                let params = parse_query(query);
+                let dataset_id = params.get("dataset_id").map(String::as_str).unwrap_or("");
+                let licensee = params.get("licensee").map(String::as_str).unwrap_or("");
+                let offset = params
+                    .get("offset")
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let limit = params
+                    .get("limit")
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(100);
+                if !dataset_id.is_empty() && !licensee.is_empty() {
+                    json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": "pass dataset_id OR licensee"}),
+                    )
+                } else if !dataset_id.is_empty() {
+                    match hub_data::Hex32::from_hex(dataset_id) {
+                        Ok(did) => match data_api.list_entitlements_by_dataset_typed(did) {
+                            Ok(list) => {
+                                let v: Vec<serde_json::Value> = list
+                                    .into_iter()
+                                    .skip(offset)
+                                    .take(limit)
+                                    .map(|ent| entitlement_view_json(&data_api, ent))
+                                    .collect();
+                                json_response(
+                                    200,
+                                    &serde_json::json!({"schema_version": 1, "dataset_id": dataset_id, "offset": offset, "limit": limit, "entitlements": v}),
+                                )
+                            }
+                            Err(e) => data_api_error_response(e),
+                        },
+                        Err(e) => json_response(
+                            400,
+                            &serde_json::json!({"schema_version": 1, "error": format!("invalid dataset_id: {e}")}),
+                        ),
+                    }
+                } else if !licensee.is_empty() {
+                    match data_api.list_entitlements_by_licensee_typed(licensee) {
+                        Ok(list) => {
+                            let v: Vec<serde_json::Value> = list
+                                .into_iter()
+                                .skip(offset)
+                                .take(limit)
+                                .map(|ent| entitlement_view_json(&data_api, ent))
+                                .collect();
+                            json_response(
+                                200,
+                                &serde_json::json!({"schema_version": 1, "licensee": licensee, "offset": offset, "limit": limit, "entitlements": v}),
+                            )
+                        }
+                        Err(e) => data_api_error_response(e),
+                    }
+                } else {
+                    json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": "missing dataset_id or licensee"}),
+                    )
                 }
             }
             ("GET", p) if p.starts_with("/data/datasets/") => {
@@ -253,6 +363,38 @@ pub fn serve(
                     Err(e) => data_api_error_response(e),
                 }
             }
+            ("POST", "/linkage/buy-license") => {
+                let mut body = Vec::new();
+                if let Err(e) = req.as_reader().read_to_end(&mut body) {
+                    return Err(format!("failed reading request body: {e}"));
+                }
+                match serde_json::from_slice::<BuyLicenseRequestV1>(&body) {
+                    Ok(req) => match linkage_api.buy_license(req) {
+                        Ok(receipt) => json_response(
+                            200,
+                            &serde_json::json!({"schema_version": 1, "receipt": receipt}),
+                        ),
+                        Err(e) => linkage_api_error_response(e),
+                    },
+                    Err(e) => json_response(
+                        400,
+                        &serde_json::json!({"schema_version": 1, "error": e.to_string()}),
+                    ),
+                }
+            }
+            ("GET", p) if p.starts_with("/linkage/purchase/") => {
+                let purchase_id = p.trim_start_matches("/linkage/purchase/");
+                match linkage_api.get_purchase_receipt(purchase_id) {
+                    Ok(Some(r)) => {
+                        json_response(200, &serde_json::json!({"schema_version": 1, "receipt": r}))
+                    }
+                    Ok(None) => json_response(
+                        404,
+                        &serde_json::json!({"schema_version": 1, "error": "not_found"}),
+                    ),
+                    Err(e) => linkage_api_error_response(e),
+                }
+            }
             _ => Response::from_string("not found\n").with_status_code(404),
         };
 
@@ -297,6 +439,56 @@ fn data_api_error_response(e: DataApiError) -> Response<std::io::Cursor<Vec<u8>>
             json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
         }
     }
+}
+
+fn linkage_api_error_response(e: LinkageApiError) -> Response<std::io::Cursor<Vec<u8>>> {
+    match e {
+        LinkageApiError::BadRequest(msg) => {
+            json_response(400, &serde_json::json!({"schema_version": 1, "error": msg}))
+        }
+        LinkageApiError::Upstream(msg) => {
+            json_response(502, &serde_json::json!({"schema_version": 1, "error": msg}))
+        }
+        LinkageApiError::Internal(msg) => {
+            json_response(500, &serde_json::json!({"schema_version": 1, "error": msg}))
+        }
+    }
+}
+
+fn entitlement_view_json(
+    data_api: &DataApi,
+    ent: hub_data::GrantEntitlementV1,
+) -> serde_json::Value {
+    // Best-effort enrichment with listing price/currency for query UX.
+    let listing = data_api.get_listing_typed(ent.listing_id).ok().flatten();
+    let (price_microunits, currency_asset_id) = match listing {
+        Some(l) => (
+            Some(l.price_microunits.0.to_string()),
+            Some(l.currency_asset_id.to_hex()),
+        ),
+        None => (None, None),
+    };
+
+    let data_action_id =
+        hub_data::DataEnvelopeV1::new(hub_data::DataActionV1::GrantEntitlementV1(ent.clone()))
+            .map(|e| e.action_id.to_hex())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+    serde_json::json!({
+        "purchase_id": ent.purchase_id.to_hex(),
+        "dataset_id": ent.dataset_id.to_hex(),
+        "listing_id": ent.listing_id.to_hex(),
+        "licensee": ent.licensee.0,
+        "price_microunits": price_microunits,
+        "currency_asset_id": currency_asset_id,
+        "status": "entitled",
+        "references": {
+            "fin_action_id": ent.payment_ref.fin_action_id.to_hex(),
+            "fin_receipt_hash": ent.payment_ref.fin_receipt_hash.to_hex(),
+            "data_action_id": data_action_id,
+            "license_id": ent.license_id.to_hex(),
+        }
+    })
 }
 
 fn parse_query(q: &str) -> std::collections::BTreeMap<String, String> {

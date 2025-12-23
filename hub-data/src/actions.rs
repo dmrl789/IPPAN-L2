@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
 
-use crate::types::{AttestationId, DatasetId, Hex32, LicenseId, PriceMicrounitsU128};
-use crate::validation::{derive_attestation_id, derive_dataset_id, derive_license_id};
+use crate::types::{AttestationId, DatasetId, Hex32, LicenseId, ListingId, PriceMicrounitsU128};
+use crate::validation::{
+    derive_attestation_id, derive_dataset_id, derive_entitlement_license_id_v1, derive_license_id,
+    derive_listing_id_v1,
+};
+use l2_core::hub_linkage::{PaymentRef, PurchaseId};
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +147,61 @@ pub struct AppendAttestationRequestV1 {
     pub nonce: String,
 }
 
+/// CREATE_LISTING action (v1.1, contract_version remains "v1").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateListingV1 {
+    pub dataset_id: DatasetId,
+    /// Deterministic id:
+    /// `blake3(dataset_id || licensor || price || currency_asset_id || rights || terms_hash)`.
+    pub listing_id: ListingId,
+    pub licensor: AccountId,
+    pub rights: LicenseRightsV1,
+    /// Integer microunits (u128) encoded as JSON string.
+    pub price_microunits: PriceMicrounitsU128,
+    /// References HUB-FIN asset id (32 bytes).
+    pub currency_asset_id: Hex32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_hash: Option<Hex32>,
+}
+
+/// Request shape for creating a listing (server derives `listing_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateListingRequestV1 {
+    pub dataset_id: DatasetId,
+    pub licensor: AccountId,
+    pub rights: LicenseRightsV1,
+    pub price_microunits: PriceMicrounitsU128,
+    pub currency_asset_id: Hex32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_hash: Option<Hex32>,
+}
+
+/// GRANT_ENTITLEMENT action (v1.1, contract_version remains "v1").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantEntitlementV1 {
+    pub purchase_id: PurchaseId,
+    pub listing_id: ListingId,
+    pub dataset_id: DatasetId,
+    pub licensee: AccountId,
+    pub payment_ref: PaymentRef,
+    /// Deterministic entitlement license id (hub-defined).
+    pub license_id: LicenseId,
+}
+
+/// Request shape for granting entitlement (server derives `license_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantEntitlementRequestV1 {
+    pub purchase_id: PurchaseId,
+    pub listing_id: ListingId,
+    pub dataset_id: DatasetId,
+    pub licensee: AccountId,
+    pub payment_ref: PaymentRef,
+}
+
 /// HUB-DATA action enum (v1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -150,6 +209,8 @@ pub enum DataActionV1 {
     RegisterDatasetV1(RegisterDatasetV1),
     IssueLicenseV1(IssueLicenseV1),
     AppendAttestationV1(AppendAttestationV1),
+    CreateListingV1(CreateListingV1),
+    GrantEntitlementV1(GrantEntitlementV1),
 }
 
 /// fin-node request shape for submitting HUB-DATA actions.
@@ -159,6 +220,8 @@ pub enum DataActionRequestV1 {
     RegisterDatasetV1(RegisterDatasetRequestV1),
     IssueLicenseV1(IssueLicenseRequestV1),
     AppendAttestationV1(AppendAttestationRequestV1),
+    CreateListingV1(CreateListingRequestV1),
+    GrantEntitlementV1(GrantEntitlementRequestV1),
 }
 
 impl DataActionRequestV1 {
@@ -231,6 +294,42 @@ impl DataActionRequestV1 {
                     ref_hash: req.ref_hash,
                     ref_uri: req.ref_uri,
                     nonce: req.nonce,
+                })
+            }
+            DataActionRequestV1::CreateListingV1(req) => {
+                let listing_id = derive_listing_id_v1(
+                    req.dataset_id,
+                    &req.licensor,
+                    req.price_microunits,
+                    &req.currency_asset_id,
+                    req.rights,
+                    req.terms_hash.as_ref(),
+                );
+                DataActionV1::CreateListingV1(CreateListingV1 {
+                    dataset_id: req.dataset_id,
+                    listing_id,
+                    licensor: req.licensor,
+                    rights: req.rights,
+                    price_microunits: req.price_microunits,
+                    currency_asset_id: req.currency_asset_id,
+                    terms_uri: req.terms_uri,
+                    terms_hash: req.terms_hash,
+                })
+            }
+            DataActionRequestV1::GrantEntitlementV1(req) => {
+                let license_id = derive_entitlement_license_id_v1(
+                    req.dataset_id,
+                    req.listing_id,
+                    &req.licensee,
+                    &req.purchase_id,
+                );
+                DataActionV1::GrantEntitlementV1(GrantEntitlementV1 {
+                    purchase_id: req.purchase_id,
+                    listing_id: req.listing_id,
+                    dataset_id: req.dataset_id,
+                    licensee: req.licensee,
+                    payment_ref: req.payment_ref,
+                    license_id,
                 })
             }
         }
