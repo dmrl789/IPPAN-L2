@@ -24,4 +24,4 @@ informational_warnings = ["unmaintained", "unsound", "notice"]
 # Automatically fetch the advisory database
 fetch = true
 # Use the main RustSec advisory database
-url = ["https://github.com/rustsec/advisory-db"]
+url = "https://github.com/rustsec/advisory-db"
