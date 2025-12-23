@@ -1,0 +1,6 @@
+{
+  "hub": "Fin",
+  "batch_id": "batch-golden-001",
+  "tx_count": 42,
+  "commitment": "0xdeadbeef"
+}

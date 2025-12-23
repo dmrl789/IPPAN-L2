@@ -1,0 +1,12 @@
+{
+  "hub": "Fin",
+  "batch": {
+    "hub": "Fin",
+    "batch_id": "batch-golden-002",
+    "tx_count": 10,
+    "commitment": null
+  },
+  "fee": {
+    "inner": 1000000
+  }
+}

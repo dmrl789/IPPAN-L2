@@ -1,0 +1,41 @@
+# IPPAN-L2 Local Development Configuration
+# This config is for local development and testing.
+#
+# Usage:
+#   export IPPAN_L2_CONFIG=configs/local.toml
+#   cargo run -p fin-node
+#
+# Environment variables can override TOML values.
+
+[l1]
+# IPPAN CORE settlement endpoint
+base_url = "http://127.0.0.1:8080"
+# Optional API key (leave empty for local dev)
+api_key = ""
+
+[server]
+# HTTP bind address for health/metrics endpoints
+bind_address = "127.0.0.1:3000"
+# Enable metrics endpoint
+metrics_enabled = true
+
+[hubs]
+# Enable FIN Hub
+fin_enabled = true
+# Enable DATA Hub
+data_enabled = true
+
+[storage]
+# Local storage path for persistent state
+path = "./data/local"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "debug"
+# Output format: json, pretty
+format = "pretty"
+
+[oracle]
+# Oracle daemon configuration (if running with oracle)
+enabled = false
+poll_interval_ms = 10000

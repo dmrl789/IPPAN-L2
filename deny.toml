@@ -1,0 +1,82 @@
+# cargo-deny configuration for IPPAN-L2
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Target platforms to check
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# The database to check for known vulnerabilities
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Ignore specific advisories (transitive dependencies we can't easily fix)
+ignore = [
+    # idna 0.4.0 - Punycode label issue, comes from ethers/url dependency chain
+    # Waiting for ethers to update their url dependency
+    "RUSTSEC-2024-0421",
+    # ring 0.16.20 - AES panic on overflow, comes from ethers/rustls dependency chain
+    # ethers uses older rustls which depends on ring 0.16.x
+    "RUSTSEC-2025-0009",
+    # ring 0.16.20 is unmaintained - same as above
+    "RUSTSEC-2025-0010",
+    # fxhash unmaintained - transitive from ethers
+    "RUSTSEC-2025-0057",
+    # instant unmaintained - transitive dependency
+    "RUSTSEC-2024-0384",
+    # rustls-pemfile unmaintained - transitive from reqwest/rustls
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+# Allowed licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+]
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+
+# Exceptions for specific crates (add with justification)
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+# Allow wildcard dependencies (workspace path deps don't have versions)
+wildcards = "allow"
+# Deny specific crates (add problematic crates here)
+deny = []
+# Skip checking specific crates
+skip = []
+
+# Skip specific crates for duplicate checking
+skip-tree = []
+
+[sources]
+# Only allow crates from crates.io
+unknown-registry = "deny"
+# Allow git dependencies (for development)
+unknown-git = "warn"
+# Allowed registries
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Allowed git sources (add specific repos if needed)
+allow-git = []

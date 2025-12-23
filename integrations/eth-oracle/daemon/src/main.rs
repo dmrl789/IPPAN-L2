@@ -23,12 +23,18 @@ struct Args {
 enum Cli {
     /// Run the oracle daemon loop (default).
     Watch {
-        #[arg(long, default_value = "integrations/eth-oracle/configs/devnet_sepolia.toml")]
+        #[arg(
+            long,
+            default_value = "integrations/eth-oracle/configs/devnet_sepolia.toml"
+        )]
         config: PathBuf,
     },
     /// One-shot: fetch scores from IPPAN and print subject IDs, labels, and scores.
     Dump {
-        #[arg(long, default_value = "integrations/eth-oracle/configs/devnet_sepolia.toml")]
+        #[arg(
+            long,
+            default_value = "integrations/eth-oracle/configs/devnet_sepolia.toml"
+        )]
         config: PathBuf,
     },
 }

@@ -52,9 +52,9 @@ impl EthOracleClient {
 
         if scores.len() == 1 {
             let s = &scores[0];
-            let call = self
-                .contract
-                .update_score(s.subject_id, U256::from(s.score), s.label.clone());
+            let call =
+                self.contract
+                    .update_score(s.subject_id, U256::from(s.score), s.label.clone());
             let pending = call.send().await;
             let pending = pending.context("failed sending updateScore tx")?;
 
@@ -74,7 +74,9 @@ impl EthOracleClient {
             new_labels.push(s.label.clone());
         }
 
-        let call = self.contract.update_scores(subjects, new_scores, new_labels);
+        let call = self
+            .contract
+            .update_scores(subjects, new_scores, new_labels);
         let pending = call.send().await;
         let pending = pending.context("failed sending updateScores tx")?;
 

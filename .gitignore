@@ -2,3 +2,28 @@
 **/target/
 
 # Cargo.lock is committed for reproducible builds (workspace includes binaries).
+
+# Environment files (may contain secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+/data/
+
+# Foundry
+integrations/eth-oracle/contracts/cache/
+integrations/eth-oracle/contracts/out/
+
+# Build artifacts
+*.pdb

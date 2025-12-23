@@ -1,0 +1,42 @@
+# IPPAN-L2 Docker Compose
+# Local development stack
+
+version: "3.8"
+
+services:
+  # FIN Node (demo)
+  fin-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: fin-node
+    volumes:
+      - ./configs:/app/configs:ro
+      - fin-data:/app/data
+    environment:
+      - RUST_LOG=info
+      - IPPAN_L2_CONFIG=/app/configs/local.toml
+    command: ["--batch-id", "docker-demo"]
+    profiles:
+      - fin
+
+  # Oracle Daemon
+  oracle-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: oracle-daemon
+    volumes:
+      - ./integrations/eth-oracle/configs:/app/configs:ro
+    environment:
+      - RUST_LOG=info
+      - IPPAN_RPC_URL=${IPPAN_RPC_URL:-http://host.docker.internal:8080}
+      - ETH_RPC_URL=${ETH_RPC_URL}
+      - ETH_PRIVATE_KEY=${ETH_PRIVATE_KEY}
+    command: ["watch", "--config", "/app/configs/devnet_sepolia.toml"]
+    restart: unless-stopped
+    profiles:
+      - oracle
+
+volumes:
+  fin-data:
