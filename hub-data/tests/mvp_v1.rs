@@ -237,7 +237,7 @@ fn license_issuer_must_be_dataset_owner() {
     // license_id derivation does not include licensor, so keep it unchanged.
     let env = DataEnvelopeV1::new(DataActionV1::IssueLicenseV1(lic)).unwrap();
     let err = apply(&env, &store).unwrap_err().to_string();
-    assert!(err.contains("licensor must equal dataset.owner"), "{err}");
+    assert!(err.contains("licensor not permitted for dataset"), "{err}");
     assert!(!store.is_applied(env.action_id).unwrap());
 }
 
@@ -259,6 +259,7 @@ fn tags_must_be_normalized_sorted_and_deduped() {
         mime_type: None,
         tags: vec!["b".to_string(), "A".to_string(), "b".to_string()], // not normalized
         schema_version: 1,
+        attestation_policy: hub_data::AttestationPolicyV1::Anyone,
     };
     let env = DataEnvelopeV1::new(DataActionV1::RegisterDatasetV1(ds)).unwrap();
 
@@ -286,6 +287,7 @@ fn bounds_are_enforced() {
         mime_type: None,
         tags: vec![],
         schema_version: 1,
+        attestation_policy: hub_data::AttestationPolicyV1::Anyone,
     };
     let env = DataEnvelopeV1::new(DataActionV1::RegisterDatasetV1(ds)).unwrap();
 

@@ -8,6 +8,8 @@ mod fin_api;
 mod http_server;
 mod linkage;
 mod metrics;
+mod policy_runtime;
+mod policy_store;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
@@ -17,6 +19,7 @@ use l2_core::l1_contract::{
     Base64Bytes, ContractVersion, FixedAmountV1, HubPayloadEnvelopeV1, IdempotencyKey, L1Client,
     L1ClientError, L1InclusionProof, L1SubmitResult, L1TxId, L2BatchEnvelopeV1,
 };
+use l2_core::AccountId;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -69,6 +72,18 @@ enum Command {
         #[command(subcommand)]
         cmd: DataCommand,
     },
+
+    /// HUB-FIN operator utilities.
+    Fin {
+        #[command(subcommand)]
+        cmd: FinCommand,
+    },
+
+    /// Policy/compliance list management (local node).
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,6 +94,53 @@ enum DataCommand {
         #[arg(long)]
         out: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum FinCommand {
+    /// Delegate an operator to transfer on behalf of an account for an asset.
+    Delegate {
+        /// From-account granting the delegation.
+        #[arg(long)]
+        from: String,
+        /// Operator account receiving the delegation.
+        #[arg(long)]
+        operator: String,
+        /// Asset id (32-byte hex).
+        #[arg(long)]
+        asset_id: String,
+    },
+    /// Revoke an operator delegation.
+    RevokeDelegate {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        operator: String,
+        #[arg(long)]
+        asset_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Manage the global allowlist.
+    Allow {
+        #[command(subcommand)]
+        cmd: PolicyListCommand,
+    },
+    /// Manage the global denylist.
+    Deny {
+        #[command(subcommand)]
+        cmd: PolicyListCommand,
+    },
+    /// Print current policy status.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyListCommand {
+    Add { account: String },
+    Remove { account: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,15 +283,55 @@ fn main() {
                 .as_ref()
                 .map(|c| c.storage.data_db_dir.as_str())
                 .unwrap_or("data_db");
+            let policy_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.policy_db_dir.as_str())
+                .unwrap_or("policy_db");
+
+            let policy_store = policy_store::PolicyStore::open(policy_db_dir)
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+            let mut policy = policy_runtime::PolicyRuntime::default();
+            if let Some(c) = cfg.as_ref() {
+                policy.mode = c.policy.mode;
+                policy.admins = c
+                    .policy
+                    .admins
+                    .iter()
+                    .cloned()
+                    .map(AccountId::new)
+                    .collect();
+                policy.compliance.enabled = c.policy.compliance.enabled;
+                policy.compliance.strategy = match c.policy.compliance.strategy {
+                    config::ComplianceStrategy::None => policy_runtime::ComplianceStrategy::None,
+                    config::ComplianceStrategy::GlobalAllowlist => {
+                        policy_runtime::ComplianceStrategy::GlobalAllowlist
+                    }
+                    config::ComplianceStrategy::GlobalDenylist => {
+                        policy_runtime::ComplianceStrategy::GlobalDenylist
+                    }
+                };
+            }
+            policy.store = Some(policy_store);
 
             let store =
                 hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
-            let fin_api = fin_api::FinApi::new(l1.clone(), store, PathBuf::from(receipts_dir));
+            ensure_state_version_fin(&store);
+            let fin_api = fin_api::FinApi::new_with_policy(
+                l1.clone(),
+                store,
+                PathBuf::from(receipts_dir),
+                policy.clone(),
+            );
 
             let data_store =
                 hub_data::DataStore::open(data_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
-            let data_api =
-                data_api::DataApi::new(l1.clone(), data_store, PathBuf::from(receipts_dir));
+            ensure_state_version_data(&data_store);
+            let data_api = data_api::DataApi::new_with_policy(
+                l1.clone(),
+                data_store,
+                PathBuf::from(receipts_dir),
+                policy,
+            );
 
             let linkage_api = linkage::LinkageApi::new(
                 fin_api.clone(),
@@ -374,6 +476,149 @@ fn main() {
                 println!("{}", out.display());
             }
         },
+        Command::Fin { cmd } => {
+            let fin_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.fin_db_dir.as_str())
+                .unwrap_or("fin_db");
+            let store =
+                hub_fin::FinStore::open(fin_db_dir).unwrap_or_else(|e| exit_err(&e.to_string()));
+
+            match cmd {
+                FinCommand::Delegate {
+                    from,
+                    operator,
+                    asset_id,
+                } => {
+                    let asset_id = hub_fin::Hex32::from_hex(&asset_id)
+                        .unwrap_or_else(|e| exit_err(&format!("invalid asset_id: {e}")));
+                    store
+                        .set_delegation(&from, &operator, asset_id)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!("ok");
+                }
+                FinCommand::RevokeDelegate {
+                    from,
+                    operator,
+                    asset_id,
+                } => {
+                    let asset_id = hub_fin::Hex32::from_hex(&asset_id)
+                        .unwrap_or_else(|e| exit_err(&format!("invalid asset_id: {e}")));
+                    store
+                        .revoke_delegation(&from, &operator, asset_id)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!("ok");
+                }
+            }
+        }
+        Command::Policy { cmd } => {
+            let policy_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.policy_db_dir.as_str())
+                .unwrap_or("policy_db");
+            let store = policy_store::PolicyStore::open(policy_db_dir)
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+            match cmd {
+                PolicyCommand::Allow { cmd } => match cmd {
+                    PolicyListCommand::Add { account } => {
+                        store
+                            .allow_add(&account)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        println!("ok");
+                    }
+                    PolicyListCommand::Remove { account } => {
+                        store
+                            .allow_remove(&account)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        println!("ok");
+                    }
+                },
+                PolicyCommand::Deny { cmd } => match cmd {
+                    PolicyListCommand::Add { account } => {
+                        store
+                            .deny_add(&account)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        println!("ok");
+                    }
+                    PolicyListCommand::Remove { account } => {
+                        store
+                            .deny_remove(&account)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        println!("ok");
+                    }
+                },
+                PolicyCommand::Status => {
+                    let (allow, deny) = store.counts().unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "allow_count": allow,
+                            "deny_count": deny,
+                        })
+                    );
+                }
+            }
+        }
+    }
+}
+
+const TARGET_STATE_VERSION: u32 = 2;
+
+fn ensure_state_version_fin(store: &hub_fin::FinStore) {
+    match store.get_state_version() {
+        Ok(Some(v)) if v >= TARGET_STATE_VERSION => {}
+        Ok(Some(v)) => {
+            info!(
+                hub = "fin",
+                from = v,
+                to = TARGET_STATE_VERSION,
+                "migrating hub-fin state version"
+            );
+            store
+                .set_state_version(TARGET_STATE_VERSION)
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+        }
+        Ok(None) => {
+            info!(
+                hub = "fin",
+                to = TARGET_STATE_VERSION,
+                "initializing hub-fin state version (assume v1)"
+            );
+            store
+                .set_state_version(TARGET_STATE_VERSION)
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+        }
+        Err(e) => exit_err(&e.to_string()),
+    }
+}
+
+fn ensure_state_version_data(store: &hub_data::DataStore) {
+    match store.get_state_version() {
+        Ok(Some(v)) if v >= TARGET_STATE_VERSION => {}
+        Ok(Some(v)) => {
+            info!(
+                hub = "data",
+                from = v,
+                to = TARGET_STATE_VERSION,
+                "migrating hub-data state version"
+            );
+            store
+                .set_state_version(TARGET_STATE_VERSION)
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+        }
+        Ok(None) => {
+            info!(
+                hub = "data",
+                to = TARGET_STATE_VERSION,
+                "initializing hub-data state version (assume v1)"
+            );
+            store
+                .set_state_version(TARGET_STATE_VERSION)
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+        }
+        Err(e) => exit_err(&e.to_string()),
     }
 }
 

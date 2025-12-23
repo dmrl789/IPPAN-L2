@@ -30,7 +30,8 @@ curl -sS -X POST "http://127.0.0.1:3000/data/datasets" \
     "pointer_uri": "ipfs://bafybeigdyrztl5example",
     "mime_type": "application/json",
     "tags": ["Example", "dataset", "ai"],
-    "schema_version": 1
+    "schema_version": 1,
+    "attestation_policy": "anyone"
   }'
 ```
 
@@ -89,6 +90,10 @@ Returns `attestation_id` + `action_id` + receipt metadata.
 
 Creates a deterministic listing for a dataset, priced in HUB-FIN microunits.
 
+In strict mode, the `licensor` must be either:
+- the dataset owner, or
+- explicitly allowlisted for the dataset.
+
 ```bash
 DATASET_ID="<DATASET_ID_HEX>"
 ASSET_ID="<HUB_FIN_ASSET_ID_HEX>"
@@ -104,6 +109,36 @@ curl -sS -X POST "http://127.0.0.1:3000/data/listings" \
     \"terms_uri\": \"https://example.com/terms/v1\",
     \"terms_hash\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"
   }"
+```
+
+### Manage allowlists (add-only, auditable)
+
+#### Add a permitted licensor for a dataset
+
+`POST /data/allowlist/licensors`
+
+```bash
+curl -sS -X POST "http://127.0.0.1:3000/data/allowlist/licensors" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset_id": "<DATASET_ID_HEX>",
+    "licensor": "acc-bob",
+    "actor": "acc-alice"
+  }'
+```
+
+#### Add an allowlisted attestor for a dataset
+
+`POST /data/allowlist/attestors`
+
+```bash
+curl -sS -X POST "http://127.0.0.1:3000/data/allowlist/attestors" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset_id": "<DATASET_ID_HEX>",
+    "attestor": "acc-carol",
+    "actor": "acc-alice"
+  }'
 ```
 
 Returns:

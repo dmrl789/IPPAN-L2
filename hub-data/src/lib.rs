@@ -20,12 +20,13 @@ pub mod types;
 pub mod validation;
 
 pub use actions::{
-    AppendAttestationRequestV1, AppendAttestationV1, CreateListingRequestV1, CreateListingV1,
-    DataActionRequestV1, DataActionV1, GrantEntitlementRequestV1, GrantEntitlementV1,
-    IssueLicenseRequestV1, IssueLicenseV1, LicenseRightsV1, RegisterDatasetRequestV1,
-    RegisterDatasetV1,
+    AddAttestorRequestV1, AddAttestorV1, AddLicensorRequestV1, AddLicensorV1,
+    AppendAttestationRequestV1, AppendAttestationV1, AttestationPolicyV1, CreateListingRequestV1,
+    CreateListingV1, DataActionRequestV1, DataActionV1, GrantEntitlementRequestV1,
+    GrantEntitlementV1, IssueLicenseRequestV1, IssueLicenseV1, LicenseRightsV1,
+    RegisterDatasetRequestV1, RegisterDatasetV1,
 };
-pub use apply::{apply, ApplyOutcome, ApplyReceipt};
+pub use apply::{apply, apply_with_policy, ApplyOutcome, ApplyReceipt};
 pub use envelope::DataEnvelopeV1;
 pub use store::{DataStateSnapshotV1, DataStore, DatasetSnapshotV1};
 pub use types::{

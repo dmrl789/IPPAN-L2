@@ -406,6 +406,24 @@ impl DataStore {
         Ok(self.tree.contains_key(keys::applied(action_id))?)
     }
 
+    pub fn get_state_version(&self) -> Result<Option<u32>, StoreError> {
+        let Some(v) = self.tree.get(keys::state_version())? else {
+            return Ok(None);
+        };
+        let s = String::from_utf8(v.to_vec())
+            .map_err(|e| StoreError::Decode(format!("invalid utf8 state_version: {e}")))?;
+        let n = s
+            .parse::<u32>()
+            .map_err(|e| StoreError::Decode(format!("invalid state_version integer: {e}")))?;
+        Ok(Some(n))
+    }
+
+    pub fn set_state_version(&self, v: u32) -> Result<(), StoreError> {
+        self.tree
+            .insert(keys::state_version(), v.to_string().into_bytes())?;
+        Ok(())
+    }
+
     pub fn mark_applied(&self, action_id: ActionId) -> Result<(), StoreError> {
         self.tree
             .insert(keys::applied(action_id), IVec::from(&b"1"[..]))?;
@@ -510,6 +528,14 @@ pub mod keys {
         format!("listings_by_dataset:{}:", dataset_id.to_hex()).into_bytes()
     }
 
+    pub fn licensor_allow(dataset_id: DatasetId, licensor: &str) -> Vec<u8> {
+        format!("licensor_allow:{}:{licensor}", dataset_id.to_hex()).into_bytes()
+    }
+
+    pub fn attestor_allow(dataset_id: DatasetId, attestor: &str) -> Vec<u8> {
+        format!("attestor_allow:{}:{attestor}", dataset_id.to_hex()).into_bytes()
+    }
+
     pub fn entitlement(purchase_id: PurchaseId) -> Vec<u8> {
         format!("entitlement:{}", purchase_id.to_hex()).into_bytes()
     }
@@ -537,6 +563,10 @@ pub mod keys {
 
     pub fn applied(action_id: ActionId) -> Vec<u8> {
         format!("applied:{}", action_id.to_hex()).into_bytes()
+    }
+
+    pub fn state_version() -> &'static [u8] {
+        b"state_version"
     }
 
     pub fn receipt(action_id: ActionId) -> Vec<u8> {

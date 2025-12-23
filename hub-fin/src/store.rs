@@ -72,6 +72,100 @@ impl FinStore {
         Ok(self.tree.contains_key(keys::applied(action_id))?)
     }
 
+    pub fn get_state_version(&self) -> Result<Option<u32>, StoreError> {
+        let Some(v) = self.tree.get(keys::state_version())? else {
+            return Ok(None);
+        };
+        let s = String::from_utf8(v.to_vec())
+            .map_err(|e| StoreError::Decode(format!("invalid utf8 state_version: {e}")))?;
+        let n = s
+            .parse::<u32>()
+            .map_err(|e| StoreError::Decode(format!("invalid state_version integer: {e}")))?;
+        Ok(Some(n))
+    }
+
+    pub fn set_state_version(&self, v: u32) -> Result<(), StoreError> {
+        self.tree
+            .insert(keys::state_version(), v.to_string().into_bytes())?;
+        Ok(())
+    }
+
+    /// Create/update an operator delegation for a given `(from, operator, asset_id)` tuple.
+    pub fn set_delegation(
+        &self,
+        from_account: &str,
+        operator_account: &str,
+        asset_id: AssetId32,
+    ) -> Result<(), StoreError> {
+        self.tree.insert(
+            keys::delegation(from_account, operator_account, asset_id),
+            IVec::from(&b"1"[..]),
+        )?;
+        Ok(())
+    }
+
+    /// Revoke an operator delegation for a given `(from, operator, asset_id)` tuple.
+    pub fn revoke_delegation(
+        &self,
+        from_account: &str,
+        operator_account: &str,
+        asset_id: AssetId32,
+    ) -> Result<(), StoreError> {
+        let _ = self
+            .tree
+            .remove(keys::delegation(from_account, operator_account, asset_id))?;
+        Ok(())
+    }
+
+    pub fn has_delegation(
+        &self,
+        from_account: &str,
+        operator_account: &str,
+        asset_id: AssetId32,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .tree
+            .contains_key(keys::delegation(from_account, operator_account, asset_id))?)
+    }
+
+    /// Add an account to the transfer allowlist for an asset.
+    pub fn add_transfer_allow(&self, asset_id: AssetId32, account: &str) -> Result<(), StoreError> {
+        self.tree.insert(
+            keys::transfer_allow(asset_id, account),
+            IVec::from(&b"1"[..]),
+        )?;
+        Ok(())
+    }
+
+    /// Add an account to the transfer denylist for an asset.
+    pub fn add_transfer_deny(&self, asset_id: AssetId32, account: &str) -> Result<(), StoreError> {
+        self.tree.insert(
+            keys::transfer_deny(asset_id, account),
+            IVec::from(&b"1"[..]),
+        )?;
+        Ok(())
+    }
+
+    pub fn is_transfer_allowlisted(
+        &self,
+        asset_id: AssetId32,
+        account: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .tree
+            .contains_key(keys::transfer_allow(asset_id, account))?)
+    }
+
+    pub fn is_transfer_denylisted(
+        &self,
+        asset_id: AssetId32,
+        account: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .tree
+            .contains_key(keys::transfer_deny(asset_id, account))?)
+    }
+
     pub fn mark_applied(&self, action_id: ActionId) -> Result<(), StoreError> {
         self.tree
             .insert(keys::applied(action_id), IVec::from(&b"1"[..]))?;
@@ -123,6 +217,26 @@ pub mod keys {
 
     pub fn applied(action_id: ActionId) -> Vec<u8> {
         format!("applied:{}", action_id.to_hex()).into_bytes()
+    }
+
+    pub fn state_version() -> &'static [u8] {
+        b"state_version"
+    }
+
+    pub fn delegation(from_account: &str, operator_account: &str, asset_id: AssetId32) -> Vec<u8> {
+        format!(
+            "delegation:{from_account}:{operator_account}:{}",
+            asset_id.to_hex()
+        )
+        .into_bytes()
+    }
+
+    pub fn transfer_allow(asset_id: AssetId32, account: &str) -> Vec<u8> {
+        format!("transfer_allow:{}:{account}", asset_id.to_hex()).into_bytes()
+    }
+
+    pub fn transfer_deny(asset_id: AssetId32, account: &str) -> Vec<u8> {
+        format!("transfer_deny:{}:{account}", asset_id.to_hex()).into_bytes()
     }
 
     pub fn receipt(action_id: ActionId) -> Vec<u8> {

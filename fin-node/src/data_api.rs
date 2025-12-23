@@ -3,27 +3,34 @@
 use base64::Engine as _;
 use hub_data::apply::ApplyError as DataApplyError;
 use hub_data::{
-    apply, AppendAttestationRequestV1, ApplyOutcome, CreateListingRequestV1, CreateListingV1,
-    DataActionV1, DataEnvelopeV1, DataStore, GrantEntitlementV1, Hex32, IssueLicenseRequestV1,
-    RegisterDatasetRequestV1,
+    apply_with_policy, AppendAttestationRequestV1, ApplyOutcome, CreateListingRequestV1,
+    CreateListingV1, DataActionV1, DataEnvelopeV1, DataStore, GrantEntitlementV1, Hex32,
+    IssueLicenseRequestV1, RegisterDatasetRequestV1,
 };
 use l2_core::l1_contract::{
     FixedAmountV1, HubPayloadEnvelopeV1, L1Client, L1SubmitResult, L2BatchEnvelopeV1,
 };
+use l2_core::policy::{PolicyDenyCode, PolicyError};
+use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
+use tracing::{info, warn};
+
+use crate::policy_runtime::{ComplianceStrategy, PolicyRuntime};
 
 #[derive(Clone)]
 pub struct DataApi {
     l1: Arc<dyn L1Client + Send + Sync>,
     store: DataStore,
     receipts_dir: PathBuf,
+    policy: PolicyRuntime,
 }
 
 impl DataApi {
+    #[allow(dead_code)]
     pub fn new(
         l1: Arc<dyn L1Client + Send + Sync>,
         store: DataStore,
@@ -33,6 +40,21 @@ impl DataApi {
             l1,
             store,
             receipts_dir,
+            policy: PolicyRuntime::default(),
+        }
+    }
+
+    pub fn new_with_policy(
+        l1: Arc<dyn L1Client + Send + Sync>,
+        store: DataStore,
+        receipts_dir: PathBuf,
+        policy: PolicyRuntime,
+    ) -> Self {
+        Self {
+            l1,
+            store,
+            receipts_dir,
+            policy,
         }
     }
 
@@ -66,14 +88,63 @@ impl DataApi {
         self.submit_action_obj(hub_data::DataActionRequestV1::CreateListingV1(req).into_action())
     }
 
+    pub fn submit_add_licensor(
+        &self,
+        req: hub_data::AddLicensorRequestV1,
+    ) -> Result<SubmitDataActionResponseV1, ApiError> {
+        self.submit_action_obj(hub_data::DataActionRequestV1::AddLicensorV1(req).into_action())
+    }
+
+    pub fn submit_add_attestor(
+        &self,
+        req: hub_data::AddAttestorRequestV1,
+    ) -> Result<SubmitDataActionResponseV1, ApiError> {
+        self.submit_action_obj(hub_data::DataActionRequestV1::AddAttestorV1(req).into_action())
+    }
+
     pub fn submit_action_obj(
         &self,
         action: DataActionV1,
     ) -> Result<SubmitDataActionResponseV1, ApiError> {
         let env = DataEnvelopeV1::new(action).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let context_id = env.action_id.to_hex();
+
+        info!(
+            event = "action_attempted",
+            hub = "data",
+            action_kind = %data_action_kind(&env.action),
+            action_id = %context_id
+        );
+
+        self.enforce_compliance(&env.action, &context_id)?;
 
         // 1) Apply locally (sled)
-        let local = apply(&env, &self.store).map_err(ApiError::from_apply)?;
+        let local =
+            match apply_with_policy(&env, &self.store, self.policy.mode, &self.policy.admins) {
+                Ok(x) => x,
+                Err(e) => {
+                    let api_err = ApiError::from_apply_with_context(e, context_id.clone());
+                    if let ApiError::PolicyDenied(p) = &api_err {
+                        warn!(
+                            event = "action_denied",
+                            hub = "data",
+                            action_kind = %data_action_kind(&env.action),
+                            action_id = %context_id,
+                            code = ?p.code,
+                            message = %p.message
+                        );
+                    }
+                    return Err(api_err);
+                }
+            };
+
+        info!(
+            event = "action_applied",
+            hub = "data",
+            action_kind = %data_action_kind(&env.action),
+            action_id = %context_id,
+            outcome = ?local.outcome
+        );
 
         // 2) Wrap into L1 contract envelope (single-item batch)
         let payload: HubPayloadEnvelopeV1 = (&env).into();
@@ -95,6 +166,16 @@ impl DataApi {
             .submit_batch(&batch)
             .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
+        info!(
+            event = "action_submitted_to_l1",
+            hub = "data",
+            action_kind = %data_action_kind(&env.action),
+            action_id = %context_id,
+            accepted = submit.accepted,
+            already_known = submit.already_known,
+            l1_tx_id = submit.l1_tx_id.as_ref().map(|x| x.0.as_str()).unwrap_or("")
+        );
+
         // 4) Persist action receipt
         let receipt =
             DataActionReceiptV1::from_parts(&env.action_id, &local, &batch_id, &batch, &submit);
@@ -114,6 +195,58 @@ impl DataApi {
             l1_submit_result: submit,
             receipt_path: receipt_path.to_string_lossy().to_string(),
         })
+    }
+
+    fn enforce_compliance(&self, action: &DataActionV1, context_id: &str) -> Result<(), ApiError> {
+        if !self.policy.compliance.enabled
+            || self.policy.compliance.strategy == ComplianceStrategy::None
+        {
+            return Ok(());
+        }
+
+        let mut accounts: Vec<AccountId> = Vec::new();
+        match action {
+            DataActionV1::RegisterDatasetV1(a) => accounts.push(a.owner.clone()),
+            DataActionV1::IssueLicenseV1(a) => {
+                accounts.push(a.licensor.clone());
+                accounts.push(a.licensee.clone());
+            }
+            DataActionV1::AppendAttestationV1(a) => accounts.push(a.attestor.clone()),
+            DataActionV1::CreateListingV1(a) => accounts.push(a.licensor.clone()),
+            DataActionV1::GrantEntitlementV1(a) => {
+                self.policy
+                    .require_actor_if_compliance_enabled(a.actor.as_ref())
+                    .map_err(|s| policy_denied_from_str(&s, context_id))?;
+                if let Some(actor) = a.actor.as_ref() {
+                    accounts.push(actor.clone());
+                }
+                accounts.push(a.licensee.clone());
+            }
+            DataActionV1::AddLicensorV1(a) => {
+                accounts.push(a.actor.clone());
+                accounts.push(a.licensor.clone());
+            }
+            DataActionV1::AddAttestorV1(a) => {
+                accounts.push(a.actor.clone());
+                accounts.push(a.attestor.clone());
+            }
+        }
+
+        accounts.sort_by(|a, b| a.0.cmp(&b.0));
+        accounts.dedup_by(|a, b| a.0 == b.0);
+
+        self.policy
+            .compliance_check_accounts(&accounts)
+            .map_err(|s| {
+                warn!(
+                    event = "action_denied",
+                    hub = "data",
+                    action_kind = %data_action_kind(action),
+                    action_id = %context_id,
+                    reason = %s
+                );
+                policy_denied_from_str(&s, context_id)
+            })
     }
 
     pub fn get_dataset(&self, dataset_id_hex: &str) -> Result<Option<serde_json::Value>, ApiError> {
@@ -252,6 +385,8 @@ impl DataApi {
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("{0}")]
+    PolicyDenied(PolicyError),
     #[error("upstream error: {0}")]
     Upstream(String),
     #[error("internal error: {0}")]
@@ -259,13 +394,56 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    fn from_apply(e: DataApplyError) -> Self {
+    fn from_apply_with_context(e: DataApplyError, context_id: String) -> Self {
         match e {
             DataApplyError::Validation(s) => ApiError::BadRequest(s),
-            DataApplyError::Rejected(s) => ApiError::BadRequest(s),
+            DataApplyError::Rejected(s) => match parse_policy_error(&s, context_id.clone()) {
+                Some(p) => ApiError::PolicyDenied(p),
+                None => ApiError::BadRequest(s),
+            },
             DataApplyError::Store(s) => ApiError::Internal(s),
         }
     }
+}
+
+fn data_action_kind(a: &DataActionV1) -> &'static str {
+    match a {
+        DataActionV1::RegisterDatasetV1(_) => "data_register_dataset",
+        DataActionV1::IssueLicenseV1(_) => "data_issue_license",
+        DataActionV1::AppendAttestationV1(_) => "data_append_attestation",
+        DataActionV1::CreateListingV1(_) => "data_create_listing",
+        DataActionV1::GrantEntitlementV1(_) => "data_grant_entitlement",
+        DataActionV1::AddLicensorV1(_) => "data_add_licensor",
+        DataActionV1::AddAttestorV1(_) => "data_add_attestor",
+    }
+}
+
+fn policy_denied_from_str(s: &str, context_id: &str) -> ApiError {
+    if let Some(p) = parse_policy_error(s, context_id.to_string()) {
+        return ApiError::PolicyDenied(p);
+    }
+    ApiError::BadRequest(s.to_string())
+}
+
+fn parse_policy_error(s: &str, context_id: String) -> Option<PolicyError> {
+    let rest = s.strip_prefix("policy:")?;
+    let mut it = rest.splitn(2, ':');
+    let code_s = it.next()?.trim();
+    let msg = it.next().unwrap_or("").trim().to_string();
+    let code = match code_s {
+        "missing_actor" => PolicyDenyCode::MissingActor,
+        "unauthorized" => PolicyDenyCode::Unauthorized,
+        "delegation_required" => PolicyDenyCode::DelegationRequired,
+        "not_found" => PolicyDenyCode::NotFound,
+        "compliance_denied" => PolicyDenyCode::ComplianceDenied,
+        "invalid_policy_input" => PolicyDenyCode::InvalidPolicyInput,
+        _ => return None,
+    };
+    Some(PolicyError {
+        code,
+        message: msg,
+        context_id,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -377,6 +555,7 @@ mod tests {
             mime_type: None,
             tags: vec!["Example".to_string(), "dataset".to_string()],
             schema_version: 1,
+            attestation_policy: hub_data::AttestationPolicyV1::Anyone,
         };
 
         let res = api.submit_register_dataset(req).unwrap();
@@ -419,6 +598,7 @@ mod tests {
                 mime_type: None,
                 tags: vec![],
                 schema_version: 1,
+                attestation_policy: hub_data::AttestationPolicyV1::Anyone,
             })
             .unwrap();
         let dataset_id = reg.dataset_id.clone().unwrap();
@@ -470,6 +650,7 @@ mod tests {
                 mime_type: None,
                 tags: vec![],
                 schema_version: 1,
+                attestation_policy: hub_data::AttestationPolicyV1::Anyone,
             })
             .unwrap();
         let dataset_id = reg.dataset_id.clone().unwrap();

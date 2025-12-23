@@ -1,5 +1,5 @@
 use hub_fin::canonical::canonical_json_bytes;
-use hub_fin::{AmountU128, Hex32};
+use hub_fin::{AmountU128, Hex32, MintPolicyV1, TransferPolicyV1};
 use hub_fin::{CreateAssetV1, MintUnitsV1, TransferUnitsV1};
 use hub_fin::{FinActionV1, FinEnvelopeV1};
 use l2_core::AccountId;
@@ -12,14 +12,17 @@ fn print_goldens() {
     let create = CreateAssetV1 {
         asset_id: hub_fin::validation::derive_asset_id(
             "Example Euro Stablecoin",
-            "issuer-001",
+            &AccountId::new("issuer-001"),
             "EURX",
         ),
         name: "Example Euro Stablecoin".to_string(),
         symbol: "EURX".to_string(),
-        issuer: "issuer-001".to_string(),
+        issuer: AccountId::new("issuer-001"),
         decimals: 6,
         metadata_uri: Some("https://example.com/eurx".to_string()),
+        actor: Some(AccountId::new("issuer-001")),
+        mint_policy: MintPolicyV1::IssuerOnly,
+        transfer_policy: TransferPolicyV1::Free,
     };
     let create_action = FinActionV1::CreateAssetV1(create.clone());
     let create_env = FinEnvelopeV1::new(create_action.clone()).unwrap();
@@ -28,6 +31,7 @@ fn print_goldens() {
         asset_id: create.asset_id,
         to_account: AccountId::new("acc-alice"),
         amount: AmountU128(20_000_000),
+        actor: Some(AccountId::new("issuer-001")),
         client_tx_id: "mint-001".to_string(),
         memo: Some("genesis allocation".to_string()),
     };
@@ -39,6 +43,7 @@ fn print_goldens() {
         from_account: AccountId::new("acc-alice"),
         to_account: AccountId::new("acc-bob"),
         amount: AmountU128(5_000_000),
+        actor: Some(AccountId::new("acc-alice")),
         client_tx_id: "pay-001".to_string(),
         memo: Some("payment".to_string()),
         purchase_id: None,

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod hub_linkage;
 pub mod l1_contract;
+pub mod policy;
 
 /// Generic transaction envelope shared by all IPPAN L2 hubs.
 ///

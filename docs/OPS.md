@@ -304,3 +304,14 @@ See [LOCAL_RUN.md](LOCAL_RUN.md) for Docker Compose setup.
 - Restrict metrics endpoint to internal network
 
 See [../SECURITY.md](../SECURITY.md) for security policy.
+
+## fin-node audit events (policy/operator friendly)
+
+`fin-node` emits structured `tracing` events for operator/audit workflows:
+
+- **action_attempted**: the node received a request and began evaluation
+- **action_denied**: the node rejected the request (policy/compliance)
+- **action_applied**: the action was applied locally (sled) and a receipt was produced
+- **action_submitted_to_l1**: the batch was submitted to L1 (accepted/rejected metadata)
+
+Common fields include `hub`, `action_kind`, and `action_id` (usable as a deterministic correlation id).

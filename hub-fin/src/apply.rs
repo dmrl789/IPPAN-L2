@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use crate::actions::{CreateAssetV1, FinActionV1, MintUnitsV1, TransferUnitsV1};
+use crate::actions::{
+    CreateAssetV1, FinActionV1, MintPolicyV1, MintUnitsV1, TransferPolicyV1, TransferUnitsV1,
+};
 use crate::canonical::canonical_json_bytes;
 use crate::envelope::FinEnvelopeV1;
 use crate::store::{keys, FinStore, StoreError};
@@ -10,6 +12,7 @@ use crate::validation::{
     validate_mint_units_v1, validate_transfer_units_v1, ValidationError,
 };
 use l2_core::hub_linkage::PurchaseId;
+use l2_core::policy::{PolicyDenyCode, PolicyMode};
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
@@ -49,12 +52,21 @@ pub enum ApplyError {
 }
 
 pub fn apply(env: &FinEnvelopeV1, store: &FinStore) -> Result<ApplyReceipt, ApplyError> {
+    apply_with_policy(env, store, PolicyMode::Permissive, &[])
+}
+
+pub fn apply_with_policy(
+    env: &FinEnvelopeV1,
+    store: &FinStore,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
+) -> Result<ApplyReceipt, ApplyError> {
     let action = env.action.clone();
     let action_id = env.action_id;
 
     let r = store
         .tree()
-        .transaction(|tree| apply_tx(tree, action_id, &action));
+        .transaction(|tree| apply_tx(tree, action_id, &action, mode, admin_accounts));
 
     match r {
         Ok(receipt) => Ok(receipt),
@@ -90,6 +102,8 @@ fn apply_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     action: &FinActionV1,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Idempotency: already applied => success/no-op.
     if tree
@@ -116,9 +130,15 @@ fn apply_tx(
     }
 
     let receipt = match action {
-        FinActionV1::CreateAssetV1(a) => apply_create_asset_v1_tx(tree, action_id, a)?,
-        FinActionV1::MintUnitsV1(a) => apply_mint_units_v1_tx(tree, action_id, a)?,
-        FinActionV1::TransferUnitsV1(a) => apply_transfer_units_v1_tx(tree, action_id, a)?,
+        FinActionV1::CreateAssetV1(a) => {
+            apply_create_asset_v1_tx(tree, action_id, a, mode, admin_accounts)?
+        }
+        FinActionV1::MintUnitsV1(a) => {
+            apply_mint_units_v1_tx(tree, action_id, a, mode, admin_accounts)?
+        }
+        FinActionV1::TransferUnitsV1(a) => {
+            apply_transfer_units_v1_tx(tree, action_id, a, mode, admin_accounts)?
+        }
     };
 
     let receipt_bytes = canonical_json_bytes(&receipt).map_err(|e| {
@@ -135,9 +155,24 @@ fn apply_create_asset_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &CreateAssetV1,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     validate_create_asset_v1(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
+
+    // Policy: actor must equal issuer (or admin in strict).
+    let actor = a.actor.as_ref().unwrap_or(&a.issuer);
+    if mode == PolicyMode::Strict && a.actor.is_none() {
+        return Err(policy_deny(PolicyDenyCode::MissingActor, "missing actor"));
+    }
+    if actor != &a.issuer && !(mode == PolicyMode::Strict && is_admin(actor, admin_accounts)) {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "actor not permitted to create asset",
+        ));
+    }
+
     if tree.get(keys::asset(a.asset_id))?.is_some() {
         return Err(ConflictableTransactionError::Abort(TxError::Rejected(
             "asset_id already exists".to_string(),
@@ -162,12 +197,35 @@ fn apply_mint_units_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &MintUnitsV1,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     validate_mint_units_v1(a).map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
-    if tree.get(keys::asset(a.asset_id))?.is_none() {
-        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
-            "asset_id not found".to_string(),
-        )));
+
+    let asset = get_asset_tx(tree, a.asset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("asset_id not found".to_string()))
+    })?;
+
+    // Policy: mint permissions based on asset.mint_policy.
+    if mode == PolicyMode::Strict && a.actor.is_none() {
+        return Err(policy_deny(PolicyDenyCode::MissingActor, "missing actor"));
+    }
+    let actor = a.actor.as_ref().unwrap_or(&asset.issuer);
+    let mint_ok = match asset.mint_policy {
+        MintPolicyV1::IssuerOnly => actor == &asset.issuer,
+        MintPolicyV1::IssuerOrOperator => {
+            actor == &asset.issuer
+                || tree
+                    .get(keys::delegation(&asset.issuer.0, &actor.0, a.asset_id))?
+                    .is_some()
+        }
+        MintPolicyV1::AdminOnly => is_admin(actor, admin_accounts),
+    };
+    if !mint_ok {
+        return Err(policy_deny(
+            PolicyDenyCode::Unauthorized,
+            "actor not permitted to mint",
+        ));
     }
 
     let bal_key = keys::balance(a.asset_id, &a.to_account.0);
@@ -195,13 +253,58 @@ fn apply_transfer_units_v1_tx(
     tree: &TransactionalTree,
     action_id: ActionId,
     a: &TransferUnitsV1,
+    mode: PolicyMode,
+    admin_accounts: &[AccountId],
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     validate_transfer_units_v1(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
-    if tree.get(keys::asset(a.asset_id))?.is_none() {
-        return Err(ConflictableTransactionError::Abort(TxError::Rejected(
-            "asset_id not found".to_string(),
-        )));
+
+    let asset = get_asset_tx(tree, a.asset_id)?.ok_or_else(|| {
+        ConflictableTransactionError::Abort(TxError::Rejected("asset_id not found".to_string()))
+    })?;
+
+    // Policy: transfers must be initiated by owner, or operator with delegation (strict).
+    if mode == PolicyMode::Strict && a.actor.is_none() {
+        return Err(policy_deny(PolicyDenyCode::MissingActor, "missing actor"));
+    }
+    let actor = a.actor.as_ref().unwrap_or(&a.from_account);
+    if actor != &a.from_account {
+        let delegated = tree
+            .get(keys::delegation(&a.from_account.0, &actor.0, a.asset_id))?
+            .is_some();
+        if mode == PolicyMode::Strict && !delegated && !is_admin(actor, admin_accounts) {
+            return Err(policy_deny(
+                PolicyDenyCode::DelegationRequired,
+                "operator delegation required",
+            ));
+        }
+    }
+
+    // Policy: optional transfer allow/deny lists (deterministic hub state).
+    match asset.transfer_policy {
+        TransferPolicyV1::Free => {}
+        TransferPolicyV1::AllowlistOnly => {
+            let ok = tree
+                .get(keys::transfer_allow(a.asset_id, &a.to_account.0))?
+                .is_some();
+            if !ok {
+                return Err(policy_deny(
+                    PolicyDenyCode::Unauthorized,
+                    "recipient not allowlisted",
+                ));
+            }
+        }
+        TransferPolicyV1::DenylistOnly => {
+            let blocked = tree
+                .get(keys::transfer_deny(a.asset_id, &a.to_account.0))?
+                .is_some();
+            if blocked {
+                return Err(policy_deny(
+                    PolicyDenyCode::Unauthorized,
+                    "recipient denylisted",
+                ));
+            }
+        }
     }
 
     let from_key = keys::balance(a.asset_id, &a.from_account.0);
@@ -248,4 +351,31 @@ fn decode_u128_be(v: &sled::IVec) -> Result<u128, ConflictableTransactionError<T
     let mut b = [0u8; 16];
     b.copy_from_slice(v.as_ref());
     Ok(u128::from_be_bytes(b))
+}
+
+fn is_admin(actor: &AccountId, admin_accounts: &[AccountId]) -> bool {
+    admin_accounts.iter().any(|a| a == actor)
+}
+
+fn policy_deny(
+    code: PolicyDenyCode,
+    message: &'static str,
+) -> ConflictableTransactionError<TxError> {
+    ConflictableTransactionError::Abort(TxError::Rejected(format!(
+        "policy:{}:{}",
+        code.as_str(),
+        message
+    )))
+}
+
+fn get_asset_tx(
+    tree: &TransactionalTree,
+    asset_id: AssetId32,
+) -> Result<Option<CreateAssetV1>, ConflictableTransactionError<TxError>> {
+    let Some(v) = tree.get(keys::asset(asset_id))? else {
+        return Ok(None);
+    };
+    serde_json::from_slice::<CreateAssetV1>(&v)
+        .map(Some)
+        .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))
 }

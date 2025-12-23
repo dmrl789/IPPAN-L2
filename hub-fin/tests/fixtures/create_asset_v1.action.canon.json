@@ -1,1 +1,1 @@
-{"asset_id":"4fb5f38e5f188678775c9acff0904b0302f322dbe2a9fd3a2b5cba583eae5678","decimals":6,"issuer":"issuer-001","metadata_uri":"https://example.com/eurx","name":"Example Euro Stablecoin","symbol":"EURX","type":"create_asset_v1"}
+{"actor":"issuer-001","asset_id":"4fb5f38e5f188678775c9acff0904b0302f322dbe2a9fd3a2b5cba583eae5678","decimals":6,"issuer":"issuer-001","metadata_uri":"https://example.com/eurx","mint_policy":"issuer_only","name":"Example Euro Stablecoin","symbol":"EURX","transfer_policy":"free","type":"create_asset_v1"}

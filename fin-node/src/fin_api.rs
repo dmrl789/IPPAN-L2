@@ -3,25 +3,32 @@
 use base64::Engine as _;
 use hub_fin::apply::ApplyError;
 use hub_fin::{
-    apply, ApplyOutcome, FinActionRequestV1, FinActionV1, FinEnvelopeV1, FinStore, Hex32,
+    apply_with_policy, ApplyOutcome, FinActionRequestV1, FinActionV1, FinEnvelopeV1, FinStore,
+    Hex32,
 };
 use l2_core::l1_contract::{
     FixedAmountV1, HubPayloadEnvelopeV1, L1Client, L1SubmitResult, L2BatchEnvelopeV1,
 };
+use l2_core::policy::{PolicyDenyCode, PolicyError};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
+use tracing::{info, warn};
+
+use crate::policy_runtime::PolicyRuntime;
 
 #[derive(Clone)]
 pub struct FinApi {
     l1: Arc<dyn L1Client + Send + Sync>,
     store: FinStore,
     receipts_dir: PathBuf,
+    policy: PolicyRuntime,
 }
 
 impl FinApi {
+    #[allow(dead_code)]
     pub fn new(
         l1: Arc<dyn L1Client + Send + Sync>,
         store: FinStore,
@@ -31,6 +38,21 @@ impl FinApi {
             l1,
             store,
             receipts_dir,
+            policy: PolicyRuntime::default(),
+        }
+    }
+
+    pub fn new_with_policy(
+        l1: Arc<dyn L1Client + Send + Sync>,
+        store: FinStore,
+        receipts_dir: PathBuf,
+        policy: PolicyRuntime,
+    ) -> Self {
+        Self {
+            l1,
+            store,
+            receipts_dir,
+            policy,
         }
     }
 
@@ -45,9 +67,44 @@ impl FinApi {
         action: FinActionV1,
     ) -> Result<SubmitActionResponseV1, ApiError> {
         let env = FinEnvelopeV1::new(action).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let context_id = env.action_id.to_hex();
+
+        info!(
+            event = "action_attempted",
+            hub = "fin",
+            action_kind = %fin_action_kind(&env.action),
+            action_id = %context_id
+        );
+
+        self.enforce_compliance(&env.action, &context_id)?;
 
         // 1) Apply locally (sled)
-        let local = apply(&env, &self.store).map_err(ApiError::from_apply)?;
+        let local =
+            match apply_with_policy(&env, &self.store, self.policy.mode, &self.policy.admins) {
+                Ok(x) => x,
+                Err(e) => {
+                    let api_err = ApiError::from_apply_with_context(e, context_id.clone());
+                    if let ApiError::PolicyDenied(p) = &api_err {
+                        warn!(
+                            event = "action_denied",
+                            hub = "fin",
+                            action_kind = %fin_action_kind(&env.action),
+                            action_id = %context_id,
+                            code = ?p.code,
+                            message = %p.message
+                        );
+                    }
+                    return Err(api_err);
+                }
+            };
+
+        info!(
+            event = "action_applied",
+            hub = "fin",
+            action_kind = %fin_action_kind(&env.action),
+            action_id = %context_id,
+            outcome = ?local.outcome
+        );
 
         // 2) Wrap into L1 contract envelope (single-item batch)
         let payload: HubPayloadEnvelopeV1 = (&env).into();
@@ -68,6 +125,16 @@ impl FinApi {
             .l1
             .submit_batch(&batch)
             .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        info!(
+            event = "action_submitted_to_l1",
+            hub = "fin",
+            action_kind = %fin_action_kind(&env.action),
+            action_id = %context_id,
+            accepted = submit.accepted,
+            already_known = submit.already_known,
+            l1_tx_id = submit.l1_tx_id.as_ref().map(|x| x.0.as_str()).unwrap_or("")
+        );
 
         // 4) Persist action receipt (includes L1 submission result)
         let receipt =
@@ -210,12 +277,63 @@ impl FinApi {
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok(())
     }
+
+    fn enforce_compliance(&self, action: &FinActionV1, context_id: &str) -> Result<(), ApiError> {
+        if self.policy.compliance.strategy == crate::policy_runtime::ComplianceStrategy::None
+            || !self.policy.compliance.enabled
+        {
+            return Ok(());
+        }
+
+        let mut accounts: Vec<l2_core::AccountId> = Vec::new();
+        match action {
+            FinActionV1::CreateAssetV1(a) => {
+                let actor = a.actor.as_ref().unwrap_or(&a.issuer);
+                accounts.push(actor.clone());
+                accounts.push(a.issuer.clone());
+            }
+            FinActionV1::MintUnitsV1(a) => {
+                self.policy
+                    .require_actor_if_compliance_enabled(a.actor.as_ref())
+                    .map_err(|s| policy_denied_from_str(&s, context_id))?;
+                if let Some(actor) = a.actor.as_ref() {
+                    accounts.push(actor.clone());
+                }
+                accounts.push(a.to_account.clone());
+            }
+            FinActionV1::TransferUnitsV1(a) => {
+                let actor = a.actor.as_ref().unwrap_or(&a.from_account);
+                accounts.push(actor.clone());
+                accounts.push(a.from_account.clone());
+                accounts.push(a.to_account.clone());
+            }
+        }
+
+        // de-dup for predictable behaviour
+        accounts.sort_by(|a, b| a.0.cmp(&b.0));
+        accounts.dedup_by(|a, b| a.0 == b.0);
+
+        self.policy
+            .compliance_check_accounts(&accounts)
+            .map_err(|s| {
+                warn!(
+                    event = "action_denied",
+                    hub = "fin",
+                    action_kind = %fin_action_kind(action),
+                    action_id = %context_id,
+                    reason = %s
+                );
+                policy_denied_from_str(&s, context_id)
+            })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("{0}")]
+    PolicyDenied(PolicyError),
     #[error("upstream error: {0}")]
     Upstream(String),
     #[error("internal error: {0}")]
@@ -223,13 +341,52 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    fn from_apply(e: ApplyError) -> Self {
+    fn from_apply_with_context(e: ApplyError, context_id: String) -> Self {
         match e {
             ApplyError::Validation(s) => ApiError::BadRequest(s),
-            ApplyError::Rejected(s) => ApiError::BadRequest(s),
+            ApplyError::Rejected(s) => match parse_policy_error(&s, context_id.clone()) {
+                Some(p) => ApiError::PolicyDenied(p),
+                None => ApiError::BadRequest(s),
+            },
             ApplyError::Store(s) => ApiError::Internal(s),
         }
     }
+}
+
+fn fin_action_kind(a: &FinActionV1) -> &'static str {
+    match a {
+        FinActionV1::CreateAssetV1(_) => "fin_create_asset",
+        FinActionV1::MintUnitsV1(_) => "fin_mint_units",
+        FinActionV1::TransferUnitsV1(_) => "fin_transfer_units",
+    }
+}
+
+fn policy_denied_from_str(s: &str, context_id: &str) -> ApiError {
+    if let Some(p) = parse_policy_error(s, context_id.to_string()) {
+        return ApiError::PolicyDenied(p);
+    }
+    ApiError::BadRequest(s.to_string())
+}
+
+fn parse_policy_error(s: &str, context_id: String) -> Option<PolicyError> {
+    let rest = s.strip_prefix("policy:")?;
+    let mut it = rest.splitn(2, ':');
+    let code_s = it.next()?.trim();
+    let msg = it.next().unwrap_or("").trim().to_string();
+    let code = match code_s {
+        "missing_actor" => PolicyDenyCode::MissingActor,
+        "unauthorized" => PolicyDenyCode::Unauthorized,
+        "delegation_required" => PolicyDenyCode::DelegationRequired,
+        "not_found" => PolicyDenyCode::NotFound,
+        "compliance_denied" => PolicyDenyCode::ComplianceDenied,
+        "invalid_policy_input" => PolicyDenyCode::InvalidPolicyInput,
+        _ => return None,
+    };
+    Some(PolicyError {
+        code,
+        message: msg,
+        context_id,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -6,7 +6,6 @@ use l2_core::AccountId;
 
 pub const NAME_MAX_LEN: usize = 128;
 pub const SYMBOL_MAX_LEN: usize = 16;
-pub const ISSUER_MAX_LEN: usize = 128;
 pub const METADATA_URI_MAX_LEN: usize = 256;
 pub const MEMO_MAX_LEN: usize = 256;
 pub const ACCOUNT_MAX_LEN: usize = 128;
@@ -21,7 +20,7 @@ pub enum ValidationError {
 pub fn validate_create_asset_v1(a: &CreateAssetV1) -> Result<(), ValidationError> {
     validate_bounded("name", &a.name, NAME_MAX_LEN)?;
     validate_bounded("symbol", &a.symbol, SYMBOL_MAX_LEN)?;
-    validate_bounded("issuer", &a.issuer, ISSUER_MAX_LEN)?;
+    validate_account_id("issuer", &a.issuer)?;
     if let Some(uri) = a.metadata_uri.as_deref() {
         validate_bounded("metadata_uri", uri, METADATA_URI_MAX_LEN)?;
     }
@@ -48,6 +47,9 @@ pub fn validate_mint_units_v1(a: &MintUnitsV1) -> Result<(), ValidationError> {
     if let Some(memo) = a.memo.as_deref() {
         validate_bounded("memo", memo, MEMO_MAX_LEN)?;
     }
+    if let Some(actor) = a.actor.as_ref() {
+        validate_account_id("actor", actor)?;
+    }
     if a.amount.0 == 0 {
         return Err(ValidationError::Invalid("amount must be > 0".to_string()));
     }
@@ -60,6 +62,9 @@ pub fn validate_transfer_units_v1(a: &TransferUnitsV1) -> Result<(), ValidationE
     validate_bounded("client_tx_id", &a.client_tx_id, CLIENT_TX_ID_MAX_LEN)?;
     if let Some(memo) = a.memo.as_deref() {
         validate_bounded("memo", memo, MEMO_MAX_LEN)?;
+    }
+    if let Some(actor) = a.actor.as_ref() {
+        validate_account_id("actor", actor)?;
     }
     if a.amount.0 == 0 {
         return Err(ValidationError::Invalid("amount must be > 0".to_string()));
@@ -86,10 +91,10 @@ fn validate_bounded(field: &str, s: &str, max_len: usize) -> Result<(), Validati
 
 /// Deterministically derive an asset id per MVP v1:
 /// `asset_id = blake3(name || issuer || symbol)` (UTF-8 bytes, direct concatenation).
-pub fn derive_asset_id(name: &str, issuer: &str, symbol: &str) -> AssetId32 {
+pub fn derive_asset_id(name: &str, issuer: &AccountId, symbol: &str) -> AssetId32 {
     let mut h = blake3::Hasher::new();
     h.update(name.as_bytes());
-    h.update(issuer.as_bytes());
+    h.update(issuer.0.as_bytes());
     h.update(symbol.as_bytes());
     let mut out = [0u8; 32];
     out.copy_from_slice(h.finalize().as_bytes());

@@ -9,6 +9,15 @@ use l2_core::hub_linkage::{PaymentRef, PurchaseId};
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 
+/// Attestation policy for a dataset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationPolicyV1 {
+    #[default]
+    Anyone,
+    AllowlistOnly,
+}
+
 /// REGISTER_DATASET action (v1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterDatasetV1 {
@@ -29,6 +38,9 @@ pub struct RegisterDatasetV1 {
     pub tags: Vec<String>,
     /// Dataset format schema version (not contract version).
     pub schema_version: u32,
+    /// Who may append attestations for this dataset.
+    #[serde(default)]
+    pub attestation_policy: AttestationPolicyV1,
 }
 
 /// Request shape for registering a dataset (server derives `dataset_id`).
@@ -46,6 +58,8 @@ pub struct RegisterDatasetRequestV1 {
     #[serde(default)]
     pub tags: Vec<String>,
     pub schema_version: u32,
+    #[serde(default)]
+    pub attestation_policy: AttestationPolicyV1,
 }
 
 /// Rights granted by a license (MVP v1).
@@ -190,6 +204,9 @@ pub struct GrantEntitlementV1 {
     pub payment_ref: PaymentRef,
     /// Deterministic entitlement license id (hub-defined).
     pub license_id: LicenseId,
+    /// Actor granting the entitlement (required in strict mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<AccountId>,
 }
 
 /// Request shape for granting entitlement (server derives `license_id`).
@@ -200,6 +217,40 @@ pub struct GrantEntitlementRequestV1 {
     pub dataset_id: DatasetId,
     pub licensee: AccountId,
     pub payment_ref: PaymentRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<AccountId>,
+}
+
+/// ADD_LICENSOR action (v1.2, contract_version remains "v1").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddLicensorV1 {
+    pub dataset_id: DatasetId,
+    pub licensor: AccountId,
+    /// Actor performing the change (dataset owner in strict mode).
+    pub actor: AccountId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddLicensorRequestV1 {
+    pub dataset_id: DatasetId,
+    pub licensor: AccountId,
+    pub actor: AccountId,
+}
+
+/// ADD_ATTESTOR action (v1.2, contract_version remains "v1").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddAttestorV1 {
+    pub dataset_id: DatasetId,
+    pub attestor: AccountId,
+    /// Actor performing the change (dataset owner in strict mode).
+    pub actor: AccountId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddAttestorRequestV1 {
+    pub dataset_id: DatasetId,
+    pub attestor: AccountId,
+    pub actor: AccountId,
 }
 
 /// HUB-DATA action enum (v1).
@@ -211,6 +262,8 @@ pub enum DataActionV1 {
     AppendAttestationV1(AppendAttestationV1),
     CreateListingV1(CreateListingV1),
     GrantEntitlementV1(GrantEntitlementV1),
+    AddLicensorV1(AddLicensorV1),
+    AddAttestorV1(AddAttestorV1),
 }
 
 /// fin-node request shape for submitting HUB-DATA actions.
@@ -222,6 +275,8 @@ pub enum DataActionRequestV1 {
     AppendAttestationV1(AppendAttestationRequestV1),
     CreateListingV1(CreateListingRequestV1),
     GrantEntitlementV1(GrantEntitlementRequestV1),
+    AddLicensorV1(AddLicensorRequestV1),
+    AddAttestorV1(AddAttestorRequestV1),
 }
 
 impl DataActionRequestV1 {
@@ -247,6 +302,7 @@ impl DataActionRequestV1 {
                     mime_type: req.mime_type,
                     tags,
                     schema_version: req.schema_version,
+                    attestation_policy: req.attestation_policy,
                 })
             }
             DataActionRequestV1::IssueLicenseV1(req) => {
@@ -330,8 +386,19 @@ impl DataActionRequestV1 {
                     licensee: req.licensee,
                     payment_ref: req.payment_ref,
                     license_id,
+                    actor: req.actor,
                 })
             }
+            DataActionRequestV1::AddLicensorV1(req) => DataActionV1::AddLicensorV1(AddLicensorV1 {
+                dataset_id: req.dataset_id,
+                licensor: req.licensor,
+                actor: req.actor,
+            }),
+            DataActionRequestV1::AddAttestorV1(req) => DataActionV1::AddAttestorV1(AddAttestorV1 {
+                dataset_id: req.dataset_id,
+                attestor: req.attestor,
+                actor: req.actor,
+            }),
         }
     }
 }

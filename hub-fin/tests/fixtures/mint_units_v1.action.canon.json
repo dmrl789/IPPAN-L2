@@ -1,1 +1,1 @@
-{"amount":"20000000","asset_id":"4fb5f38e5f188678775c9acff0904b0302f322dbe2a9fd3a2b5cba583eae5678","client_tx_id":"mint-001","memo":"genesis allocation","to_account":"acc-alice","type":"mint_units_v1"}
+{"actor":"issuer-001","amount":"20000000","asset_id":"4fb5f38e5f188678775c9acff0904b0302f322dbe2a9fd3a2b5cba583eae5678","client_tx_id":"mint-001","memo":"genesis allocation","to_account":"acc-alice","type":"mint_units_v1"}

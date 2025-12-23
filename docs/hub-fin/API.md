@@ -33,11 +33,14 @@ curl -sS -X POST "http://127.0.0.1:3000/fin/actions" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "create_asset_v1",
+    "actor": "issuer-001",
     "name": "Example Euro Stablecoin",
     "symbol": "EURX",
     "issuer": "issuer-001",
     "decimals": 6,
-    "metadata_uri": "https://example.com/eurx"
+    "metadata_uri": "https://example.com/eurx",
+    "mint_policy": "issuer_only",
+    "transfer_policy": "free"
   }'
 ```
 
@@ -59,6 +62,7 @@ curl -sS -X POST "http://127.0.0.1:3000/fin/actions" \
     \"asset_id\": \"${ASSET_ID}\",
     \"to_account\": \"acc-alice\",
     \"amount\": \"20000000\",
+    \"actor\": \"issuer-001\",
     \"client_tx_id\": \"mint-001\",
     \"memo\": \"genesis allocation\"
   }"
@@ -77,11 +81,23 @@ curl -sS -X POST "http://127.0.0.1:3000/fin/actions" \
     \"from_account\": \"acc-buyer\",
     \"to_account\": \"acc-seller\",
     \"amount\": \"1000000\",
+    \"actor\": \"acc-buyer\",
     \"client_tx_id\": \"<64_hex_chars_or_other_id>\",
     \"memo\": \"dataset license purchase\",
     \"purchase_id\": \"<purchase_id_hex_optional>\"
   }"
 ```
+
+## Delegation (operator transfers)
+
+To allow an operator account to transfer on behalf of a `from_account` for a specific asset:
+
+```bash
+fin-node fin delegate --from acc-alice --operator acc-operator --asset-id "<ASSET_ID_HEX>"
+fin-node fin revoke-delegate --from acc-alice --operator acc-operator --asset-id "<ASSET_ID_HEX>"
+```
+
+In **strict** policy mode, operator transfers require an explicit delegation entry.
 
 ### 3) Query asset
 

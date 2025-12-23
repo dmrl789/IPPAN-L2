@@ -151,6 +151,7 @@ fn mint_overflow_is_rejected_and_not_marked_applied() {
         asset_id,
         to_account: AccountId::new("acc-alice"),
         amount: AmountU128(2),
+        actor: Some(AccountId::new("issuer-001")),
         client_tx_id: "overflow-001".to_string(),
         memo: None,
     };
