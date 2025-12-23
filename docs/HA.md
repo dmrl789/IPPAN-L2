@@ -6,15 +6,33 @@
 - **All nodes** can serve **read-only** HTTP APIs.
 - **Write HTTP requests** can be **leader-only** (recommended) or **allowed on all nodes** (dev).
 
-This is **not** consensus (no Raft/etcd). It is a **best-effort leader lock** using a shared Sled-backed TTL lease.
+This is **not** consensus (no Raft/etcd). It is a **best-effort leader lock** using a TTL lease.
 
 ## Assumptions / requirements
 
-- **Shared storage is required** for correctness (active/active reads, leader-only writers):
+- **Shared storage is required** for correctness when using the built-in (sled-based) lock:
   - receipt directory
   - sled DB directories (fin/data/policy/recon)
   - HA lock directory (`[ha].lock_db_dir`)
-- If storage is **not** shared across nodes, the built-in lock **cannot coordinate** leadership. See **Limitations**.
+
+> **WARNING — shared-storage requirement (sled lock)**
+>
+> The default HA leader lock is stored in the local sled DB under `[ha].lock_db_dir`.
+> **All HA nodes MUST point at the same shared, correctly configured volume** for the lock to coordinate leadership.
+>
+> If nodes are configured with **separate disks** (or a **misconfigured NFS** where not all nodes observe the same writes),
+> two nodes can simultaneously believe they are leader (**split-brain**). This can cause concurrent writer loops (recon/pruning)
+> and state corruption / unexpected side effects.
+>
+> If you need HA across **independent machines/disks/regions**, configure an **external lock provider** (e.g. Redis/Consul).
+
+## Deployment safety matrix
+
+| Deployment pattern | Safe? | Notes |
+|---|---:|---|
+| Single node | ✅ | No leader contention. |
+| Multi-node + shared volume | ✅ | Supported by default sled-based lock (shared `[ha].lock_db_dir`). |
+| Multi-node + separate disks | ❌ | Unsafe until an **external lock provider** is enabled. |
 
 ## Leader-only tasks list
 
@@ -42,6 +60,20 @@ node_id = "fin-node-1"        # must be unique per instance
 lease_ms = 15000              # leader renews every lease_ms/3
 lock_db_dir = "shared/ha_db"  # MUST be shared across nodes
 write_mode = "leader_only"    # recommended: leader_only | allow_all
+
+[ha.lock]
+provider = "sled"             # sled | redis | consul (sled is default)
+
+[ha.lock.redis]
+url = "redis://host:6379"
+key = "ippan:l2:leader"
+lease_ms = 15000
+connect_timeout_ms = 2000
+
+[ha.lock.consul]
+address = "http://consul:8500"
+key = "ippan/l2/leader"
+session_ttl = "15s"
 
 [ha.leader_urls]
 fin-node-1 = "http://10.0.0.11:3000"
@@ -98,13 +130,27 @@ When `[ha].write_mode = "allow_all"`:
 ## Failure playbook
 
 - **Leader crash**: followers take over after `lease_ms` (plus their election polling interval).
-- **Split brain (storage not shared)**: cannot be prevented by this mechanism. Do not use built-in HA without shared storage.
+- **Split brain (storage not shared / NFS misconfigured)**: cannot be prevented by the built-in (sled) lock. Use shared storage correctly, or use an external lock provider.
 - **Clock skew**: lease uses wall-clock milliseconds; moderate skew is tolerated, but extreme skew can delay leadership changes.
 
 ## Limitations / next steps
 
-- Built-in leadership requires **shared storage**; otherwise use an **external lock provider** (Redis/Consul/etc.) or a shared DB.
-- No multi-region preference / leader affinity (could be added as a scoring hook).
-- Followers currently **reject** writes; optional improvement: **request forwarding** to leader.
-- Lease timestamps use `SystemTime` (wall clock), not a monotonic clock (acceptable for operational scheduling only).
+### Limitations (current)
+
+1) **Shared storage required** when using the internal (sled) lock provider.  
+2) **External lock provider required** for independent disks / regions.  
+3) HA provides **leader-only scheduling**, not consensus (no ordering guarantees).  
+4) Network partitions can **delay leadership handover** until TTL expiry / connectivity restored.  
+5) Write routing depends on **operator configuration** (`leader_only` vs `allow_all`).  
+
+### Next steps (roadmap, max 8)
+
+1) Redis-based leader lock provider (this work)  
+2) Consul lock provider for regulated environments  
+3) Request forwarding to leader instead of rejection  
+4) Per-workflow sharded leadership (future)  
+5) Multi-region active/active read scaling  
+6) External queue integration (Kafka / NATS)  
+7) Encrypted-at-rest state stores  
+8) Formal HA correctness proofs
 

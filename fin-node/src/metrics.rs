@@ -173,6 +173,29 @@ pub static HA_LOCK_ACQUIRE_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static HA_LOCK_PROVIDER: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "ha_lock_provider",
+            "Active HA lock provider (1 for active provider type)",
+        ),
+        &["type"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+pub static HA_LOCK_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new("ha_lock_errors_total", "Total HA lock provider errors"),
+        &["provider", "reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
 pub static RECEIPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("receipts_total", "Total receipts by state"),

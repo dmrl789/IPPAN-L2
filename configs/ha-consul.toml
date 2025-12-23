@@ -1,0 +1,18 @@
+[ha]
+enabled = true
+node_id = "fin-node-1"      # must be unique per instance
+lease_ms = 15000            # supervisor tick uses this (renew every lease_ms/3)
+write_mode = "leader_only"  # recommended
+
+[ha.lock]
+provider = "consul"
+
+[ha.lock.consul]
+address = "http://consul:8500"
+key = "ippan/l2/leader"
+session_ttl = "15s"
+
+[ha.leader_urls]
+fin-node-1 = "http://10.0.0.11:3000"
+fin-node-2 = "http://10.0.0.12:3000"
+

@@ -1038,14 +1038,11 @@ mod tests {
         };
 
         let ha_state = HaState::new(cfg);
-        ha_state.set_from_lease(
+        ha_state.set_from_holder(
             false,
-            Some(crate::ha::leader_lock::LeaderLease {
-                holder_id: "node-b".to_string(),
-                acquired_at_ms: 0,
-                renew_at_ms: 0,
+            Some(crate::ha::lock_provider::LeaderInfo {
+                node_id: "node-b".to_string(),
                 expires_at_ms: u64::MAX,
-                lease_ms: 15_000,
             }),
         );
 

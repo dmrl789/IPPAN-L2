@@ -1,0 +1,14 @@
+[ha]
+enabled = true
+node_id = "fin-node-1"        # must be unique per instance
+lease_ms = 15000              # leader renews every lease_ms/3
+lock_db_dir = "shared/ha_db"  # MUST be shared across nodes
+write_mode = "leader_only"    # recommended: leader_only | allow_all
+
+[ha.lock]
+provider = "sled"             # default; explicit for clarity
+
+[ha.leader_urls]
+fin-node-1 = "http://10.0.0.11:3000"
+fin-node-2 = "http://10.0.0.12:3000"
+

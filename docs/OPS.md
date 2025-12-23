@@ -205,6 +205,8 @@ When metrics are enabled, the following metrics are exposed:
 | `ha_is_leader` | Gauge | Whether this node is leader (0/1) |
 | `ha_leader_changes_total{event}` | Counter | Leadership transitions (`became_leader`,`stepped_down`) |
 | `ha_lock_acquire_failures_total{reason}` | Counter | Lock acquisition failures (`contended`,`error`) |
+| `ha_lock_provider{type}` | Gauge | Active HA lock provider (`sled`,`redis`,`consul`) |
+| `ha_lock_errors_total{provider,reason}` | Counter | Lock provider errors (`timeout`,`connection`,`permission`,`misconfigured`,`backend`) |
 | `ippan_oracle_poll_total` | Counter | Oracle poll iterations |
 | `ippan_oracle_push_total` | Counter | Scores pushed to Ethereum |
 
