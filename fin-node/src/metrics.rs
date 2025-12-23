@@ -328,6 +328,29 @@ pub static BOOTSTRAP_VERIFY_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+pub static BOOTSTRAP_PEER_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "bootstrap_peer_failures_total",
+            "Total bootstrap peer download failures",
+        ),
+        &["peer"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_QUORUM_MISMATCHES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "bootstrap_quorum_mismatches_total",
+        "Total bootstrap peer quorum failures",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
 pub static BOOTSTRAP_RESTORE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
