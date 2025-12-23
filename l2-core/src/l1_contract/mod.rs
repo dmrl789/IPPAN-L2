@@ -329,14 +329,36 @@ pub trait L1Client {
 
 #[derive(Debug, thiserror::Error)]
 pub enum L1ClientError {
+    /// Endpoint path required by the contract is missing from configuration.
+    #[error("missing endpoint: {0}")]
+    EndpointMissing(&'static str),
+
+    /// Non-success HTTP status from L1.
+    #[error("http status: {0}")]
+    HttpStatus(u16),
+
+    /// Response decoding failed (JSON/base64/etc).
+    #[error("decode error: {0}")]
+    DecodeError(String),
+
+    /// Request timed out (connect and/or overall request timeout).
+    #[error("timeout")]
+    Timeout,
+
+    /// A bounded retry loop was exhausted.
+    #[error("retry exhausted after {attempts} attempts: {last_error}")]
+    RetryExhausted {
+        attempts: u32,
+        last_error: Box<L1ClientError>,
+    },
+
+    /// Invalid local configuration.
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// Transport error not covered by a structured variant.
     #[error("network error: {0}")]
     Network(String),
-    #[error("protocol error: {0}")]
-    Protocol(String),
-    #[error("serialization error: {0}")]
-    Serialization(String),
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -1,0 +1,16 @@
+{
+  "contract_version": "v1",
+  "hub": "Data",
+  "batch_id": "batch-data-example-v1",
+  "sequence": 1,
+  "tx_count": 1,
+  "fee": 1000000,
+  "payload": {
+    "contract_version": "v1",
+    "hub": "Data",
+    "schema_version": "hub-data.payload.v1",
+    "content_type": "application/json",
+    "payload": "eyJ0eHMiOlt7ImtpbmQiOiJkZW1vIiwidHhfaWQiOiJ0eC0wMDEifV19"
+  },
+  "idempotency_key": "E0zLA4RSYOQjmqYpCwSTvMwUBTQhE0pHqSTnhyfyp24"
+}

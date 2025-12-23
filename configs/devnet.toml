@@ -1,0 +1,60 @@
+# IPPAN-L2 Devnet Configuration (REAL L1 RPC)
+#
+# This profile is intended to run IPPAN-L2 against a real IPPAN CORE devnet.
+#
+# Usage:
+#   export IPPAN_L2_CONFIG=./configs/devnet.toml
+#   cargo run -p fin-node -- --l1-mode http l1 check
+#   cargo run -p fin-node -- --l1-mode http run
+#
+# IMPORTANT:
+# - Do NOT invent endpoint paths in code.
+# - Fill **all** `l1.endpoints.*` paths from IPPAN CORE devnet RPC documentation.
+# - Do NOT commit secrets; use `env:VAR` for sensitive values.
+
+[node]
+# Included in logs as node identity.
+label = "devnet-fin-node-1"
+
+[l1]
+# REQUIRED: IPPAN CORE devnet base URL (scheme+host+port only)
+base_url = "https://REPLACE_WITH_IPPAN_CORE_DEVNET_BASE_URL"
+
+# Optional auth token / API key for the L1 RPC (never logged).
+# api_key = "env:L1_API_KEY"
+api_key = ""
+
+# Timeouts (ms)
+connect_timeout_ms = 3000
+request_timeout_ms = 10000
+
+# Optional readiness gate: require L1 status network_id to match this exact value.
+# expected_network_id = "ippan-devnet"
+
+[l1.retry]
+# Bounded retries for transient errors only (timeouts, 5xx, connection reset).
+max_attempts = 5
+base_delay_ms = 250
+max_delay_ms = 3000
+
+[l1.endpoints]
+# REQUIRED endpoint paths (paths only, not full URLs).
+#
+# Replace the values below with the *actual* IPPAN CORE devnet RPC paths.
+chain_status = "REPLACE_WITH_STATUS_PATH"
+submit_batch = "REPLACE_WITH_SUBMIT_BATCH_PATH"
+get_inclusion = "REPLACE_WITH_GET_INCLUSION_PATH_WITH_{id}"
+get_finality = "REPLACE_WITH_GET_FINALITY_PATH_WITH_{l1_tx_id}"
+
+[server]
+bind_address = "0.0.0.0:3000"
+metrics_enabled = true
+
+[storage]
+# Receipt output directory (relative to working directory or absolute).
+receipts_dir = "receipts"
+
+[logging]
+level = "info"
+format = "json"
+

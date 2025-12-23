@@ -16,23 +16,23 @@ This document describes how to run, monitor, and troubleshoot IPPAN-L2 component
 
 ### FIN Node
 
-The FIN node is currently a demo/CLI tool for testing the FIN Hub.
+The FIN node can be used as a CLI tool and as a long-running service that exposes health/readiness/metrics.
 
 ```bash
-# Basic run
-cargo run -p fin-node
+# Local (mock) service mode
+cargo run -p fin-node -- run
 
-# With custom parameters
-cargo run -p fin-node -- \
-  --batch-id "batch-$(date +%s)" \
-  --from acc-alice \
-  --to acc-bob \
-  --amount 100
+# L1 smoke (read-only)
+cargo run -p fin-node -- l1 status
+cargo run -p fin-node -- l1 check
 
-# With L1 configuration
-cargo run -p fin-node -- \
-  --config configs/local.toml \
-  --batch-id test-batch
+# Submit a deterministic envelope + write receipt
+cargo run -p fin-node -- submit-batch --hub fin --file ./examples/batch_fin_v1.json
+
+# Devnet/staging (real L1 RPC)
+export IPPAN_L2_CONFIG=./configs/devnet.toml
+cargo run -p fin-node -- --l1-mode http l1 check
+cargo run -p fin-node -- --l1-mode http run
 ```
 
 ### Ethereum Oracle Daemon
@@ -97,15 +97,13 @@ export RUST_LOG_FORMAT=json
 
 ## Health Endpoints
 
-### Planned Endpoints
-
-When HTTP server is enabled, the following endpoints will be available:
+`fin-node run` exposes:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/healthz` | GET | Liveness check (always returns 200 if running) |
-| `/readyz` | GET | Readiness check (verifies dependencies) |
-| `/metrics` | GET | Prometheus metrics |
+| `/readyz` | GET | Readiness check (requires L1 `chain_status`; optional network id match) |
+| `/metrics` | GET | Prometheus metrics (if enabled) |
 
 ### Health Check Examples
 
@@ -127,10 +125,10 @@ When metrics are enabled, the following metrics are exposed:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `ippan_l2_process_uptime_seconds` | Gauge | Process uptime |
-| `ippan_l2_l1_rpc_calls_total` | Counter | Total L1 RPC calls |
-| `ippan_l2_l1_rpc_errors_total` | Counter | L1 RPC errors |
-| `ippan_l2_batches_submitted_total` | Counter | Batches submitted |
+| `process_uptime_seconds` | Gauge | Process uptime |
+| `l1_requests_total{method,status}` | Counter | L1 requests (status includes `ok`, http code, or error class) |
+| `l1_request_failures_total{reason}` | Counter | L1 request failures by reason |
+| `submit_batches_total{result}` | Counter | Batch submits (`accepted`,`already_known`,`rejected`) |
 | `ippan_oracle_poll_total` | Counter | Oracle poll iterations |
 | `ippan_oracle_push_total` | Counter | Scores pushed to Ethereum |
 

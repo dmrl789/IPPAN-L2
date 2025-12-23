@@ -4,19 +4,20 @@
 version: "3.8"
 
 services:
-  # FIN Node (demo)
+  # FIN Node (service mode: health/ready/metrics)
   fin-node:
     build:
       context: .
-      dockerfile: Dockerfile
-      target: fin-node
+      dockerfile: Dockerfile.fin-node
     volumes:
       - ./configs:/app/configs:ro
-      - fin-data:/app/data
+      - ./receipts:/app/receipts
     environment:
       - RUST_LOG=info
       - IPPAN_L2_CONFIG=/app/configs/local.toml
-    command: ["--batch-id", "docker-demo"]
+    command: ["run"]
+    ports:
+      - "3000:3000"
     profiles:
       - fin
 
@@ -38,5 +39,4 @@ services:
     profiles:
       - oracle
 
-volumes:
-  fin-data:
+volumes: {}

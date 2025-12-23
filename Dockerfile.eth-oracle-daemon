@@ -1,0 +1,26 @@
+# ippan_eth_oracle_daemon production image (optional)
+#
+# Build:
+#   docker build -f Dockerfile.eth-oracle-daemon -t ippan-l2/oracle-daemon:local .
+
+FROM rust:1.83-slim-bookworm AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY integrations ./integrations
+COPY hub-data ./hub-data
+COPY hub-fin ./hub-fin
+COPY l2-core ./l2-core
+
+RUN cargo build --release -p ippan_eth_oracle_daemon
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /build/target/release/ippan_eth_oracle_daemon /app/ippan_eth_oracle_daemon
+
+RUN useradd -r -s /bin/false ippan && chown -R ippan:ippan /app
+USER ippan
+ENTRYPOINT ["/app/ippan_eth_oracle_daemon"]
+
