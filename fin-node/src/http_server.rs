@@ -7,6 +7,7 @@ use crate::config::{CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig}
 use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
 use crate::ha::supervisor::HaState;
+use crate::bootstrap_mirror_health::MirrorHealthStore;
 use crate::linkage::{ApiError as LinkageApiError, BuyLicenseRequestV1, LinkageApi};
 use crate::metrics;
 use crate::rate_limit::{RateLimiter, SystemTimeSource};
@@ -62,6 +63,7 @@ pub fn serve(
     rate_limit: RateLimitConfig,
     _cors: CorsConfig,
     max_inflight_requests: usize,
+    bootstrap_db_dir: String,
     ha_state: Arc<HaState>,
     write_pause: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -203,6 +205,20 @@ pub fn serve(
             ("GET", "/ha/status") => {
                 let snap = ha_state.snapshot();
                 json_response(200, &snap)
+            }
+            ("GET", "/bootstrap/sources/status") => {
+                let list = MirrorHealthStore::open(bootstrap_db_dir.as_str())
+                    .ok()
+                    .and_then(|s: MirrorHealthStore| s.list().ok())
+                    .unwrap_or_default();
+                json_response(
+                    200,
+                    &serde_json::json!({
+                        "schema_version": 1,
+                        "bootstrap_db_dir": bootstrap_db_dir,
+                        "mirrors": list,
+                    }),
+                )
             }
             // OpenAPI (v1): served only under the versioned prefix.
             ("GET", "/openapi.json") if is_versioned => {
@@ -1277,6 +1293,7 @@ fn route_label(method: &str, path: &str) -> &'static str {
         ("GET", "/metrics") => "GET /metrics",
         ("GET", "/openapi.json") => "GET /openapi.json",
         ("GET", "/ha/status") => "GET /ha/status",
+        ("GET", "/bootstrap/sources/status") => "GET /bootstrap/sources/status",
         ("GET", "/recon/pending") => "GET /recon/pending",
         ("POST", "/fin/actions") => "POST /fin/actions",
         ("POST", "/data/datasets") => "POST /data/datasets",

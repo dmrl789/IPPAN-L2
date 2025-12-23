@@ -364,6 +364,64 @@ pub static BOOTSTRAP_RESTORE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+// ============================================================
+// Multi-source bootstrap hardening metrics
+// ============================================================
+
+pub static BOOTSTRAP_INDEX_QUORUM_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "bootstrap_index_quorum_failures_total",
+        "Total bootstrap index quorum failures",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_ARTIFACT_QUORUM_FAILURES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "bootstrap_artifact_quorum_failures_total",
+        "Total bootstrap artifact quorum failures",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_MIRROR_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "bootstrap_mirror_latency_ms",
+        "Bootstrap mirror request latency (ms)",
+    )
+    .buckets(vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]);
+    let h = HistogramVec::new(opts, &["source"]).expect("metric");
+    REGISTRY.register(Box::new(h.clone())).expect("register");
+    h
+});
+
+pub static BOOTSTRAP_MIRROR_HASH_MISMATCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "bootstrap_mirror_hash_mismatch_total",
+            "Total bootstrap mirror hash mismatches (quorum/verification)",
+        ),
+        &["source"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static BOOTSTRAP_ROLLBACK_BLOCKED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "bootstrap_rollback_blocked_total",
+        "Total bootstrap rollbacks blocked by anti-rollback guard",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
 pub fn gather_text() -> String {
     PROCESS_UPTIME_SECONDS.set(START.elapsed().as_secs_f64());
     let mf = REGISTRY.gather();

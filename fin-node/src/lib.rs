@@ -3,6 +3,7 @@
 #![deny(clippy::float_cmp)]
 
 pub mod bootstrap;
+pub mod bootstrap_mirror_health;
 pub mod bootstrap_store;
 pub mod config;
 pub mod data_api;

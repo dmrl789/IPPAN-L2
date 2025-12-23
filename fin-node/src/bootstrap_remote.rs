@@ -4,6 +4,8 @@ use crate::bootstrap::source::{
     BootstrapSource as _, BootstrapSourceError, HttpSource, PeerSource,
 };
 use crate::bootstrap::{BootstrapIndexV1, BootstrapSetV1};
+use crate::bootstrap_mirror_health::MirrorHealthStore;
+use crate::config::{BootstrapArtifactQuorumMode, BootstrapSourcesMode};
 use crate::config::FinNodeConfig;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -101,6 +103,10 @@ pub struct BootstrapFetchProvenanceV1 {
     pub index_path: String,
     pub index_fetched_from: String,
     #[serde(default)]
+    pub index_quorum_sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_hash: Option<String>,
+    #[serde(default)]
     pub artifacts: Vec<BootstrapArtifactSourceV1>,
 }
 
@@ -166,6 +172,8 @@ pub fn fetch_remote_bootstrap(
     remote_name: &str,
     dry_run: bool,
 ) -> Result<(), BootstrapRemoteError> {
+    // Ensure new metrics are registered even if not triggered yet.
+    let _ = &*crate::metrics::BOOTSTRAP_ROLLBACK_BLOCKED_TOTAL;
     // Metrics are exposed when fin-node runs with its HTTP server, but we also
     // increment them for CLI invocations for consistent accounting.
     let r = fetch_remote_bootstrap_inner(cfg, remote_name, dry_run);
@@ -213,21 +221,29 @@ fn fetch_remote_bootstrap_inner(
         .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_INDEX_INVALID, e))?;
     let index_url = join_url(&remote.base_url, index_path);
 
-    // 1) Fetch index.json
+    // 1) Fetch index.json (single/mirrors/mirrors_quorum).
     let primary = build_primary_source(cfg)?;
     let peers = build_peer_sources(cfg)?;
-    let (index_bytes, index_fetched_from) =
-        fetch_index_with_fallback(cfg, &primary, peers.as_slice())?;
-
-    // Optional signature verification (Phase 5)
-    verify_index_signature(
-        cfg,
-        &primary,
-        index_path,
-        &index_bytes,
-        &index_fetched_from,
-        peers.as_slice(),
-    )?;
+    let (index_bytes, index_fetched_from, index_quorum_sources, index_hash) = match cfg.bootstrap.sources.mode {
+        BootstrapSourcesMode::MirrorsQuorum => {
+            fetch_index_with_quorum(cfg, index_path)?
+        }
+        _ => {
+            // Backward-compatible single-source fetch with fallback.
+            let (b, from) = fetch_index_with_fallback(cfg, &primary, peers.as_slice())?;
+            // Optional signature verification for the chosen source.
+            verify_index_signature(
+                cfg,
+                &primary,
+                index_path,
+                &b,
+                &from,
+                peers.as_slice(),
+            )?;
+            let h = blake3::hash(b.as_ref()).to_hex().to_string();
+            (b, from, Vec::new(), h)
+        }
+    };
     let index: BootstrapIndexV1 = parse_and_validate_index(index_bytes.as_ref())?;
 
     // 2) Select base + required deltas (latest set)
@@ -326,6 +342,8 @@ fn fetch_remote_bootstrap_inner(
             schema_version: 1,
             index_path: index_path.to_string(),
             index_fetched_from: index_fetched_from.clone(),
+            index_quorum_sources: index_quorum_sources.clone(),
+            index_hash: Some(index_hash.clone()),
             artifacts: Vec::new(),
         })
         .unwrap_or_default(),
@@ -349,9 +367,10 @@ fn fetch_remote_bootstrap_inner(
         .min(remote.concurrency)
         .clamp(1, 32);
 
+    let http_sources = build_http_sources_for_artifacts(cfg, &primary)?;
     let mut fetch_artifact_prov: Vec<BootstrapArtifactSourceV1> = Vec::new();
     download_all(
-        &primary,
+        http_sources.as_slice(),
         peers.as_slice(),
         cfg,
         &artifacts_dir,
@@ -392,11 +411,241 @@ fn fetch_remote_bootstrap_inner(
             schema_version: 1,
             index_path: index_path.to_string(),
             index_fetched_from: index_fetched_from.clone(),
+            index_quorum_sources: index_quorum_sources.clone(),
+            index_hash: Some(index_hash.clone()),
             artifacts: fetch_artifact_prov,
         })
         .unwrap_or_default(),
     );
     Ok(())
+}
+
+#[derive(Clone)]
+struct IndexSource {
+    name: String,
+    base_url: String,
+    src: HttpSource,
+}
+
+fn fetch_index_with_quorum(
+    cfg: &FinNodeConfig,
+    index_path: &str,
+) -> Result<(bytes::Bytes, String, Vec<String>, String), BootstrapRemoteError> {
+    let sources = build_index_sources(cfg)?;
+    let max_sources = cfg.bootstrap.sources.max_sources.max(1).min(10);
+    let quorum = cfg.bootstrap.sources.quorum.max(1);
+    let mut sources = sources;
+    sources.truncate(max_sources);
+
+    let mh = MirrorHealthStore::open(cfg.storage.bootstrap_db_dir.as_str()).ok();
+    let now_ms = unix_now_millis();
+
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        String,
+        String,
+        u128,
+        Result<bytes::Bytes, BootstrapRemoteError>,
+    )>();
+    for s in sources.iter().cloned() {
+        let tx = tx.clone();
+        let cfg = cfg.clone();
+        let index_path = index_path.to_string();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let r = fetch_index_one(&cfg, &s, &index_path);
+            let latency_ms = started.elapsed().as_millis();
+            let _ = tx.send((s.name.clone(), s.base_url.clone(), latency_ms, r));
+        });
+    }
+
+    let mut results: Vec<(IndexSource, u128, bytes::Bytes)> = Vec::new();
+    for _ in 0..sources.len() {
+        let Ok((name, base_url, latency_ms, r)) = rx.recv() else {
+            break;
+        };
+        crate::metrics::BOOTSTRAP_MIRROR_LATENCY_MS
+            .with_label_values(&[base_url.as_str()])
+            .observe(latency_ms as f64);
+        match r {
+            Ok(bytes) => {
+                if let Some(mh) = mh.as_ref() {
+                    let _ = mh.record_success(&base_url, u64::try_from(latency_ms).unwrap_or(u64::MAX), now_ms);
+                }
+                if let Some(src) = sources.iter().find(|s| s.base_url == base_url) {
+                    results.push((src.clone(), latency_ms, bytes));
+                }
+            }
+            Err(_e) => {
+                if let Some(mh) = mh.as_ref() {
+                    let _ = mh.record_timeout(&base_url, now_ms);
+                }
+                // Best-effort failure accounting happens via health store (Phase 3).
+                let _ = name;
+            }
+        }
+    }
+
+    // Group by blake3(index_bytes).
+    let mut by_hash: std::collections::BTreeMap<String, Vec<(IndexSource, bytes::Bytes)>> =
+        std::collections::BTreeMap::new();
+    for (src, _lat, bytes) in results {
+        let h = blake3::hash(bytes.as_ref()).to_hex().to_string();
+        by_hash.entry(h).or_default().push((src, bytes));
+    }
+
+    // Pick winner by highest count; tie-break by hash lexicographically.
+    let mut best: Option<(String, usize)> = None;
+    for (h, list) in &by_hash {
+        let n = list.len();
+        match best.as_ref() {
+            None => best = Some((h.clone(), n)),
+            Some((best_h, best_n)) => {
+                if n > *best_n || (n == *best_n && h < best_h) {
+                    best = Some((h.clone(), n));
+                }
+            }
+        }
+    }
+
+    let Some((winning_hash, count)) = best else {
+        crate::metrics::BOOTSTRAP_INDEX_QUORUM_FAILURES_TOTAL.inc();
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_INDEX_INVALID,
+            "index quorum failed: no successful sources",
+        ));
+    };
+    if count < quorum {
+        crate::metrics::BOOTSTRAP_INDEX_QUORUM_FAILURES_TOTAL.inc();
+        for (h, list) in &by_hash {
+            if h != &winning_hash {
+                for (src, _bytes) in list {
+                    crate::metrics::BOOTSTRAP_MIRROR_HASH_MISMATCH_TOTAL
+                        .with_label_values(&[src.base_url.as_str()])
+                        .inc();
+                    if let Some(mh) = mh.as_ref() {
+                        let _ = mh.record_hash_mismatch(src.base_url.as_str(), now_ms);
+                    }
+                }
+            }
+        }
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_INDEX_INVALID,
+            format!(
+                "index quorum failed: need quorum={}, best_count={}, hashes={}",
+                quorum,
+                count,
+                by_hash
+                    .iter()
+                    .map(|(h, v)| format!("{h}:{}", v.len()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ));
+    }
+
+    // Winner: pick the lowest base_url among sources that match (deterministic).
+    let mut winners = by_hash
+        .get(&winning_hash)
+        .cloned()
+        .unwrap_or_default();
+    winners.sort_by(|a, b| a.0.base_url.cmp(&b.0.base_url));
+    let quorum_sources = winners.iter().map(|(s, _)| s.base_url.clone()).collect();
+    let (winner_src, winner_bytes) = winners.into_iter().next().expect("non-empty");
+    Ok((
+        winner_bytes,
+        winner_src.base_url,
+        quorum_sources,
+        winning_hash,
+    ))
+}
+
+fn build_index_sources(cfg: &FinNodeConfig) -> Result<Vec<IndexSource>, BootstrapRemoteError> {
+    let remote = &cfg.bootstrap.remote;
+    let sources_cfg = &cfg.bootstrap.sources;
+    let connect = Duration::from_millis(remote.connect_timeout_ms);
+    let timeout = Duration::from_millis(remote.read_timeout_ms);
+
+    let primary_url = if sources_cfg.primary.trim().is_empty() {
+        remote.base_url.trim().to_string()
+    } else {
+        sources_cfg.primary.trim().to_string()
+    };
+
+    let mut urls: Vec<(String, String)> = Vec::new();
+    urls.push(("primary".to_string(), primary_url));
+    for (i, m) in sources_cfg.mirrors.iter().enumerate() {
+        urls.push((format!("mirror[{i}]"), m.trim().to_string()));
+    }
+
+    // Optional peers can also participate in quorum (HTTP gateways).
+    if cfg.bootstrap.p2p.enabled {
+        for (i, p) in cfg.bootstrap.p2p.peers.iter().enumerate() {
+            urls.push((format!("peer[{i}]"), p.trim().to_string()));
+        }
+    }
+
+    // Deduplicate by base_url (stable).
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut out = Vec::new();
+    for (label, url) in urls {
+        if url.trim().is_empty() {
+            continue;
+        }
+        let url_norm = url.trim_end_matches('/').to_string();
+        if !seen.insert(url_norm.clone()) {
+            continue;
+        }
+        let src = HttpSource::new(
+            format!("sources:{label}:{url_norm}"),
+            url_norm.clone(),
+            remote.index_path.clone(),
+            connect,
+            timeout,
+        )?;
+        out.push(IndexSource {
+            name: label,
+            base_url: url_norm,
+            src,
+        });
+    }
+    Ok(out)
+}
+
+fn fetch_index_one(
+    cfg: &FinNodeConfig,
+    src: &IndexSource,
+    index_path: &str,
+) -> Result<bytes::Bytes, BootstrapRemoteError> {
+    let index_bytes = src.src.fetch_index().map_err(BootstrapRemoteError::from)?;
+
+    // If signing is enabled, each candidate must pass signature verification to count toward quorum.
+    if cfg.bootstrap.signing.enabled {
+        let sig_rel = index_sig_rel_path(index_path);
+        let sig_bytes = src
+            .src
+            .fetch_artifact(&sig_rel, None)
+            .map_err(BootstrapRemoteError::from)?
+            .to_vec();
+
+        #[cfg(feature = "bootstrap-signing")]
+        {
+            verify_index_signature_bytes(
+                cfg.bootstrap.signing.publisher_pubkeys.as_slice(),
+                index_bytes.as_ref(),
+                &sig_bytes,
+            )?;
+        }
+        #[cfg(not(feature = "bootstrap-signing"))]
+        {
+            let _ = sig_bytes;
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_INDEX_INVALID,
+                "bootstrap.signing is enabled but fin-node was built without feature bootstrap-signing",
+            ));
+        }
+    }
+
+    Ok(index_bytes)
 }
 
 pub fn fetch_and_restore(
@@ -794,6 +1043,72 @@ fn build_primary_source(cfg: &FinNodeConfig) -> Result<HttpSource, BootstrapRemo
     )?)
 }
 
+fn build_http_sources_for_artifacts(
+    cfg: &FinNodeConfig,
+    primary: &HttpSource,
+) -> Result<Vec<HttpSource>, BootstrapRemoteError> {
+    let remote = &cfg.bootstrap.remote;
+    let connect = Duration::from_millis(remote.connect_timeout_ms);
+    let timeout = Duration::from_millis(remote.read_timeout_ms);
+
+    let mut out = Vec::new();
+    // Always include the primary source first for backward compatibility.
+    out.push(primary.clone());
+
+    // Only add mirrors when sources.mode is mirrors* or pinned (where we still fetch via mirrors).
+    let mode = cfg.bootstrap.sources.mode;
+    if matches!(
+        mode,
+        BootstrapSourcesMode::Mirrors | BootstrapSourcesMode::MirrorsQuorum | BootstrapSourcesMode::Pinned
+    ) {
+        for (i, m) in cfg.bootstrap.sources.mirrors.iter().enumerate() {
+            let url = m.trim();
+            if url.is_empty() {
+                continue;
+            }
+            out.push(HttpSource::new(
+                format!("mirror[{i}]:{url}"),
+                url.to_string(),
+                remote.index_path.clone(),
+                connect,
+                timeout,
+            )?);
+        }
+    }
+
+    // Deduplicate by base_url (stable first-wins).
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut dedup = Vec::new();
+    for s in out {
+        let key = s.base_url().to_string();
+        if seen.insert(key) {
+            dedup.push(s);
+        }
+    }
+    // Prefer highest-scoring sources (Phase 3), deterministically.
+    if let Ok(mh) = MirrorHealthStore::open(cfg.storage.bootstrap_db_dir.as_str()) {
+        let now_ms = unix_now_millis();
+        const QUARANTINE_MS: u64 = 60 * 60 * 1000;
+        dedup.sort_by(|a, b| {
+            let sa = mh.score_for(a.base_url());
+            let sb = mh.score_for(b.base_url());
+            sb.cmp(&sa).then(a.base_url().cmp(b.base_url()))
+        });
+        // Drop recently mismatching sources unless that would remove all sources.
+        let filtered: Vec<HttpSource> = dedup
+            .iter()
+            .cloned()
+            .filter(|s| !mh.quarantined_recent_mismatch(s.base_url(), now_ms, QUARANTINE_MS))
+            .collect();
+        if !filtered.is_empty() {
+            return Ok(filtered);
+        }
+        // If all are quarantined, return the ranked list (operator may still want progress).
+        return Ok(dedup);
+    }
+    Ok(dedup)
+}
+
 fn build_peer_sources(cfg: &FinNodeConfig) -> Result<Vec<PeerSource>, BootstrapRemoteError> {
     if !cfg.bootstrap.p2p.enabled {
         return Ok(Vec::new());
@@ -1054,7 +1369,7 @@ impl Drop for PermitGuard {
 
 #[allow(clippy::too_many_arguments)]
 fn download_all(
-    primary: &HttpSource,
+    http_sources: &[HttpSource],
     peers: &[PeerSource],
     cfg: &FinNodeConfig,
     artifacts_dir: &Path,
@@ -1075,7 +1390,7 @@ fn download_all(
     loop {
         while in_flight < concurrency {
             let Some(a) = iter.next().cloned() else { break };
-            let primary = primary.clone();
+            let http_sources = http_sources.to_vec();
             let peers = peers.to_vec();
             let cfg = cfg.clone();
             let artifacts_dir = artifacts_dir.to_path_buf();
@@ -1086,7 +1401,7 @@ fn download_all(
             let permits = permits.clone();
             std::thread::spawn(move || {
                 let r = download_one_with_sources(
-                    &primary,
+                    http_sources.as_slice(),
                     peers.as_slice(),
                     &cfg,
                     &artifacts_dir,
@@ -1124,7 +1439,7 @@ fn download_all(
 
 #[allow(clippy::too_many_arguments)]
 fn download_one_with_sources(
-    primary: &HttpSource,
+    http_sources: &[HttpSource],
     peers: &[PeerSource],
     cfg: &FinNodeConfig,
     artifacts_dir: &Path,
@@ -1192,21 +1507,72 @@ fn download_one_with_sources(
         }
     }
 
-    // HTTP fallback (resume-safe).
-    let prov = {
+    // HTTP path (mirrors): either bytes_quorum or hash_only with failover.
+    if cfg.bootstrap.sources.artifact_quorum_mode == BootstrapArtifactQuorumMode::BytesQuorum
+        && cfg.bootstrap.sources.artifact_quorum >= 2
+        && http_sources.len() >= cfg.bootstrap.sources.artifact_quorum
+    {
         let _permit = permits.acquire();
-        download_one_http(
-            primary.client(),
+        match download_from_http_sources_bytes_quorum(
+            http_sources,
+            &permits,
+            &limiter,
+            &a.kind,
+            &a.primary_path,
+            &out_path,
+            a.size_bytes,
+            &a.expected_hash,
+            cfg.bootstrap.sources.artifact_quorum,
+        ) {
+            Ok(used) => {
+                update_download_entry(&state, state_path, a, a.size_bytes)?;
+                return Ok(BootstrapArtifactSourceV1 {
+                    kind: a.kind.clone(),
+                    path: a.path.clone(),
+                    expected_hash: a.expected_hash.clone(),
+                    fetched_from: used,
+                    used_http_fallback: true,
+                });
+            }
+            Err(e) => {
+                crate::metrics::BOOTSTRAP_ARTIFACT_QUORUM_FAILURES_TOTAL.inc();
+                return Err(e);
+            }
+        }
+    }
+
+    // Hash-only: try sources in order, resume-safe only for the first source.
+    for (i, src) in http_sources.iter().enumerate() {
+        let _permit = permits.acquire();
+        // When falling back to non-primary sources, restart from zero (avoid cross-source range resume).
+        if i > 0 {
+            let _ = std::fs::remove_file(&part_path);
+        }
+        let url = src.url_for(&a.primary_path);
+        let prov = download_one_http(
+            src.client(),
             &limiter,
             artifacts_dir,
             state_path,
-            state,
+            state.clone(),
             a,
+            &url,
             &part_path,
             &out_path,
-        )?
-    };
-    Ok(prov)
+        );
+        if let Ok(mut p) = prov {
+            // Record actual URL used.
+            if p.fetched_from.is_empty() {
+                p.fetched_from = vec![url];
+            }
+            return Ok(p);
+        }
+    }
+
+    Err(BootstrapRemoteError::coded(
+        BOOTSTRAP_INDEX_INVALID,
+        "failed to download artifact from any HTTP source",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1217,6 +1583,7 @@ fn download_one_http(
     state_path: &Path,
     state: Arc<Mutex<DownloadStateV1>>,
     a: &FetchArtifactV1,
+    url: &str,
     part_path: &Path,
     out_path: &Path,
 ) -> Result<BootstrapArtifactSourceV1, BootstrapRemoteError> {
@@ -1232,7 +1599,7 @@ fn download_one_http(
     loop {
         attempt = attempt.saturating_add(1);
         let etag = lookup_etag(&state, &a.path, &a.expected_hash);
-        let mut req = client.get(&a.url);
+        let mut req = client.get(url);
         if downloaded > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
             if let Some(etag) = etag.as_ref() {
@@ -1276,7 +1643,7 @@ fn download_one_http(
             if attempt >= 5 {
                 return Err(BootstrapRemoteError::Http(format!(
                     "GET {} failed: http_status={status}",
-                    a.url
+                    url
                 )));
             }
             std::thread::sleep(backoff(attempt));
@@ -1341,7 +1708,7 @@ fn download_one_http(
         kind: a.kind.clone(),
         path: a.path.clone(),
         expected_hash: a.expected_hash.clone(),
-        fetched_from: vec![a.url.clone()],
+        fetched_from: vec![url.to_string()],
         used_http_fallback: true,
     })
 }
@@ -1536,6 +1903,213 @@ fn download_peer_to_temp_and_verify(
     Ok(tmp_path.to_path_buf())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn download_from_http_sources_bytes_quorum(
+    sources: &[HttpSource],
+    permits: &DownloadPermits,
+    limiter: &ByteRateLimiter,
+    kind: &str,
+    rel_path: &str,
+    out_path: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+    quorum: usize,
+) -> Result<Vec<String>, BootstrapRemoteError> {
+    let quorum = quorum.max(1);
+    let (tx, rx) =
+        std::sync::mpsc::channel::<(String, Result<(PathBuf, String), BootstrapRemoteError>)>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    for (i, s) in sources.iter().cloned().enumerate() {
+        let tx = tx.clone();
+        let rel_path = rel_path.to_string();
+        let out_dir = out_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let file_name = out_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact");
+        let tmp_path = out_dir.join(format!("{file_name}.http{i}.tmp"));
+        let kind = kind.to_string();
+        let expected_hash = expected_hash.to_string();
+        let stop = stop.clone();
+        let limiter = limiter.clone();
+        let permits = permits.clone();
+        std::thread::spawn(move || {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let r = download_http_to_temp_and_verify(
+                &s,
+                &permits,
+                &limiter,
+                &kind,
+                &rel_path,
+                &tmp_path,
+                expected_size,
+                &expected_hash,
+            );
+            let _ = tx.send((s.base_url().to_string(), r));
+        });
+    }
+
+    let mut received = 0usize;
+    let mut successes: Vec<(String, PathBuf, String)> = Vec::new(); // (source, tmp_path, bytes_hash)
+    while received < sources.len() {
+        let Ok((src_url, r)) = rx.recv() else {
+            break;
+        };
+        received = received.saturating_add(1);
+        match r {
+            Ok((tmp_path, bytes_hash)) => {
+                successes.push((src_url, tmp_path, bytes_hash));
+            }
+            Err(_e) => {
+                // Best-effort: continue collecting other sources.
+            }
+        }
+    }
+
+    if successes.is_empty() {
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_HASH_MISMATCH,
+            "bytes_quorum failed: no valid sources",
+        ));
+    }
+
+    // Group by bytes hash, pick most common (tie-break by hash).
+    let mut by_hash: std::collections::BTreeMap<String, Vec<(String, PathBuf)>> =
+        std::collections::BTreeMap::new();
+    for (src, p, h) in successes {
+        by_hash.entry(h).or_default().push((src, p));
+    }
+    let mut best: Option<(String, usize)> = None;
+    for (h, v) in &by_hash {
+        let n = v.len();
+        match best.as_ref() {
+            None => best = Some((h.clone(), n)),
+            Some((bh, bn)) => {
+                if n > *bn || (n == *bn && h < bh) {
+                    best = Some((h.clone(), n));
+                }
+            }
+        }
+    }
+    let (winning_hash, count) = best.expect("non-empty");
+    if count < quorum {
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_HASH_MISMATCH,
+            format!(
+                "bytes_quorum failed: need quorum={}, best_count={}",
+                quorum, count
+            ),
+        ));
+    }
+
+    let mut winners = by_hash.remove(&winning_hash).unwrap_or_default();
+    winners.sort_by(|a, b| a.0.cmp(&b.0));
+    let used: Vec<String> = winners.iter().map(|(s, _)| s.clone()).collect();
+
+    // Promote the first winner to out_path; delete remaining temps.
+    for (i, (_src, tmp)) in winners.into_iter().enumerate() {
+        if i == 0 {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&tmp, out_path)?;
+        } else {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+    Ok(used)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_http_to_temp_and_verify(
+    src: &HttpSource,
+    permits: &DownloadPermits,
+    limiter: &ByteRateLimiter,
+    kind: &str,
+    rel_path: &str,
+    tmp_path: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<(PathBuf, String), BootstrapRemoteError> {
+    let _permit = permits.acquire();
+    let url = src.url_for(rel_path);
+    let resp = src
+        .client()
+        .get(&url)
+        .send()
+        .map_err(|e| BootstrapRemoteError::Http(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(BootstrapRemoteError::Http(format!(
+            "GET {url} failed: http_status={status}"
+        )));
+    }
+
+    if let Some(parent) = tmp_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(tmp_path)?;
+    let mut reader = resp;
+    let mut buf = [0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        limiter.acquire(u64::try_from(n).unwrap_or(u64::MAX));
+        std::io::Write::write_all(&mut file, &buf[..n])?;
+        hasher.update(&buf[..n]);
+        downloaded = downloaded.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        if downloaded > expected_size {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_INDEX_INVALID,
+                "http download exceeded expected size",
+            ));
+        }
+    }
+    if downloaded != expected_size {
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(BootstrapRemoteError::coded(
+            BOOTSTRAP_INDEX_INVALID,
+            "http download incomplete",
+        ));
+    }
+
+    // Verify expected hash via existing artifact verifiers.
+    if kind == "base" {
+        let m = crate::snapshot::verify_snapshot_v1_tar(tmp_path)
+            .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_HASH_MISMATCH, e.to_string()))?;
+        if m.hash != expected_hash {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_HASH_MISMATCH,
+                "http base hash mismatch",
+            ));
+        }
+    } else {
+        let d = crate::bootstrap::parse_delta_snapshot_v1_tar(tmp_path)
+            .map_err(|e| BootstrapRemoteError::coded(BOOTSTRAP_HASH_MISMATCH, e.to_string()))?;
+        if d.manifest.hash != expected_hash {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(BootstrapRemoteError::coded(
+                BOOTSTRAP_HASH_MISMATCH,
+                "http delta hash mismatch",
+            ));
+        }
+    }
+
+    Ok((tmp_path.to_path_buf(), hasher.finalize().to_hex().to_string()))
+}
+
 fn update_download_entry(
     state: &Arc<Mutex<DownloadStateV1>>,
     state_path: &Path,
@@ -1721,7 +2295,7 @@ fn verify_index_signature(
     cfg: &FinNodeConfig,
     primary: &HttpSource,
     index_path: &str,
-    index_bytes: &bytes::Bytes,
+    _index_bytes: &bytes::Bytes,
     index_fetched_from: &str,
     peers: &[PeerSource],
 ) -> Result<(), BootstrapRemoteError> {
@@ -1764,7 +2338,7 @@ fn verify_index_signature(
     {
         verify_index_signature_bytes(
             scfg.publisher_pubkeys.as_slice(),
-            index_bytes.as_ref(),
+            _index_bytes.as_ref(),
             &sig_bytes,
         )
     }

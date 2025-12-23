@@ -144,6 +144,26 @@
         }
       }
     },
+    "/api/v1/bootstrap/sources/status": {
+      "get": {
+        "tags": ["HA"],
+        "summary": "Bootstrap sources/mirrors health status (best-effort)",
+        "responses": {
+          "200": {
+            "description": "Mirror health status",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BootstrapSourcesStatusResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/recon/pending": {
       "get": {
         "tags": ["Recon"],
@@ -995,6 +1015,32 @@
           "leader_id": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
           "lease_ms": { "type": "integer", "minimum": 1 },
           "expires_in_ms": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      },
+      "BootstrapSourcesStatusResponse": {
+        "type": "object",
+        "required": ["schema_version", "bootstrap_db_dir", "mirrors"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "bootstrap_db_dir": { "type": "string" },
+          "mirrors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["schema_version", "source", "successes", "timeouts", "hash_mismatches", "avg_latency_ms", "score"],
+              "properties": {
+                "schema_version": { "type": "integer" },
+                "source": { "type": "string" },
+                "successes": { "type": "integer", "minimum": 0 },
+                "timeouts": { "type": "integer", "minimum": 0 },
+                "hash_mismatches": { "type": "integer", "minimum": 0 },
+                "avg_latency_ms": { "type": "integer", "minimum": 0 },
+                "score": { "type": "integer" }
+              },
+              "additionalProperties": true
+            }
+          }
         },
         "additionalProperties": false
       },

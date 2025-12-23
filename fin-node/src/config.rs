@@ -907,12 +907,118 @@ impl Default for SnapshotScheduleConfig {
 pub struct BootstrapConfig {
     #[serde(default)]
     pub remote: BootstrapRemoteConfig,
+    /// Multi-source snapshot repository configuration (mirrors/quorum/pinned).
+    #[serde(default)]
+    pub sources: BootstrapSourcesConfig,
     #[serde(default)]
     pub signing: BootstrapSigningConfig,
     #[serde(default)]
     pub p2p: BootstrapP2pConfig,
     #[serde(default)]
     pub transfer: BootstrapTransferConfig,
+    /// Trusted pinned snapshot set (used when `[bootstrap.sources].mode = "pinned"`).
+    #[serde(default)]
+    pub pinned: BootstrapPinnedConfig,
+}
+
+/// Multi-source repository selection mode.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapSourcesMode {
+    /// Use a single HTTP source (back-compat default).
+    #[default]
+    Single,
+    /// Use multiple mirrors (best-effort failover; no quorum required for index).
+    Mirrors,
+    /// Require quorum agreement across sources for index hash + artifact hashes.
+    MirrorsQuorum,
+    /// Accept only explicitly pinned base+delta hashes.
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapArtifactQuorumMode {
+    /// Download once from best source; verify against index/pinned hash.
+    #[default]
+    HashOnly,
+    /// Download from N sources; require identical content hash (and size match).
+    BytesQuorum,
+}
+
+/// Remote bootstrap sources configuration (HTTP mirrors + optional peers).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapSourcesConfig {
+    #[serde(default)]
+    pub mode: BootstrapSourcesMode,
+    /// Primary HTTP base URL (defaults to `[bootstrap.remote].base_url` when empty).
+    #[serde(default)]
+    pub primary: String,
+    /// Additional HTTP mirror base URLs.
+    #[serde(default)]
+    pub mirrors: Vec<String>,
+    /// Quorum required in `mirrors_quorum` mode.
+    #[serde(default = "default_bootstrap_sources_quorum")]
+    pub quorum: usize,
+    /// Bounded maximum number of sources considered (primary + mirrors + peers).
+    #[serde(default = "default_bootstrap_sources_max_sources")]
+    pub max_sources: usize,
+    /// Artifact quorum mode.
+    #[serde(default)]
+    pub artifact_quorum_mode: BootstrapArtifactQuorumMode,
+    /// In `bytes_quorum`, number of distinct sources required.
+    #[serde(default = "default_bootstrap_sources_artifact_quorum")]
+    pub artifact_quorum: usize,
+}
+
+fn default_bootstrap_sources_quorum() -> usize {
+    2
+}
+
+fn default_bootstrap_sources_max_sources() -> usize {
+    5
+}
+
+fn default_bootstrap_sources_artifact_quorum() -> usize {
+    1
+}
+
+impl Default for BootstrapSourcesConfig {
+    fn default() -> Self {
+        Self {
+            mode: BootstrapSourcesMode::Single,
+            primary: String::new(),
+            mirrors: Vec::new(),
+            quorum: default_bootstrap_sources_quorum(),
+            max_sources: default_bootstrap_sources_max_sources(),
+            artifact_quorum_mode: BootstrapArtifactQuorumMode::HashOnly,
+            artifact_quorum: default_bootstrap_sources_artifact_quorum(),
+        }
+    }
+}
+
+/// Pinned trusted snapshot set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapPinnedConfig {
+    /// Base snapshot manifest hash (required in pinned mode).
+    #[serde(default)]
+    pub base_hash: String,
+    /// Ordered delta manifest hashes (optional; may be empty to restore base only).
+    #[serde(default)]
+    pub delta_hashes: Vec<String>,
+    /// Optional pinned index.json hash (blake3(index_bytes)) for extra auditing.
+    #[serde(default)]
+    pub index_hash: Option<String>,
+}
+
+impl Default for BootstrapPinnedConfig {
+    fn default() -> Self {
+        Self {
+            base_hash: String::new(),
+            delta_hashes: Vec::new(),
+            index_hash: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1105,11 +1211,140 @@ impl Default for BootstrapSigningConfig {
 impl BootstrapConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.remote.validate()?;
+        self.sources
+            .validate(&self.remote, &self.p2p, &self.pinned)?;
         self.signing.validate(&self.remote)?;
         self.p2p.validate(&self.remote)?;
         self.transfer.validate(&self.remote)?;
+        self.pinned.validate(&self.sources)?;
         Ok(())
     }
+}
+
+impl BootstrapSourcesConfig {
+    pub fn validate(
+        &self,
+        remote: &BootstrapRemoteConfig,
+        p2p: &BootstrapP2pConfig,
+        pinned: &BootstrapPinnedConfig,
+    ) -> Result<(), String> {
+        if !remote.enabled {
+            // Sources configuration is ignored when remote is disabled.
+            return Ok(());
+        }
+
+        let primary = self.primary.trim();
+        let fallback_primary = remote.base_url.trim();
+        let resolved_primary = if primary.is_empty() {
+            fallback_primary
+        } else {
+            primary
+        };
+
+        if matches!(self.mode, BootstrapSourcesMode::Pinned) {
+            // Pinned mode does not require any specific remote URLs (may still be used to fetch).
+            if pinned.base_hash.trim().is_empty() {
+                return Err("[bootstrap.pinned].base_hash is empty (required for pinned mode)"
+                    .to_string());
+            }
+            return Ok(());
+        }
+
+        // For non-pinned modes, we need at least a primary URL (from sources.primary or remote.base_url).
+        if resolved_primary.is_empty() {
+            return Err(
+                "[bootstrap.sources].primary is empty and [bootstrap.remote].base_url is empty"
+                    .to_string(),
+            );
+        }
+
+        if self.max_sources == 0 {
+            return Err("[bootstrap.sources].max_sources must be >= 1".to_string());
+        }
+        if self.max_sources > 10 {
+            // Keep it bounded (global rule).
+            return Err("[bootstrap.sources].max_sources must be <= 10".to_string());
+        }
+
+        // Validate mirrors list.
+        for (i, m) in self.mirrors.iter().enumerate() {
+            if m.trim().is_empty() {
+                return Err(format!("[bootstrap.sources].mirrors[{i}] is empty"));
+            }
+        }
+
+        if matches!(
+            self.mode,
+            BootstrapSourcesMode::Mirrors | BootstrapSourcesMode::MirrorsQuorum
+        ) && self.mirrors.is_empty()
+        {
+            return Err(
+                "[bootstrap.sources].mode=mirrors* requires at least one entry in mirrors[]"
+                    .to_string(),
+            );
+        }
+
+        if matches!(self.mode, BootstrapSourcesMode::MirrorsQuorum) {
+            if self.quorum == 0 {
+                return Err("[bootstrap.sources].quorum must be >= 1".to_string());
+            }
+            // Count configured sources (primary + mirrors + optional peers if enabled).
+            let peer_n = if p2p.enabled { p2p.peers.len() } else { 0 };
+            let total_sources = 1usize
+                .saturating_add(self.mirrors.len())
+                .saturating_add(peer_n)
+                .min(self.max_sources);
+            if self.quorum > total_sources {
+                return Err(format!(
+                    "[bootstrap.sources].quorum must be <= effective sources (got quorum={}, sources={})",
+                    self.quorum, total_sources
+                ));
+            }
+        }
+
+        if matches!(self.artifact_quorum_mode, BootstrapArtifactQuorumMode::BytesQuorum) {
+            if self.artifact_quorum == 0 {
+                return Err("[bootstrap.sources].artifact_quorum must be >= 1".to_string());
+            }
+            if self.artifact_quorum > self.max_sources {
+                return Err("[bootstrap.sources].artifact_quorum must be <= max_sources".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl BootstrapPinnedConfig {
+    pub fn validate(&self, sources: &BootstrapSourcesConfig) -> Result<(), String> {
+        if sources.mode != BootstrapSourcesMode::Pinned {
+            return Ok(());
+        }
+        if self.base_hash.trim().is_empty() {
+            return Err("[bootstrap.pinned].base_hash is empty".to_string());
+        }
+        validate_hash_hex("[bootstrap.pinned].base_hash", &self.base_hash)?;
+        for (i, h) in self.delta_hashes.iter().enumerate() {
+            validate_hash_hex(&format!("[bootstrap.pinned].delta_hashes[{i}]"), h)?;
+        }
+        if let Some(h) = self.index_hash.as_deref() {
+            if !h.trim().is_empty() {
+                validate_hash_hex("[bootstrap.pinned].index_hash", h)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_hash_hex(field: &str, h: &str) -> Result<(), String> {
+    let raw = hex::decode(h.trim()).map_err(|e| format!("{field} invalid hex: {e}"))?;
+    if raw.len() != 32 {
+        return Err(format!(
+            "{field} must be 32 bytes hex (blake3 hex, 64 chars); got {} bytes",
+            raw.len()
+        ));
+    }
+    Ok(())
 }
 
 impl BootstrapRemoteConfig {
