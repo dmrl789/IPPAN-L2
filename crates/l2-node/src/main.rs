@@ -26,7 +26,8 @@ use l2_batcher::{
 };
 use l2_bridge::{
     spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, DepositClaimRequest,
-    DepositClaimResponse, DepositEvent, DepositStatus, LoggingWatcher,
+    DepositClaimResponse, DepositEvent, DepositStatus, LoggingWatcher, WithdrawRequest,
+    WithdrawStatus,
 };
 use l2_core::forced_inclusion::{
     ForceIncludeRequest, ForceIncludeResponse, ForceIncludeStatus, ForcedInclusionConfig,
@@ -686,6 +687,8 @@ async fn run() -> Result<(), NodeError> {
         // Bridge endpoints
         .route("/bridge/deposit/claim", post(claim_deposit))
         .route("/bridge/deposit/{id}", get(get_deposit))
+        .route("/bridge/withdraw", post(request_withdraw))
+        .route("/bridge/withdraw/{id}", get(get_withdraw))
         // Batch endpoints
         .route("/batch/{hash}", get(get_batch))
         .with_state(state.clone());
@@ -1636,6 +1639,194 @@ async fn get_deposit(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "deposit not found"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("storage error: {e}")
+            })),
+        ),
+    }
+}
+
+/// Request to withdraw from L2 to L1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WithdrawApiRequest {
+    /// Sender address on L2.
+    from_l2: String,
+    /// Recipient address on L1.
+    to_l1: String,
+    /// Asset identifier.
+    asset: String,
+    /// Amount in smallest units.
+    amount: u128,
+    /// Nonce for replay protection.
+    nonce: u64,
+    /// Signature from L2 account (hex, optional for MVP).
+    #[serde(default)]
+    sig: Option<String>,
+}
+
+/// Response to a withdraw request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WithdrawApiResponse {
+    /// Whether the request was accepted.
+    accepted: bool,
+    /// Withdrawal ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdraw_id: Option<String>,
+    /// The full withdrawal request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<WithdrawRequest>,
+    /// Error message (if rejected).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn request_withdraw(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<WithdrawApiRequest>,
+) -> impl IntoResponse {
+    // Validate required fields
+    if req.from_l2.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WithdrawApiResponse {
+                accepted: false,
+                withdraw_id: None,
+                request: None,
+                error: Some("from_l2 is required".to_string()),
+            }),
+        );
+    }
+    if req.to_l1.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WithdrawApiResponse {
+                accepted: false,
+                withdraw_id: None,
+                request: None,
+                error: Some("to_l1 is required".to_string()),
+            }),
+        );
+    }
+    if req.amount == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WithdrawApiResponse {
+                accepted: false,
+                withdraw_id: None,
+                request: None,
+                error: Some("amount must be > 0".to_string()),
+            }),
+        );
+    }
+
+    // Generate withdrawal ID
+    let withdraw_id = WithdrawRequest::generate_id(&req.from_l2, req.nonce);
+
+    // Check if withdrawal already exists
+    if let Ok(true) = state.storage.withdrawal_exists(&withdraw_id) {
+        // Return existing
+        if let Ok(Some(data)) = state.storage.get_withdrawal(&withdraw_id) {
+            if let Ok(existing) = l2_core::canonical_decode::<WithdrawRequest>(&data) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(WithdrawApiResponse {
+                        accepted: false,
+                        withdraw_id: Some(withdraw_id),
+                        request: Some(existing),
+                        error: Some("withdrawal already exists".to_string()),
+                    }),
+                );
+            }
+        }
+    }
+
+    // Create withdrawal request
+    let withdraw = WithdrawRequest {
+        id: withdraw_id.clone(),
+        from_l2: req.from_l2,
+        to_l1: req.to_l1,
+        asset: req.asset,
+        amount: req.amount,
+        nonce: req.nonce,
+        sig: req.sig,
+        created_at_ms: now_ms(),
+        status: WithdrawStatus::Pending,
+        l1_tx: None,
+        chain_id: ChainId(state.settings.chain_id),
+    };
+
+    // Store withdrawal
+    let encoded = match l2_core::canonical_encode(&withdraw) {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WithdrawApiResponse {
+                    accepted: false,
+                    withdraw_id: None,
+                    request: None,
+                    error: Some(format!("encoding error: {e}")),
+                }),
+            );
+        }
+    };
+
+    if let Err(e) = state.storage.put_withdrawal(&withdraw_id, &encoded) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(WithdrawApiResponse {
+                accepted: false,
+                withdraw_id: None,
+                request: None,
+                error: Some(format!("storage error: {e}")),
+            }),
+        );
+    }
+
+    info!(
+        withdraw_id = %withdraw_id,
+        from_l2 = %withdraw.from_l2,
+        to_l1 = %withdraw.to_l1,
+        amount = %withdraw.amount,
+        "created withdrawal request"
+    );
+
+    (
+        StatusCode::OK,
+        Json(WithdrawApiResponse {
+            accepted: true,
+            withdraw_id: Some(withdraw_id),
+            request: Some(withdraw),
+            error: None,
+        }),
+    )
+}
+
+async fn get_withdraw(
+    state: axum::extract::State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.storage.get_withdrawal(&id) {
+        Ok(Some(data)) => match l2_core::canonical_decode::<WithdrawRequest>(&data) {
+            Ok(withdraw) => (
+                StatusCode::OK,
+                Json(serde_json::to_value(withdraw).unwrap()),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("decode error: {e}")
+                })),
+            ),
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "withdrawal not found"
             })),
         ),
         Err(e) => (
