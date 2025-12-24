@@ -17,7 +17,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-prometheus = "0.13"
+prometheus = "0.14"
 l2-core = { path = "../l2-core" }
 l2-storage = { path = "../l2-storage" }
 l2-batcher = { path = "../l2-batcher" }
