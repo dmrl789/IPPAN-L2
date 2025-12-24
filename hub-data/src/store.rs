@@ -6,11 +6,13 @@ use crate::actions::{
 use crate::types::{ActionId, AttestationId, DatasetId, LicenseId, ListingId};
 use base64::Engine as _;
 use l2_core::hub_linkage::PurchaseId;
+use l2_core::storage_encryption::{KeyProvider, SledValueCipher};
 use sled::transaction::ConflictableTransactionError;
 use sled::transaction::TransactionError;
 use sled::Transactional;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 pub const CHANGELOG_VERSION_V1: u32 = 1;
 
@@ -57,14 +59,56 @@ pub struct ChangelogEntryV1 {
 pub struct DataStore {
     tree: sled::Tree,
     changelog: sled::Tree,
+    cipher: Option<SledValueCipher>,
 }
 
 impl DataStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_encryption(path, None, false)
+    }
+
+    pub fn open_with_encryption(
+        path: impl AsRef<Path>,
+        provider: Option<Arc<dyn KeyProvider>>,
+        allow_plaintext_read: bool,
+    ) -> Result<Self, StoreError> {
         let db = sled::open(path)?;
         let tree = db.open_tree("hub-data")?;
         let changelog = db.open_tree("hub-data-changelog")?;
-        Ok(Self { tree, changelog })
+        let cipher = provider.map(|p| SledValueCipher::new(p, "hub-data", allow_plaintext_read));
+        Ok(Self {
+            tree,
+            changelog,
+            cipher,
+        })
+    }
+
+    pub(crate) fn value_cipher(&self) -> Option<&SledValueCipher> {
+        self.cipher.as_ref()
+    }
+
+    fn encrypt_for_store(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let Some(c) = self.cipher.as_ref() else {
+            return Ok(plaintext.to_vec());
+        };
+        c.encrypt_value(key, plaintext)
+            .map_err(|e| StoreError::Decode(format!("encrypt failed: {e}")))
+    }
+
+    fn decrypt_for_store(&self, key: &[u8], stored: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let Some(c) = self.cipher.as_ref() else {
+            return Ok(stored.to_vec());
+        };
+        c.decrypt_value(key, stored)
+            .map_err(|e| StoreError::Decode(format!("decrypt failed: {e}")))
+    }
+
+    fn get_plain(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(v) = self.tree.get(key)? else {
+            return Ok(None);
+        };
+        let plain = self.decrypt_for_store(key, v.as_ref())?;
+        Ok(Some(plain))
     }
 
     pub fn get_dataset(
@@ -72,7 +116,7 @@ impl DataStore {
         dataset_id: DatasetId,
     ) -> Result<Option<RegisterDatasetV1>, StoreError> {
         let key = keys::dataset(dataset_id);
-        let Some(v) = self.tree.get(key)? else {
+        let Some(v) = self.get_plain(&key)? else {
             return Ok(None);
         };
         serde_json::from_slice::<RegisterDatasetV1>(&v)
@@ -107,7 +151,7 @@ impl DataStore {
 
     pub fn get_license(&self, license_id: LicenseId) -> Result<Option<IssueLicenseV1>, StoreError> {
         let key = keys::license(license_id);
-        let Some(v) = self.tree.get(key)? else {
+        let Some(v) = self.get_plain(&key)? else {
             return Ok(None);
         };
         serde_json::from_slice::<IssueLicenseV1>(&v)
@@ -190,7 +234,7 @@ impl DataStore {
         attestation_id: AttestationId,
     ) -> Result<Option<AppendAttestationV1>, StoreError> {
         let key = keys::attestation(attestation_id);
-        let Some(v) = self.tree.get(key)? else {
+        let Some(v) = self.get_plain(&key)? else {
             return Ok(None);
         };
         serde_json::from_slice::<AppendAttestationV1>(&v)
@@ -203,7 +247,7 @@ impl DataStore {
         listing_id: ListingId,
     ) -> Result<Option<CreateListingV1>, StoreError> {
         let key = keys::listing(listing_id);
-        let Some(v) = self.tree.get(key)? else {
+        let Some(v) = self.get_plain(&key)? else {
             return Ok(None);
         };
         serde_json::from_slice::<CreateListingV1>(&v)
@@ -282,7 +326,7 @@ impl DataStore {
         purchase_id: PurchaseId,
     ) -> Result<Option<GrantEntitlementV1>, StoreError> {
         let key = keys::entitlement(purchase_id);
-        let Some(v) = self.tree.get(key)? else {
+        let Some(v) = self.get_plain(&key)? else {
             return Ok(None);
         };
         serde_json::from_slice::<GrantEntitlementV1>(&v)
@@ -508,10 +552,10 @@ impl DataStore {
     }
 
     pub fn get_state_version(&self) -> Result<Option<u32>, StoreError> {
-        let Some(v) = self.tree.get(keys::state_version())? else {
+        let Some(v) = self.get_plain(keys::state_version())? else {
             return Ok(None);
         };
-        let s = String::from_utf8(v.to_vec())
+        let s = String::from_utf8(v)
             .map_err(|e| StoreError::Decode(format!("invalid utf8 state_version: {e}")))?;
         let n = s
             .parse::<u32>()
@@ -543,10 +587,8 @@ impl DataStore {
     }
 
     pub fn get_apply_receipt(&self, action_id: ActionId) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self
-            .tree
-            .get(keys::apply_receipt(action_id))?
-            .map(|v| v.to_vec()))
+        let key = keys::apply_receipt(action_id);
+        self.get_plain(&key)
     }
 
     /// Store a fin-node receipt (includes L1 submission metadata).
@@ -561,12 +603,14 @@ impl DataStore {
     }
 
     pub fn get_final_receipt(&self, action_id: ActionId) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self.tree.get(keys::receipt(action_id))?.map(|v| v.to_vec()))
+        let key = keys::receipt(action_id);
+        self.get_plain(&key)
     }
 
     /// Low-level write used by bootstrap restore (bypasses changelog).
     pub fn raw_put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.tree.insert(key, value)?;
+        let stored = self.encrypt_for_store(key, value)?;
+        self.tree.insert(key, stored)?;
         Ok(())
     }
 
@@ -604,7 +648,10 @@ impl DataStore {
     pub fn export_kv_v1<W: Write>(&self, w: &mut W) -> Result<(), StoreError> {
         for r in self.tree.iter() {
             let (k, v) = r?;
-            write_kv_record_v1(w, k.as_ref(), v.as_ref())
+            let plain = self
+                .decrypt_for_store(k.as_ref(), v.as_ref())
+                .map_err(|e| StoreError::Decode(format!("kv export decrypt failed: {e}")))?;
+            write_kv_record_v1(w, k.as_ref(), plain.as_slice())
                 .map_err(|e| StoreError::Decode(format!("kv export write failed: {e}")))?;
         }
         Ok(())
@@ -631,7 +678,8 @@ impl DataStore {
             .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
         {
             // Snapshot import must not emit changelog entries (bootstrap deltas are separate).
-            store.tree.insert(k, v)?;
+            let stored = store.encrypt_for_store(&k, &v)?;
+            store.tree.insert(k, stored)?;
         }
         Ok(store)
     }
@@ -642,7 +690,8 @@ impl DataStore {
             .map_err(|e| StoreError::Decode(format!("kv import decode failed: {e}")))?
         {
             // Snapshot import must not emit changelog entries (bootstrap deltas are separate).
-            self.tree.insert(k, v)?;
+            let stored = self.encrypt_for_store(&k, &v)?;
+            self.tree.insert(k, stored)?;
         }
         Ok(())
     }
@@ -686,11 +735,12 @@ impl DataStore {
     }
 
     fn tx_put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        let stored = self.encrypt_for_store(key, value)?;
         let r: Result<(), TransactionError<String>> =
             (&self.tree, &self.changelog).transaction(|(t, c)| {
                 let mut ctx = ChangelogTxCtx::load(c)
                     .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
-                t.insert(key, value)?;
+                t.insert(key, stored.as_slice())?;
                 ctx.record_put(c, key, value)
                     .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
                 ctx.store(c)

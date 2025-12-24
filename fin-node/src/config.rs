@@ -31,6 +31,8 @@ pub struct FinNodeConfig {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
+    pub encryption: EncryptionConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -44,6 +46,49 @@ pub struct FinNodeConfig {
     pub snapshots: SnapshotsConfig,
     #[serde(default)]
     pub bootstrap: BootstrapConfig,
+}
+
+// ============================================================
+// Encryption-at-rest configuration (feature: encryption-at-rest)
+// ============================================================
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EncryptionConfig {
+    /// Enable encryption-at-rest behavior for sled values and exported archives.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Key provider type (MVP: "file").
+    #[serde(default)]
+    pub provider: String,
+    /// Current key id (e.g. "k1").
+    #[serde(default)]
+    pub key_id: String,
+    /// Path to current master key file (32-byte hex).
+    #[serde(default)]
+    pub key_path: String,
+    /// Optional directory containing old keys (for decrypt of historical values).
+    #[serde(default)]
+    pub old_keys_dir: String,
+    /// Ordered list of key ids acceptable for decrypt lookup (newest first).
+    #[serde(default)]
+    pub keyring: Vec<String>,
+    /// Dev-only escape hatch: allow reading plaintext values when encryption is enabled.
+    #[serde(default)]
+    pub allow_plaintext_read: bool,
+}
+
+impl Default for EncryptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "file".to_string(),
+            key_id: String::new(),
+            key_path: String::new(),
+            old_keys_dir: String::new(),
+            keyring: Vec::new(),
+            allow_plaintext_read: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -806,6 +851,48 @@ impl FinNodeConfig {
             .validate()
             .map_err(|e| format!("invalid [ha] config: {e}"))?;
 
+        self.encryption
+            .validate()
+            .map_err(|e| format!("invalid [encryption] config: {e}"))?;
+
+        Ok(())
+    }
+}
+
+impl EncryptionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !cfg!(feature = "encryption-at-rest") {
+            return Err(
+                "encryption.enabled=true requires building fin-node with feature encryption-at-rest"
+                    .to_string(),
+            );
+        }
+        if self.provider.trim().is_empty() {
+            return Err("[encryption].provider is empty".to_string());
+        }
+        if self.provider.trim() != "file" {
+            return Err(format!(
+                "[encryption].provider={} unsupported (MVP supports: file)",
+                self.provider.trim()
+            ));
+        }
+        if self.key_id.trim().is_empty() {
+            return Err("[encryption].key_id is empty".to_string());
+        }
+        if self.key_path.trim().is_empty() {
+            return Err("[encryption].key_path is empty".to_string());
+        }
+        if self.keyring.is_empty() {
+            return Err("[encryption].keyring is empty (must include current key id)".to_string());
+        }
+        for (i, k) in self.keyring.iter().enumerate() {
+            if k.trim().is_empty() {
+                return Err(format!("[encryption].keyring[{i}] is empty"));
+            }
+        }
         Ok(())
     }
 }

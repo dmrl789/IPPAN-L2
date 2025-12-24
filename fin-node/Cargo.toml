@@ -36,6 +36,7 @@ redis = { version = "0.27", optional = true }
 tar = "0.4"
 tempfile = "3"
 ed25519-dalek = { version = "2", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 [features]
 default = []
@@ -43,6 +44,7 @@ ha-redis = ["dep:redis"]
 ha-consul = []
 bootstrap-signing = ["dep:ed25519-dalek"]
 bootstrap-ipndht = []
+encryption-at-rest = ["l2-core/encryption-at-rest", "hub-fin/encryption-at-rest", "hub-data/encryption-at-rest", "dep:getrandom"]
 
 [dev-dependencies]
 assert_cmd = "2"

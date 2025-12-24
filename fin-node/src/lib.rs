@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod bootstrap_mirror_health;
 pub mod bootstrap_store;
 pub mod config;
+pub mod crypto;
 pub mod data_api;
 pub mod fin_api;
 pub mod ha;
