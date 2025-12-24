@@ -160,10 +160,10 @@ pub fn sign_envelope(
 
     let signing_bytes = envelope.signing_bytes()?;
     let signature = signing_key.sign(&signing_bytes);
-    
+
     envelope.sequencer_pubkey = signing_key.verifying_key().to_bytes().to_vec();
     envelope.sequencer_sig = signature.to_bytes().to_vec();
-    
+
     Ok(())
 }
 
@@ -199,7 +199,7 @@ pub fn verify_envelope(envelope: &BatchEnvelope) -> Result<bool, BatchEnvelopeEr
     let signature = Signature::from_bytes(&sig_bytes);
 
     let signing_bytes = envelope.signing_bytes()?;
-    
+
     Ok(verifying_key.verify(&signing_bytes, &signature).is_ok())
 }
 
@@ -359,20 +359,12 @@ mod tests {
 
     #[test]
     fn compute_tx_root_deterministic() {
-        let hashes = vec![
-            Hash32([0x01; 32]),
-            Hash32([0x02; 32]),
-            Hash32([0x03; 32]),
-        ];
+        let hashes = vec![Hash32([0x01; 32]), Hash32([0x02; 32]), Hash32([0x03; 32])];
         let root1 = compute_tx_root(&hashes);
         let root2 = compute_tx_root(&hashes);
         assert_eq!(root1, root2);
         // Different order should give different root
-        let hashes_rev = vec![
-            Hash32([0x03; 32]),
-            Hash32([0x02; 32]),
-            Hash32([0x01; 32]),
-        ];
+        let hashes_rev = vec![Hash32([0x03; 32]), Hash32([0x02; 32]), Hash32([0x01; 32])];
         let root_rev = compute_tx_root(&hashes_rev);
         assert_ne!(root1, root_rev);
     }
@@ -434,11 +426,11 @@ mod signing_tests {
 
         let key = test_signing_key();
         sign_envelope(&mut envelope, &key).unwrap();
-        
+
         assert!(envelope.is_signed());
         assert_eq!(envelope.sequencer_pubkey.len(), 32);
         assert_eq!(envelope.sequencer_sig.len(), 64);
-        
+
         let valid = verify_envelope(&envelope).unwrap();
         assert!(valid);
     }
@@ -478,15 +470,15 @@ mod signing_tests {
             Hash32([0x22; 32]),
             vec![0xDE, 0xAD, 0xBE, 0xEF],
         );
-        
+
         let key = test_signing_key();
-        
+
         let mut envelope1 = BatchEnvelope::new_unsigned(payload.clone()).unwrap();
         sign_envelope(&mut envelope1, &key).unwrap();
-        
+
         let mut envelope2 = BatchEnvelope::new_unsigned(payload).unwrap();
         sign_envelope(&mut envelope2, &key).unwrap();
-        
+
         assert_eq!(envelope1.sequencer_sig, envelope2.sequencer_sig);
         assert_eq!(envelope1.sequencer_pubkey, envelope2.sequencer_pubkey);
     }
@@ -504,17 +496,17 @@ mod signing_tests {
             Hash32([0x22; 32]),
             vec![0xDE, 0xAD, 0xBE, 0xEF],
         );
-        
+
         let key = test_signing_key();
         let mut envelope = BatchEnvelope::new_unsigned(payload).unwrap();
         sign_envelope(&mut envelope, &key).unwrap();
-        
+
         // Golden pubkey (deterministic from seed 0x42...)
         assert_eq!(
             hex::encode(&envelope.sequencer_pubkey),
             "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
         );
-        
+
         // The signature should also be deterministic
         let valid = verify_envelope(&envelope).unwrap();
         assert!(valid);

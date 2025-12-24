@@ -174,7 +174,10 @@ pub fn generate_and_write_key_hex(path: &Path, force: bool) -> Result<[u8; 32], 
 ///
 /// Returns the key bytes (caller should NOT print them).
 #[cfg(not(feature = "encryption-at-rest"))]
-pub fn generate_and_write_key_hex(_path: &Path, _force: bool) -> Result<[u8; 32], EncryptToolError> {
+pub fn generate_and_write_key_hex(
+    _path: &Path,
+    _force: bool,
+) -> Result<[u8; 32], EncryptToolError> {
     Err(EncryptToolError::Encrypt(
         "encryption-at-rest feature not enabled".to_string(),
     ))

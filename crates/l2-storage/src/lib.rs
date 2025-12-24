@@ -242,7 +242,10 @@ impl Storage {
     }
 
     /// Get the posting state for a batch.
-    pub fn get_posting_state(&self, batch_hash: &Hash32) -> Result<Option<PostingState>, StorageError> {
+    pub fn get_posting_state(
+        &self,
+        batch_hash: &Hash32,
+    ) -> Result<Option<PostingState>, StorageError> {
         self.posting_state
             .get(batch_hash.0)
             .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
@@ -381,13 +384,16 @@ mod tests {
     fn posting_state_roundtrip() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
+
         let batch_hash = Hash32([0xAA; 32]);
         let state = PostingState::pending(1_700_000_000_000);
-        
+
         storage.set_posting_state(&batch_hash, &state).expect("set");
-        let loaded = storage.get_posting_state(&batch_hash).expect("get").expect("present");
-        
+        let loaded = storage
+            .get_posting_state(&batch_hash)
+            .expect("get")
+            .expect("present");
+
         assert_eq!(loaded, state);
     }
 
@@ -395,24 +401,34 @@ mod tests {
     fn posting_state_transition() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
+
         let batch_hash = Hash32([0xBB; 32]);
-        
+
         // Start as pending
         let pending = PostingState::pending(1_700_000_000_000);
-        storage.set_posting_state(&batch_hash, &pending).expect("set pending");
-        assert!(storage.get_posting_state(&batch_hash).unwrap().unwrap().is_pending());
-        
+        storage
+            .set_posting_state(&batch_hash, &pending)
+            .expect("set pending");
+        assert!(storage
+            .get_posting_state(&batch_hash)
+            .unwrap()
+            .unwrap()
+            .is_pending());
+
         // Transition to posted
         let posted = PostingState::posted("l1tx123".to_string(), 1_700_000_001_000);
-        storage.set_posting_state(&batch_hash, &posted).expect("set posted");
+        storage
+            .set_posting_state(&batch_hash, &posted)
+            .expect("set posted");
         let loaded = storage.get_posting_state(&batch_hash).unwrap().unwrap();
         assert!(loaded.is_posted());
         assert_eq!(loaded.l1_tx(), Some("l1tx123"));
-        
+
         // Transition to confirmed
         let confirmed = PostingState::confirmed("l1tx123".to_string(), 1_700_000_002_000);
-        storage.set_posting_state(&batch_hash, &confirmed).expect("set confirmed");
+        storage
+            .set_posting_state(&batch_hash, &confirmed)
+            .expect("set confirmed");
         let loaded = storage.get_posting_state(&batch_hash).unwrap().unwrap();
         assert!(loaded.is_terminal());
         assert_eq!(loaded.l1_tx(), Some("l1tx123"));
@@ -422,19 +438,25 @@ mod tests {
     fn list_pending_batches() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
+
         // Add some batches in different states
         let hash1 = Hash32([0x01; 32]);
         let hash2 = Hash32([0x02; 32]);
         let hash3 = Hash32([0x03; 32]);
-        
-        storage.set_posting_state(&hash1, &PostingState::pending(1000)).unwrap();
-        storage.set_posting_state(&hash2, &PostingState::posted("tx".to_string(), 2000)).unwrap();
-        storage.set_posting_state(&hash3, &PostingState::pending(3000)).unwrap();
-        
+
+        storage
+            .set_posting_state(&hash1, &PostingState::pending(1000))
+            .unwrap();
+        storage
+            .set_posting_state(&hash2, &PostingState::posted("tx".to_string(), 2000))
+            .unwrap();
+        storage
+            .set_posting_state(&hash3, &PostingState::pending(3000))
+            .unwrap();
+
         let pending = storage.list_pending(10).unwrap();
         assert_eq!(pending.len(), 2);
-        
+
         // Verify they're both pending
         for entry in &pending {
             assert!(entry.state.is_pending());
@@ -445,15 +467,21 @@ mod tests {
     fn list_posted_batches() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
+
         let hash1 = Hash32([0x11; 32]);
         let hash2 = Hash32([0x12; 32]);
         let hash3 = Hash32([0x13; 32]);
-        
-        storage.set_posting_state(&hash1, &PostingState::pending(1000)).unwrap();
-        storage.set_posting_state(&hash2, &PostingState::posted("tx2".to_string(), 2000)).unwrap();
-        storage.set_posting_state(&hash3, &PostingState::confirmed("tx3".to_string(), 3000)).unwrap();
-        
+
+        storage
+            .set_posting_state(&hash1, &PostingState::pending(1000))
+            .unwrap();
+        storage
+            .set_posting_state(&hash2, &PostingState::posted("tx2".to_string(), 2000))
+            .unwrap();
+        storage
+            .set_posting_state(&hash3, &PostingState::confirmed("tx3".to_string(), 3000))
+            .unwrap();
+
         let posted = storage.list_posted(10).unwrap();
         assert_eq!(posted.len(), 1);
         assert!(posted[0].state.is_posted());
@@ -464,13 +492,32 @@ mod tests {
     fn count_posting_states() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
-        storage.set_posting_state(&Hash32([0x01; 32]), &PostingState::pending(1000)).unwrap();
-        storage.set_posting_state(&Hash32([0x02; 32]), &PostingState::pending(1000)).unwrap();
-        storage.set_posting_state(&Hash32([0x03; 32]), &PostingState::posted("tx".to_string(), 2000)).unwrap();
-        storage.set_posting_state(&Hash32([0x04; 32]), &PostingState::confirmed("tx".to_string(), 3000)).unwrap();
-        storage.set_posting_state(&Hash32([0x05; 32]), &PostingState::failed("err".to_string(), 4000, 3)).unwrap();
-        
+
+        storage
+            .set_posting_state(&Hash32([0x01; 32]), &PostingState::pending(1000))
+            .unwrap();
+        storage
+            .set_posting_state(&Hash32([0x02; 32]), &PostingState::pending(1000))
+            .unwrap();
+        storage
+            .set_posting_state(
+                &Hash32([0x03; 32]),
+                &PostingState::posted("tx".to_string(), 2000),
+            )
+            .unwrap();
+        storage
+            .set_posting_state(
+                &Hash32([0x04; 32]),
+                &PostingState::confirmed("tx".to_string(), 3000),
+            )
+            .unwrap();
+        storage
+            .set_posting_state(
+                &Hash32([0x05; 32]),
+                &PostingState::failed("err".to_string(), 4000, 3),
+            )
+            .unwrap();
+
         let counts = storage.count_posting_states().unwrap();
         assert_eq!(counts.pending, 2);
         assert_eq!(counts.posted, 1);
@@ -483,15 +530,17 @@ mod tests {
     fn delete_posting_state() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
+
         let hash = Hash32([0xFF; 32]);
-        storage.set_posting_state(&hash, &PostingState::pending(1000)).unwrap();
-        
+        storage
+            .set_posting_state(&hash, &PostingState::pending(1000))
+            .unwrap();
+
         assert!(storage.get_posting_state(&hash).unwrap().is_some());
         let deleted = storage.delete_posting_state(&hash).unwrap();
         assert!(deleted);
         assert!(storage.get_posting_state(&hash).unwrap().is_none());
-        
+
         // Deleting again returns false
         let deleted_again = storage.delete_posting_state(&hash).unwrap();
         assert!(!deleted_again);
@@ -501,19 +550,24 @@ mod tests {
     fn posting_state_failed() {
         let dir = tempdir().expect("tmpdir");
         let storage = Storage::open(dir.path()).expect("open");
-        
+
         let hash = Hash32([0xEE; 32]);
         let failed = PostingState::failed("network timeout".to_string(), 5000, 3);
-        
+
         storage.set_posting_state(&hash, &failed).unwrap();
         let loaded = storage.get_posting_state(&hash).unwrap().unwrap();
-        
+
         assert!(loaded.is_terminal());
         assert!(!loaded.is_pending());
         assert!(!loaded.is_posted());
         assert_eq!(loaded.l1_tx(), None);
-        
-        if let PostingState::Failed { reason, retry_count, .. } = loaded {
+
+        if let PostingState::Failed {
+            reason,
+            retry_count,
+            ..
+        } = loaded
+        {
             assert_eq!(reason, "network timeout");
             assert_eq!(retry_count, 3);
         } else {

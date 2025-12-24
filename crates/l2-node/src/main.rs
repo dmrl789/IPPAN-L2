@@ -18,9 +18,10 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use ippan_rpc::IppanRpcConfig;
 use l2_batcher::{
-    spawn as spawn_batcher, spawn_reconciler, BatcherConfig, BatcherHandle, BatcherSnapshot,
-    BatchPoster, IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, ReconcilerConfig,
+    spawn as spawn_batcher, spawn_reconciler, BatchPoster, BatcherConfig, BatcherHandle,
+    BatcherSnapshot, IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, ReconcilerConfig,
     ReconcilerHandle,
 };
 use l2_bridge::{
@@ -28,7 +29,6 @@ use l2_bridge::{
 };
 use l2_core::{canonical_hash, ChainId, Hash32, Tx};
 use l2_storage::{PostingStateCounts, Storage};
-use ippan_rpc::IppanRpcConfig;
 use prometheus::{Encoder, IntCounter, IntGauge, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -100,55 +100,55 @@ struct Metrics {
 impl Metrics {
     fn new() -> Self {
         let registry = Registry::new();
-        
+
         let uptime_ms = IntGauge::with_opts(Opts::new(
             "l2_uptime_ms",
             "Uptime of the L2 node in milliseconds",
         ))
         .expect("uptime gauge");
-        
+
         let queue_depth = IntGauge::with_opts(Opts::new(
             "l2_batcher_queue_depth",
             "Current batcher queue depth",
         ))
         .expect("queue gauge");
-        
+
         let queue_capacity = IntGauge::with_opts(Opts::new(
             "l2_admission_queue_capacity",
             "Maximum admission queue capacity",
         ))
         .expect("capacity gauge");
-        
+
         let tx_submitted = IntCounter::with_opts(Opts::new(
             "l2_tx_submitted_total",
             "Total transactions submitted",
         ))
         .expect("tx submitted counter");
-        
+
         let tx_rejected = IntCounter::with_opts(Opts::new(
             "l2_tx_rejected_total",
             "Total transactions rejected",
         ))
         .expect("tx rejected counter");
-        
+
         let batches_pending = IntGauge::with_opts(Opts::new(
             "l2_batches_pending",
             "Number of batches pending posting",
         ))
         .expect("batches pending gauge");
-        
+
         let batches_posted = IntGauge::with_opts(Opts::new(
             "l2_batches_posted",
             "Number of batches posted to L1",
         ))
         .expect("batches posted gauge");
-        
+
         let batches_confirmed = IntGauge::with_opts(Opts::new(
             "l2_batches_confirmed",
             "Number of batches confirmed on L1",
         ))
         .expect("batches confirmed gauge");
-        
+
         let batches_failed = IntGauge::with_opts(Opts::new(
             "l2_post_failures_total",
             "Number of batch posting failures",
@@ -183,12 +183,16 @@ impl Metrics {
             batches_failed,
         }
     }
-    
+
     fn update_posting_counts(&self, counts: &PostingStateCounts) {
-        self.batches_pending.set(i64::try_from(counts.pending).unwrap_or(i64::MAX));
-        self.batches_posted.set(i64::try_from(counts.posted).unwrap_or(i64::MAX));
-        self.batches_confirmed.set(i64::try_from(counts.confirmed).unwrap_or(i64::MAX));
-        self.batches_failed.set(i64::try_from(counts.failed).unwrap_or(i64::MAX));
+        self.batches_pending
+            .set(i64::try_from(counts.pending).unwrap_or(i64::MAX));
+        self.batches_posted
+            .set(i64::try_from(counts.posted).unwrap_or(i64::MAX));
+        self.batches_confirmed
+            .set(i64::try_from(counts.confirmed).unwrap_or(i64::MAX));
+        self.batches_failed
+            .set(i64::try_from(counts.failed).unwrap_or(i64::MAX));
     }
 }
 
@@ -211,7 +215,7 @@ impl AppState {
     fn queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
     }
-    
+
     fn try_enqueue(&self) -> bool {
         let current = self.queue_depth.load(Ordering::Relaxed);
         if current >= self.settings.admission_cap {
@@ -222,7 +226,7 @@ impl AppState {
             .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
     }
-    
+
     fn dequeue(&self) {
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
@@ -346,10 +350,12 @@ async fn run() -> Result<(), NodeError> {
 
     let metrics = Metrics::new();
     let queue_depth = Arc::new(AtomicUsize::new(0));
-    
+
     // Set queue capacity metric
-    metrics.queue_capacity.set(i64::try_from(settings.admission_cap).unwrap_or(i64::MAX));
-    
+    metrics
+        .queue_capacity
+        .set(i64::try_from(settings.admission_cap).unwrap_or(i64::MAX));
+
     let mut batcher_handle = None;
     let mut bridge_handle = None;
     let mut reconciler_handle = None;
@@ -373,7 +379,7 @@ async fn run() -> Result<(), NodeError> {
             max_wait_ms: 1_000,
             chain_id: ChainId(settings.chain_id),
         };
-        
+
         // Create poster based on IPPAN_RPC_URL
         let poster: Arc<dyn BatchPoster> = if !settings.ippan_rpc_url.is_empty() {
             info!(url = %settings.ippan_rpc_url, "using IPPAN RPC poster");
@@ -394,10 +400,10 @@ async fn run() -> Result<(), NodeError> {
             info!("using logging batch poster (IPPAN_RPC_URL not set)");
             Arc::new(LoggingBatchPoster {})
         };
-        
+
         let handle = spawn_batcher(config, Arc::clone(&storage), poster);
         batcher_handle = Some(handle);
-        
+
         // Spawn reconciler (leader-only)
         let reconciler_config = ReconcilerConfig::from_env();
         info!(
@@ -441,10 +447,7 @@ async fn run() -> Result<(), NodeError> {
         .route("/batch/{hash}", get(get_batch))
         .with_state(state.clone());
 
-    let addr: SocketAddr = settings
-        .listen_addr
-        .parse()
-        .expect("invalid listen addr");
+    let addr: SocketAddr = settings.listen_addr.parse().expect("invalid listen addr");
     info!(%addr, "listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -495,19 +498,19 @@ async fn ready(state: axum::extract::State<AppState>) -> impl IntoResponse {
 async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
     let uptime_millis = state.start_instant.elapsed().as_millis();
     let uptime_ms = u64::try_from(uptime_millis).unwrap_or(u64::MAX);
-    
+
     let batcher_snapshot: BatcherSnapshot = if let Some(handle) = &state.batcher {
         handle.snapshot().await
     } else {
         BatcherSnapshot::default()
     };
-    
+
     let bridge_snapshot: BridgeSnapshot = if let Some(handle) = &state.bridge {
         handle.snapshot().await
     } else {
         BridgeSnapshot::default()
     };
-    
+
     // Get posting state counts
     let posting_counts = state.storage.count_posting_states().unwrap_or_default();
 
@@ -557,10 +560,10 @@ async fn metrics_handler(state: axum::extract::State<AppState>) -> impl IntoResp
     } else {
         0
     };
-    
+
     state.metrics.uptime_ms.set(uptime_ms);
     state.metrics.queue_depth.set(queue_depth);
-    
+
     // Update posting counts
     if let Ok(counts) = state.storage.count_posting_states() {
         state.metrics.update_posting_counts(&counts);
@@ -592,7 +595,7 @@ async fn submit_tx(
             }),
         );
     }
-    
+
     // Check if batcher is enabled
     let batcher = match &state.batcher {
         Some(b) => b,
@@ -607,7 +610,7 @@ async fn submit_tx(
             );
         }
     };
-    
+
     // Validate chain_id
     if req.chain_id != state.settings.chain_id {
         state.metrics.tx_rejected.inc();
@@ -623,7 +626,7 @@ async fn submit_tx(
             }),
         );
     }
-    
+
     // Decode payload
     let payload = match hex::decode(&req.payload) {
         Ok(p) => p,
@@ -639,7 +642,7 @@ async fn submit_tx(
             );
         }
     };
-    
+
     // Check payload size
     if payload.len() > state.settings.max_tx_size {
         state.metrics.tx_rejected.inc();
@@ -656,7 +659,7 @@ async fn submit_tx(
             }),
         );
     }
-    
+
     // Check admission queue capacity (429 backpressure)
     if !state.try_enqueue() {
         state.metrics.tx_rejected.inc();
@@ -669,7 +672,7 @@ async fn submit_tx(
             }),
         );
     }
-    
+
     // Create transaction
     let tx = Tx {
         chain_id: ChainId(req.chain_id),
@@ -677,7 +680,7 @@ async fn submit_tx(
         from: req.from,
         payload,
     };
-    
+
     // Compute hash
     let tx_hash = match canonical_hash(&tx) {
         Ok(h) => h,
@@ -694,7 +697,7 @@ async fn submit_tx(
             );
         }
     };
-    
+
     // Store transaction
     if let Err(e) = state.storage.put_tx(&tx) {
         state.dequeue();
@@ -708,7 +711,7 @@ async fn submit_tx(
             }),
         );
     }
-    
+
     // Submit to batcher
     if let Err(e) = batcher.submit_tx(tx).await {
         state.dequeue();
@@ -722,10 +725,10 @@ async fn submit_tx(
             }),
         );
     }
-    
+
     // Success - queue depth will be decremented by batcher
     state.metrics.tx_submitted.inc();
-    
+
     (
         StatusCode::OK,
         Json(SubmitTxResponse {
@@ -752,7 +755,7 @@ async fn get_tx(
             );
         }
     };
-    
+
     // Look up transaction
     match state.storage.get_tx(&tx_hash) {
         Ok(Some(tx)) => {
@@ -763,7 +766,10 @@ async fn get_tx(
                 nonce: tx.nonce,
                 payload_size: tx.payload.len(),
             };
-            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -798,7 +804,7 @@ async fn get_batch(
             );
         }
     };
-    
+
     // Look up batch
     match state.storage.get_batch(&batch_hash) {
         Ok(Some(batch)) => {
@@ -809,7 +815,10 @@ async fn get_batch(
                 tx_count: batch.txs.len(),
                 created_ms: batch.created_ms,
             };
-            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,

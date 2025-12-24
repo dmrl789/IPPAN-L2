@@ -187,7 +187,7 @@ impl IppanBatchPoster {
     fn should_post(&self, hash: &Hash32) -> Result<bool, BatcherError> {
         let state = self.storage.get_posting_state(hash)?;
         match state {
-            None => Ok(true), // Never posted
+            None => Ok(true),                               // Never posted
             Some(PostingState::Pending { .. }) => Ok(true), // Ready to post
             Some(PostingState::Posted { .. }) => Ok(self.config.force_repost),
             Some(PostingState::Confirmed { .. }) => Ok(self.config.force_repost),
@@ -257,7 +257,8 @@ impl BatchPoster for IppanBatchPoster {
         }
 
         // Mark as pending
-        self.storage.set_posting_state(hash, &PostingState::pending(now_ms()))?;
+        self.storage
+            .set_posting_state(hash, &PostingState::pending(now_ms()))?;
 
         // Attempt posting with bounded retries
         let mut last_error: Option<String> = None;
@@ -271,10 +272,8 @@ impl BatchPoster for IppanBatchPoster {
                         l1_tx = %l1_tx,
                         "batch posted successfully"
                     );
-                    self.storage.set_posting_state(
-                        hash,
-                        &PostingState::posted(l1_tx, now_ms()),
-                    )?;
+                    self.storage
+                        .set_posting_state(hash, &PostingState::posted(l1_tx, now_ms()))?;
                     return Ok(());
                 }
                 Err(err) => {
@@ -289,7 +288,9 @@ impl BatchPoster for IppanBatchPoster {
 
                     if retry_count <= self.config.max_retries {
                         // Exponential backoff
-                        let delay_ms = self.config.retry_delay_ms
+                        let delay_ms = self
+                            .config
+                            .retry_delay_ms
                             .saturating_mul(2u64.saturating_pow(retry_count.saturating_sub(1)));
                         let delay = Duration::from_millis(delay_ms.min(10_000)); // Cap at 10s
                         tokio::time::sleep(delay).await;
@@ -361,7 +362,7 @@ impl ReconcilerConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(300_000);
-        
+
         Self {
             interval_ms,
             batch_limit,
@@ -399,7 +400,7 @@ async fn run_reconciler(
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(config.interval_ms));
-    
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -424,21 +425,21 @@ async fn reconcile_cycle(
 ) -> Result<(), BatcherError> {
     // List posted batches
     let posted = storage.list_posted(config.batch_limit)?;
-    
+
     if posted.is_empty() {
         debug!("no posted batches to reconcile");
         return Ok(());
     }
-    
+
     info!(count = posted.len(), "reconciling posted batches");
-    
+
     for entry in posted {
         // Get the L1 tx hash from the state
         let l1_tx = match &entry.state {
             PostingState::Posted { l1_tx, .. } => l1_tx.clone(),
             _ => continue, // Should not happen
         };
-        
+
         // Query IPPAN for transaction status
         let confirmed = if let Some(rpc_client) = client {
             match rpc_client.get_tx(&l1_tx).await {
@@ -465,20 +466,18 @@ async fn reconcile_cycle(
             );
             true // Consider confirmed in best-effort mode
         };
-        
+
         if confirmed {
             info!(
                 batch_hash = %entry.batch_hash.to_hex(),
                 l1_tx = %l1_tx,
                 "batch confirmed on L1"
             );
-            storage.set_posting_state(
-                &entry.batch_hash,
-                &PostingState::confirmed(l1_tx, now_ms()),
-            )?;
+            storage
+                .set_posting_state(&entry.batch_hash, &PostingState::confirmed(l1_tx, now_ms()))?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -711,7 +710,10 @@ mod tests {
     fn post_mode_from_env_str() {
         assert_eq!(PostMode::from_env_str("tx_data"), PostMode::TxData);
         assert_eq!(PostMode::from_env_str("TX_DATA"), PostMode::TxData);
-        assert_eq!(PostMode::from_env_str("tx_payment_memo"), PostMode::TxPaymentMemo);
+        assert_eq!(
+            PostMode::from_env_str("tx_payment_memo"),
+            PostMode::TxPaymentMemo
+        );
         assert_eq!(PostMode::from_env_str("payment"), PostMode::TxPaymentMemo);
         assert_eq!(PostMode::from_env_str("unknown"), PostMode::TxData); // Default
     }
@@ -766,7 +768,7 @@ mod ippan_poster_tests {
     #[tokio::test]
     async fn ippan_poster_success() {
         let server = MockServer::start().await;
-        
+
         Mock::given(method("POST"))
             .and(path("/tx"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -778,7 +780,7 @@ mod ippan_poster_tests {
 
         let dir = tempdir().expect("tmpdir");
         let storage = Arc::new(Storage::open(dir.path()).expect("open"));
-        
+
         let rpc_config = IppanRpcConfig {
             base_url: server.uri(),
             timeout_ms: 5000,
@@ -790,14 +792,15 @@ mod ippan_poster_tests {
             max_retries: 1,
             retry_delay_ms: 10,
         };
-        
-        let poster = IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
-        
+
+        let poster =
+            IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
+
         let batch = test_batch();
         let hash = l2_core::canonical_hash(&batch).unwrap();
-        
+
         poster.post_batch(&batch, &hash).await.unwrap();
-        
+
         // Verify posting state was updated
         let state = storage.get_posting_state(&hash).unwrap().unwrap();
         assert!(state.is_posted());
@@ -807,7 +810,7 @@ mod ippan_poster_tests {
     #[tokio::test]
     async fn ippan_poster_idempotent_skip() {
         let server = MockServer::start().await;
-        
+
         // Should not be called since batch is already confirmed
         Mock::given(method("POST"))
             .and(path("/tx"))
@@ -821,15 +824,17 @@ mod ippan_poster_tests {
 
         let dir = tempdir().expect("tmpdir");
         let storage = Arc::new(Storage::open(dir.path()).expect("open"));
-        
+
         // Pre-set the state as confirmed
         let batch = test_batch();
         let hash = l2_core::canonical_hash(&batch).unwrap();
-        storage.set_posting_state(&hash, &PostingState::confirmed(
-            "existingl1tx".to_string(),
-            1_700_000_000_000,
-        )).unwrap();
-        
+        storage
+            .set_posting_state(
+                &hash,
+                &PostingState::confirmed("existingl1tx".to_string(), 1_700_000_000_000),
+            )
+            .unwrap();
+
         let rpc_config = IppanRpcConfig {
             base_url: server.uri(),
             timeout_ms: 5000,
@@ -841,12 +846,13 @@ mod ippan_poster_tests {
             max_retries: 1,
             retry_delay_ms: 10,
         };
-        
-        let poster = IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
-        
+
+        let poster =
+            IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
+
         // Should skip without error
         poster.post_batch(&batch, &hash).await.unwrap();
-        
+
         // State should remain confirmed with original l1_tx
         let state = storage.get_posting_state(&hash).unwrap().unwrap();
         assert_eq!(state.l1_tx(), Some("existingl1tx"));
@@ -855,7 +861,7 @@ mod ippan_poster_tests {
     #[tokio::test]
     async fn ippan_poster_retry_on_failure() {
         let server = MockServer::start().await;
-        
+
         // First call fails with 500
         Mock::given(method("POST"))
             .and(path("/tx"))
@@ -863,7 +869,7 @@ mod ippan_poster_tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        
+
         // Second call succeeds
         Mock::given(method("POST"))
             .and(path("/tx"))
@@ -876,7 +882,7 @@ mod ippan_poster_tests {
 
         let dir = tempdir().expect("tmpdir");
         let storage = Arc::new(Storage::open(dir.path()).expect("open"));
-        
+
         let rpc_config = IppanRpcConfig {
             base_url: server.uri(),
             timeout_ms: 5000,
@@ -888,14 +894,15 @@ mod ippan_poster_tests {
             max_retries: 2,
             retry_delay_ms: 10,
         };
-        
-        let poster = IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
-        
+
+        let poster =
+            IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
+
         let batch = test_batch();
         let hash = l2_core::canonical_hash(&batch).unwrap();
-        
+
         poster.post_batch(&batch, &hash).await.unwrap();
-        
+
         let state = storage.get_posting_state(&hash).unwrap().unwrap();
         assert!(state.is_posted());
         assert_eq!(state.l1_tx(), Some("retryl1tx"));
