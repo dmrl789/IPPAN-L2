@@ -1,5 +1,7 @@
 # Prefer keeping branch versions for generated locks to reduce merge conflicts
 Cargo.lock merge=ours
+crates/**/Cargo.lock merge=ours
 
 # Favor combining OpenAPI spec changes where possible
 openapi.yaml merge=union
+docs/**/openapi.yaml merge=union
