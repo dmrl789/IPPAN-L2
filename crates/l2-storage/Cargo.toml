@@ -1,0 +1,20 @@
+[package]
+name = "l2-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Sled-backed storage for IPPAN L2 node"
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-core = { path = "../l2-core" }
+sled = "0.34"
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY l2-core ./l2-core
+COPY crates/l2-core ./crates/l2-core
 COPY hub-fin ./hub-fin
 COPY hub-data ./hub-data
 COPY fin-node ./fin-node

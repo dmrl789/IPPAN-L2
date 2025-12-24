@@ -35,11 +35,20 @@ cd IPPAN-L2
 # Build
 make build
 
-# Run FIN node demo
-make run-fin-node
+# Run generic L2 node (health/status/metrics)
+make run
 
 # Run tests
 make test
+```
+
+Status surfaces once `make run` is active:
+
+```bash
+curl -s http://localhost:3000/healthz
+curl -s http://localhost:3000/readyz
+curl -s http://localhost:3000/status | jq
+curl -s http://localhost:3000/metrics
 ```
 
 See [docs/DEV.md](docs/DEV.md) for detailed development instructions.
@@ -48,9 +57,15 @@ See [docs/DEV.md](docs/DEV.md) for detailed development instructions.
 
 ```
 IPPAN-L2/
-├── l2-core/           # Core types and primitives
+├── crates/
+│   ├── l2-core/       # Core types and primitives (canonical encoding + hashing)
+│   ├── l2-storage/    # Sled-backed persistence for tx/batches/receipts
+│   ├── l2-batcher/    # Deterministic batching loop + poster trait
+│   ├── l2-bridge/     # Bridge watcher skeleton
+│   └── l2-node/       # Axum HTTP node exposing health/status/metrics
+├── l2-core/           # Legacy path kept for backward compatibility
 ├── hub-fin/           # Finance Hub implementation
-├── hub-data/          # Data Hub implementation  
+├── hub-data/          # Data Hub implementation
 ├── fin-node/          # FIN Hub executable
 ├── integrations/
 │   └── eth-oracle/    # Ethereum Oracle integration
@@ -69,12 +84,15 @@ IPPAN-L2/
 - [WHITEPAPER.md](docs/WHITEPAPER.md) - Whitepaper-ready notes (Limitations & Resilience)
 - [LOCAL_RUN.md](docs/LOCAL_RUN.md) - Running locally
 - [API.md](docs/API.md) - API reference
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Node/batcher/bridge components
 - [OpenAPI (fin-node)](docs/openapi/README.md) - Production API contract + SDK stub generation
 - [HUB-FIN MVP](docs/hub-fin/README.md) - Finance hub MVP v1 docs (actions + API)
 - [HUB-DATA MVP](docs/hub-data/README.md) - Data hub MVP v1 docs (datasets + licenses + attestations)
 - [HUB linkage](docs/hubs/LINKAGE.md) - Cross-hub IDs and invariants
 - [Buy license](docs/hubs/BUY_LICENSE.md) - End-to-end payment → entitlement workflow
 - [architecture.md](docs/architecture.md) - System architecture
+- [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) - Threat model and mitigations
+- [LEADER.md](docs/LEADER.md) - Sequencer/leader model and rotation notes
 
 ## Status
 

@@ -1,0 +1,162 @@
+openapi: 3.1.0
+info:
+  title: IPPAN L2 Node API
+  version: 0.1.0
+servers:
+  - url: http://localhost:3000
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Node is alive
+  /readyz:
+    get:
+      summary: Readiness check
+      responses:
+        '200':
+          description: Node is ready to accept traffic
+        '503':
+          description: Node is not ready (storage or configuration missing)
+  /status:
+    get:
+      summary: Node status
+      responses:
+        '200':
+          description: Structured status payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+  /tx:
+    post:
+      summary: Submit a transaction (stub)
+      description: Accepts an L2 transaction; in MVP this is a stub for future batching.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Tx'
+      responses:
+        '202':
+          description: Accepted for batching
+    
+  /tx/{hash}:
+    get:
+      summary: Fetch a transaction by hash (stub)
+      parameters:
+        - in: path
+          name: hash
+          required: true
+          schema:
+            type: string
+            description: Hex-encoded 32 byte hash
+      responses:
+        '200':
+          description: Transaction details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tx'
+        '404':
+          description: Not found
+  /batch/{hash}:
+    get:
+      summary: Fetch a batch by hash (stub)
+      parameters:
+        - in: path
+          name: hash
+          required: true
+          schema:
+            type: string
+            description: Hex-encoded batch hash
+      responses:
+        '200':
+          description: Batch details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Batch'
+        '404':
+          description: Not found
+components:
+  schemas:
+    StatusResponse:
+      type: object
+      properties:
+        service:
+          type: object
+          properties:
+            name:
+              type: string
+            version:
+              type: string
+        uptime_ms:
+          type: integer
+          format: int64
+        leader:
+          type: object
+          properties:
+            mode:
+              type: string
+            id:
+              type: string
+            term:
+              type: integer
+              format: int64
+        queue:
+          type: object
+          properties:
+            depth:
+              type: integer
+            capacity:
+              type: integer
+        batcher:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            last_batch_hash:
+              type: string
+              nullable: true
+            last_post_time:
+              type: integer
+              format: int64
+              nullable: true
+        bridge:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            last_event_time:
+              type: integer
+              format: int64
+              nullable: true
+    Tx:
+      type: object
+      properties:
+        chain_id:
+          type: integer
+        nonce:
+          type: integer
+        from:
+          type: string
+        payload:
+          type: string
+          description: Base64-encoded payload
+    Batch:
+      type: object
+      properties:
+        chain_id:
+          type: integer
+        batch_number:
+          type: integer
+        txs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tx'
+        created_ms:
+          type: integer
+          format: int64

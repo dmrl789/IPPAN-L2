@@ -21,6 +21,7 @@ blake3 = "1"
 base64 = "0.22"
 tracing = "0.1"
 hex = "0.4"
+bincode = { version = "1" }
 ed25519-dalek = { version = "2", optional = true }
 chacha20poly1305 = { version = "0.10", features = ["std"], optional = true }
 getrandom = { version = "0.2", optional = true }

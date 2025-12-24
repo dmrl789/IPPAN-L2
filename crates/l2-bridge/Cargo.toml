@@ -1,0 +1,23 @@
+[package]
+name = "l2-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Bridge/watch skeleton for IPPAN L2"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+l2-core = { path = "../l2-core" }
+l2-storage = { path = "../l2-storage" }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

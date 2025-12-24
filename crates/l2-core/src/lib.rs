@@ -15,10 +15,16 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod canonical;
 pub mod finality;
 pub mod hub_linkage;
 pub mod l1_contract;
 pub mod policy;
+
+pub use canonical::{
+    canonical_decode, canonical_encode, canonical_hash, Batch, CanonicalError, ChainId, Hash32,
+    Receipt, Tx,
+};
 
 #[cfg(feature = "signed-envelopes")]
 pub mod signing;

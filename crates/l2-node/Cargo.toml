@@ -1,0 +1,27 @@
+[package]
+name = "l2-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Axum-based IPPAN L2 node with status/metrics endpoints"
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+prometheus = "0.14"
+l2-core = { path = "../l2-core" }
+l2-storage = { path = "../l2-storage" }
+l2-batcher = { path = "../l2-batcher" }
+l2-bridge = { path = "../l2-bridge" }
+thiserror = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hyper = { version = "1", features = ["server"] }

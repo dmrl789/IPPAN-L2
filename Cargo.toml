@@ -1,10 +1,14 @@
 [workspace]
 members = [
-  "l2-core",
   "hub-fin",
   "fin-node",
   "hub-data",
   "integrations/eth-oracle/daemon",
+  "crates/l2-node",
+  "crates/l2-core",
+  "crates/l2-storage",
+  "crates/l2-batcher",
+  "crates/l2-bridge",
 ]
 resolver = "2"
 

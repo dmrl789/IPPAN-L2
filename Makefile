@@ -1,7 +1,7 @@
 # IPPAN-L2 Makefile
 # Production-grade build, test, and development commands
 
-.PHONY: all build test clippy fmt check audit clean run-fin-node run-oracle-daemon help
+.PHONY: all build test clippy fmt check audit clean run run-fin-node run-oracle-daemon help
 
 # Default target
 all: check
@@ -45,11 +45,15 @@ deny:
 
 # Clean build artifacts
 clean:
-	cargo clean
+        cargo clean
+
+# Run generic l2-node
+run:
+        cargo run -p l2-node --release -- --listen-addr 0.0.0.0:3000
 
 # Run fin-node demo
 run-fin-node:
-	cargo run -p fin-node -- --batch-id demo-$(shell date +%s)
+        cargo run -p fin-node -- --batch-id demo-$(shell date +%s)
 
 # Run eth-oracle daemon (requires config)
 run-oracle-daemon:
@@ -83,13 +87,14 @@ help:
 	@echo "  build            - Build all crates in release mode"
 	@echo "  build-debug      - Build all crates in debug mode"
 	@echo "  test             - Run all tests"
-	@echo "  clippy           - Run clippy with strict warnings"
-	@echo "  fmt              - Format code"
-	@echo "  fmt-check        - Check formatting"
-	@echo "  check            - Full check (fmt + clippy + test)"
-	@echo "  audit            - Run cargo-audit security check"
-	@echo "  deny             - Run cargo-deny dependency check"
-	@echo "  clean            - Clean build artifacts"
+        @echo "  clippy           - Run clippy with strict warnings"
+        @echo "  fmt              - Format code"
+        @echo "  fmt-check        - Check formatting"
+        @echo "  check            - Full check (fmt + clippy + test)"
+        @echo "  run              - Run generic L2 node (health/status/metrics)"
+        @echo "  audit            - Run cargo-audit security check"
+        @echo "  deny             - Run cargo-deny dependency check"
+        @echo "  clean            - Clean build artifacts"
 	@echo "  run-fin-node     - Run fin-node demo"
 	@echo "  run-oracle-daemon - Run eth-oracle daemon"
 	@echo "  dump-oracle      - Dump oracle scores"
