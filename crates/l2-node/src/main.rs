@@ -56,8 +56,10 @@ pub struct Settings {
     pub is_leader: bool,
     #[arg(long, env = "LEADER_ID", default_value = "sequencer-0")]
     pub leader_id: String,
-    #[arg(long, env = "LEADER_TERM", default_value_t = 1)]
+    #[arg(long, env = "LEADER_TERM", default_value_t = 0)]
     pub leader_term: u64,
+    #[arg(long, env = "L2_SEQUENCER_KEY_PATH", default_value = "")]
+    pub sequencer_key_path: String,
     #[arg(long, env = "L2_ADMISSION_CAP", default_value_t = 1024)]
     pub admission_cap: usize,
     #[arg(long, env = "L2_CHAIN_ID", default_value_t = 1)]
