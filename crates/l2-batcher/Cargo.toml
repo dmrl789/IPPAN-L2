@@ -10,6 +10,15 @@ description = "Batching skeleton for IPPAN L2"
 [lints]
 workspace = true
 
+[features]
+default = []
+## Enable the async HTTP L1 client (native async, no spawn_blocking).
+async-l1-http = ["dep:reqwest", "dep:base64"]
+## Enable contract-based batch posting with L1 envelope submission.
+contract-posting = []
+## Enable signed batch envelopes.
+signed-envelopes = ["l2-core/signed-envelopes"]
+
 [dependencies]
 async-trait = "0.1"
 l2-core = { path = "../l2-core" }
@@ -21,6 +30,8 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+base64 = { version = "0.22", optional = true }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
