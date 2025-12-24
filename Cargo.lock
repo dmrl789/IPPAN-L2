@@ -2482,6 +2482,7 @@ name = "l2-storage"
 version = "0.1.0"
 dependencies = [
  "l2-core",
+ "serde",
  "sled",
  "tempfile",
  "thiserror 1.0.69",
