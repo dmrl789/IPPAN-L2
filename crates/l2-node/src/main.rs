@@ -25,7 +25,8 @@ use l2_batcher::{
     ReconcilerHandle,
 };
 use l2_bridge::{
-    spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, LoggingWatcher,
+    spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, DepositClaimRequest,
+    DepositClaimResponse, DepositEvent, DepositStatus, LoggingWatcher,
 };
 use l2_core::forced_inclusion::{
     ForceIncludeRequest, ForceIncludeResponse, ForceIncludeStatus, ForcedInclusionConfig,
@@ -682,6 +683,9 @@ async fn run() -> Result<(), NodeError> {
         // Forced inclusion endpoints
         .route("/tx/force", post(force_include_tx))
         .route("/tx/force/{hash}", get(get_force_status))
+        // Bridge endpoints
+        .route("/bridge/deposit/claim", post(claim_deposit))
+        .route("/bridge/deposit/{id}", get(get_deposit))
         // Batch endpoints
         .route("/batch/{hash}", get(get_batch))
         .with_state(state.clone());
@@ -1508,6 +1512,130 @@ async fn get_batch(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "batch not found"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("storage error: {e}")
+            })),
+        ),
+    }
+}
+
+// ============== Bridge Endpoints ==============
+
+async fn claim_deposit(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<DepositClaimRequest>,
+) -> impl IntoResponse {
+    // Validate L1 tx hash format
+    if req.l1_tx_hash.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DepositClaimResponse {
+                accepted: false,
+                deposit: None,
+                error: Some("l1_tx_hash is required".to_string()),
+            }),
+        );
+    }
+
+    // Check if deposit already claimed
+    let deposit_id = req.l1_tx_hash.clone();
+    if let Ok(true) = state.storage.deposit_exists(&deposit_id) {
+        // Deposit already exists - return existing
+        if let Ok(Some(data)) = state.storage.get_deposit(&deposit_id) {
+            if let Ok(existing) = l2_core::canonical_decode::<DepositEvent>(&data) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(DepositClaimResponse {
+                        accepted: false,
+                        deposit: Some(existing),
+                        error: Some("deposit already claimed".to_string()),
+                    }),
+                );
+            }
+        }
+    }
+
+    // For MVP, we create a pending deposit that needs manual verification
+    // In production, we would verify via the L1 watcher
+    let deposit = DepositEvent {
+        l1_tx_hash: req.l1_tx_hash.clone(),
+        from_l1: String::new(), // Would be extracted from L1 tx
+        to_l2: String::new(),   // Would be parsed from memo
+        asset: "IPN".to_string(),
+        amount: 0, // Would be extracted from L1 tx
+        memo: None,
+        seen_at_ms: now_ms(),
+        status: DepositStatus::Pending,
+        chain_id: ChainId(state.settings.chain_id),
+        nonce: 0,
+    };
+
+    // Store deposit
+    let encoded = match l2_core::canonical_encode(&deposit) {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DepositClaimResponse {
+                    accepted: false,
+                    deposit: None,
+                    error: Some(format!("encoding error: {e}")),
+                }),
+            );
+        }
+    };
+
+    if let Err(e) = state.storage.put_deposit(&deposit_id, &encoded) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(DepositClaimResponse {
+                accepted: false,
+                deposit: None,
+                error: Some(format!("storage error: {e}")),
+            }),
+        );
+    }
+
+    info!(
+        l1_tx_hash = %req.l1_tx_hash,
+        "created pending deposit claim"
+    );
+
+    (
+        StatusCode::OK,
+        Json(DepositClaimResponse {
+            accepted: true,
+            deposit: Some(deposit),
+            error: None,
+        }),
+    )
+}
+
+async fn get_deposit(
+    state: axum::extract::State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.storage.get_deposit(&id) {
+        Ok(Some(data)) => match l2_core::canonical_decode::<DepositEvent>(&data) {
+            Ok(deposit) => (
+                StatusCode::OK,
+                Json(serde_json::to_value(deposit).unwrap()),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("decode error: {e}")
+                })),
+            ),
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "deposit not found"
             })),
         ),
         Err(e) => (

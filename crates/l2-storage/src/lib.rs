@@ -175,6 +175,10 @@ pub struct Storage {
     posting_state: Tree,
     /// Forced inclusion queue (tx_hash -> InclusionTicket).
     forced_queue: Tree,
+    /// Bridge deposits (deposit_id -> DepositEvent).
+    bridge_deposits: Tree,
+    /// Bridge withdrawals (withdraw_id -> WithdrawRequest).
+    bridge_withdrawals: Tree,
 }
 
 impl Storage {
@@ -186,6 +190,8 @@ impl Storage {
         let meta = db.open_tree("meta")?;
         let posting_state = db.open_tree("posting_state")?;
         let forced_queue = db.open_tree("forced_queue")?;
+        let bridge_deposits = db.open_tree("bridge_deposits")?;
+        let bridge_withdrawals = db.open_tree("bridge_withdrawals")?;
         let storage = Self {
             db,
             tx_pool,
@@ -194,6 +200,8 @@ impl Storage {
             meta,
             posting_state,
             forced_queue,
+            bridge_deposits,
+            bridge_withdrawals,
         };
         storage.init_schema()?;
         Ok(storage)
@@ -443,6 +451,77 @@ impl Storage {
             }
         }
         Ok(count)
+    }
+
+    // ========== Bridge Deposit APIs ==========
+
+    /// Store a deposit event.
+    pub fn put_deposit(&self, deposit_id: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.bridge_deposits.insert(deposit_id.as_bytes(), data)?;
+        Ok(())
+    }
+
+    /// Get a deposit event by ID.
+    pub fn get_deposit(&self, deposit_id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .bridge_deposits
+            .get(deposit_id.as_bytes())?
+            .map(|ivec| ivec.to_vec()))
+    }
+
+    /// Check if a deposit exists.
+    pub fn deposit_exists(&self, deposit_id: &str) -> Result<bool, StorageError> {
+        Ok(self.bridge_deposits.contains_key(deposit_id.as_bytes())?)
+    }
+
+    /// Count deposits.
+    pub fn count_deposits(&self) -> Result<u64, StorageError> {
+        let count = self.bridge_deposits.len();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    // ========== Bridge Withdrawal APIs ==========
+
+    /// Store a withdrawal request.
+    pub fn put_withdrawal(&self, withdraw_id: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.bridge_withdrawals.insert(withdraw_id.as_bytes(), data)?;
+        Ok(())
+    }
+
+    /// Get a withdrawal request by ID.
+    pub fn get_withdrawal(&self, withdraw_id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .bridge_withdrawals
+            .get(withdraw_id.as_bytes())?
+            .map(|ivec| ivec.to_vec()))
+    }
+
+    /// Check if a withdrawal exists.
+    pub fn withdrawal_exists(&self, withdraw_id: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .bridge_withdrawals
+            .contains_key(withdraw_id.as_bytes())?)
+    }
+
+    /// Count withdrawals.
+    pub fn count_withdrawals(&self) -> Result<u64, StorageError> {
+        let count = self.bridge_withdrawals.len();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    /// List withdrawal IDs (up to limit).
+    pub fn list_withdrawal_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let mut ids = Vec::new();
+        for result in self.bridge_withdrawals.iter() {
+            if ids.len() >= limit {
+                break;
+            }
+            let (key, _value) = result?;
+            if let Ok(id) = String::from_utf8(key.to_vec()) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     fn init_schema(&self) -> Result<(), StorageError> {

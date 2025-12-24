@@ -28,8 +28,8 @@ pub use batch_envelope::{
     BatchPayload, BATCH_SIGNING_DOMAIN_V1,
 };
 pub use canonical::{
-    canonical_decode, canonical_encode, canonical_hash, Batch, CanonicalError, ChainId, Hash32,
-    Receipt, Tx,
+    canonical_decode, canonical_encode, canonical_hash, canonical_hash_bytes, Batch,
+    CanonicalError, ChainId, Hash32, Receipt, Tx,
 };
 
 #[cfg(feature = "signed-envelopes")]
