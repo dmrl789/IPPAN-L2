@@ -358,6 +358,7 @@ fn apply_issue_license_v1_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_append_attestation_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
@@ -441,6 +442,7 @@ fn apply_append_attestation_v1_tx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_create_listing_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,

@@ -136,7 +136,7 @@ impl EncryptedValueV1 {
     }
 
     pub fn is_encrypted(bytes: &[u8]) -> bool {
-        bytes.len() >= MAGIC.len() + 1 && &bytes[..MAGIC.len()] == MAGIC
+        bytes.len() > MAGIC.len() && &bytes[..MAGIC.len()] == MAGIC
     }
 }
 

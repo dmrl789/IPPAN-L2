@@ -202,6 +202,7 @@ pub fn create_snapshot_v1_encrypted(
 }
 
 /// Restore an encrypted snapshot container produced by `create_snapshot_v1_encrypted`.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_snapshot_v1_encrypted(
     cfg: &SnapshotsConfig,
     from_path: &Path,
