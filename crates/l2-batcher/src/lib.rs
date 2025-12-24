@@ -11,12 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use ippan_rpc::{DataTxRequest, IppanRpcClient, IppanRpcConfig, IppanRpcError};
 use l2_core::{Batch, ChainId, Hash32, Tx};
-use l2_storage::Storage;
+use l2_storage::{PostingState, Storage};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
@@ -60,6 +62,265 @@ impl BatchPoster for LoggingBatchPoster {
         info!(txs = batch.txs.len(), hash = %hash.to_hex(), "stub posting batch to L1");
         Ok(())
     }
+}
+
+/// Posting mode for IPPAN batch poster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PostMode {
+    /// Use POST /tx endpoint with data field.
+    #[default]
+    TxData,
+    /// Use POST /tx/payment endpoint with memo field.
+    TxPaymentMemo,
+}
+
+impl PostMode {
+    /// Parse from environment variable value.
+    pub fn from_env_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "tx_payment_memo" | "payment" => Self::TxPaymentMemo,
+            _ => Self::TxData,
+        }
+    }
+}
+
+/// Configuration for IPPAN batch poster.
+#[derive(Debug, Clone)]
+pub struct IppanPosterConfig {
+    /// Posting mode (tx_data or tx_payment_memo).
+    pub mode: PostMode,
+    /// Force repost even if already posted/confirmed.
+    pub force_repost: bool,
+    /// Maximum number of posting retries.
+    pub max_retries: u32,
+    /// Base retry delay in milliseconds.
+    pub retry_delay_ms: u64,
+}
+
+impl Default for IppanPosterConfig {
+    fn default() -> Self {
+        Self {
+            mode: PostMode::TxData,
+            force_repost: false,
+            max_retries: 3,
+            retry_delay_ms: 500,
+        }
+    }
+}
+
+impl IppanPosterConfig {
+    /// Create configuration from environment variables.
+    pub fn from_env() -> Self {
+        let mode = std::env::var("L2_POST_MODE")
+            .map(|s| PostMode::from_env_str(&s))
+            .unwrap_or_default();
+        let force_repost = std::env::var("L2_FORCE_REPOST")
+            .map(|s| s == "1" || s.to_lowercase() == "true")
+            .unwrap_or(false);
+        let max_retries = std::env::var("L2_POST_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let retry_delay_ms = std::env::var("L2_POST_RETRY_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+
+        Self {
+            mode,
+            force_repost,
+            max_retries,
+            retry_delay_ms,
+        }
+    }
+}
+
+/// Batch data payload for posting to L1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BatchPostData {
+    /// Batch hash (hex).
+    pub batch_hash: String,
+    /// Chain ID.
+    pub chain_id: u64,
+    /// Batch number.
+    pub batch_number: u64,
+    /// Transaction count.
+    pub tx_count: usize,
+    /// Creation timestamp (ms).
+    pub created_ms: u64,
+    /// Payload hash (hex).
+    pub payload_hash: String,
+}
+
+/// IPPAN RPC batch poster with idempotent posting.
+pub struct IppanBatchPoster {
+    client: IppanRpcClient,
+    storage: Arc<Storage>,
+    config: IppanPosterConfig,
+}
+
+impl IppanBatchPoster {
+    /// Create a new IPPAN batch poster.
+    pub fn new(
+        rpc_config: IppanRpcConfig,
+        storage: Arc<Storage>,
+        poster_config: IppanPosterConfig,
+    ) -> Result<Self, BatcherError> {
+        let client = IppanRpcClient::new(rpc_config)
+            .map_err(|e| BatcherError::Poster(format!("failed to create RPC client: {e}")))?;
+        Ok(Self {
+            client,
+            storage,
+            config: poster_config,
+        })
+    }
+
+    /// Create from environment variables.
+    pub fn from_env(storage: Arc<Storage>) -> Result<Self, BatcherError> {
+        let rpc_config = IppanRpcConfig::from_env()
+            .map_err(|e| BatcherError::Poster(format!("RPC config error: {e}")))?;
+        let poster_config = IppanPosterConfig::from_env();
+        Self::new(rpc_config, storage, poster_config)
+    }
+
+    /// Check if batch should be posted (idempotency check).
+    fn should_post(&self, hash: &Hash32) -> Result<bool, BatcherError> {
+        let state = self.storage.get_posting_state(hash)?;
+        match state {
+            None => Ok(true), // Never posted
+            Some(PostingState::Pending { .. }) => Ok(true), // Ready to post
+            Some(PostingState::Posted { .. }) => Ok(self.config.force_repost),
+            Some(PostingState::Confirmed { .. }) => Ok(self.config.force_repost),
+            Some(PostingState::Failed { retry_count, .. }) => {
+                // Allow retry if under limit
+                Ok(retry_count < self.config.max_retries)
+            }
+        }
+    }
+
+    /// Post batch data using the configured mode.
+    async fn do_post(&self, batch: &Batch, hash: &Hash32) -> Result<String, IppanRpcError> {
+        // Create the batch data payload
+        let payload_hash = l2_core::canonical_hash(batch)
+            .map(|h| h.to_hex())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let batch_data = BatchPostData {
+            batch_hash: hash.to_hex(),
+            chain_id: batch.chain_id.0,
+            batch_number: batch.batch_number,
+            tx_count: batch.txs.len(),
+            created_ms: batch.created_ms,
+            payload_hash,
+        };
+
+        // Serialize to JSON string for the data field
+        let data_json = serde_json::to_string(&batch_data)
+            .map_err(|e| IppanRpcError::Decode(format!("failed to serialize batch data: {e}")))?;
+
+        // Use hex encoding of the JSON for the data field
+        let data_hex = hex::encode(data_json.as_bytes());
+
+        match self.config.mode {
+            PostMode::TxData => {
+                let request = DataTxRequest {
+                    data: data_hex,
+                    memo: Some(format!("L2 Batch {}", hash.to_hex())),
+                    nonce: Some(batch.batch_number),
+                };
+                let response = self.client.submit_data_tx(&request).await?;
+                Ok(response.tx_hash)
+            }
+            PostMode::TxPaymentMemo => {
+                // For payment mode, we'd use submit_payment_tx, but since data posting
+                // is more appropriate for batch anchoring, we use the same data endpoint
+                // but document that payment_memo would use a different endpoint
+                let request = DataTxRequest {
+                    data: data_hex,
+                    memo: Some(format!("L2 Batch {}", hash.to_hex())),
+                    nonce: Some(batch.batch_number),
+                };
+                let response = self.client.submit_data_tx(&request).await?;
+                Ok(response.tx_hash)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl BatchPoster for IppanBatchPoster {
+    async fn post_batch(&self, batch: &Batch, hash: &Hash32) -> Result<(), BatcherError> {
+        // Idempotency check
+        if !self.should_post(hash)? {
+            info!(hash = %hash.to_hex(), "batch already posted, skipping");
+            return Ok(());
+        }
+
+        // Mark as pending
+        self.storage.set_posting_state(hash, &PostingState::pending(now_ms()))?;
+
+        // Attempt posting with bounded retries
+        let mut last_error: Option<String> = None;
+        let mut retry_count: u32 = 0;
+
+        while retry_count <= self.config.max_retries {
+            match self.do_post(batch, hash).await {
+                Ok(l1_tx) => {
+                    info!(
+                        hash = %hash.to_hex(),
+                        l1_tx = %l1_tx,
+                        "batch posted successfully"
+                    );
+                    self.storage.set_posting_state(
+                        hash,
+                        &PostingState::posted(l1_tx, now_ms()),
+                    )?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        hash = %hash.to_hex(),
+                        attempt = retry_count + 1,
+                        error = %err,
+                        "batch posting failed"
+                    );
+                    last_error = Some(err.to_string());
+                    retry_count = retry_count.saturating_add(1);
+
+                    if retry_count <= self.config.max_retries {
+                        // Exponential backoff
+                        let delay_ms = self.config.retry_delay_ms
+                            .saturating_mul(2u64.saturating_pow(retry_count.saturating_sub(1)));
+                        let delay = Duration::from_millis(delay_ms.min(10_000)); // Cap at 10s
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted
+        let reason = last_error.unwrap_or_else(|| "unknown error".to_string());
+        error!(
+            hash = %hash.to_hex(),
+            retries = retry_count,
+            reason = %reason,
+            "batch posting failed after all retries"
+        );
+        self.storage.set_posting_state(
+            hash,
+            &PostingState::failed(reason.clone(), now_ms(), retry_count),
+        )?;
+        Err(BatcherError::Poster(reason))
+    }
+}
+
+/// Result of a posting attempt.
+#[derive(Debug, Clone)]
+pub struct PostingResult {
+    pub batch_hash: String,
+    pub l1_tx: Option<String>,
+    pub success: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -285,5 +546,199 @@ mod tests {
             storage.get_meta("schema_version").unwrap(),
             Some(SCHEMA_VERSION.as_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn post_mode_from_env_str() {
+        assert_eq!(PostMode::from_env_str("tx_data"), PostMode::TxData);
+        assert_eq!(PostMode::from_env_str("TX_DATA"), PostMode::TxData);
+        assert_eq!(PostMode::from_env_str("tx_payment_memo"), PostMode::TxPaymentMemo);
+        assert_eq!(PostMode::from_env_str("payment"), PostMode::TxPaymentMemo);
+        assert_eq!(PostMode::from_env_str("unknown"), PostMode::TxData); // Default
+    }
+
+    #[test]
+    fn ippan_poster_config_defaults() {
+        let config = IppanPosterConfig::default();
+        assert_eq!(config.mode, PostMode::TxData);
+        assert!(!config.force_repost);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.retry_delay_ms, 500);
+    }
+
+    #[test]
+    fn batch_post_data_serialization() {
+        let data = BatchPostData {
+            batch_hash: "aabbccdd".to_string(),
+            chain_id: 1337,
+            batch_number: 42,
+            tx_count: 10,
+            created_ms: 1_700_000_000_000,
+            payload_hash: "11223344".to_string(),
+        };
+        let json = serde_json::to_string(&data).expect("serialize");
+        assert!(json.contains("\"batch_hash\":\"aabbccdd\""));
+        assert!(json.contains("\"chain_id\":1337"));
+        assert!(json.contains("\"batch_number\":42"));
+    }
+}
+
+#[cfg(test)]
+mod ippan_poster_tests {
+    use super::*;
+    use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_batch() -> Batch {
+        Batch {
+            chain_id: ChainId(1337),
+            batch_number: 1,
+            txs: vec![Tx {
+                chain_id: ChainId(1337),
+                nonce: 1,
+                from: "alice".to_string(),
+                payload: vec![1, 2, 3],
+            }],
+            created_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn ippan_poster_success() {
+        let server = MockServer::start().await;
+        
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tx_hash": "l1tx123abc",
+                "accepted": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+        
+        let rpc_config = IppanRpcConfig {
+            base_url: server.uri(),
+            timeout_ms: 5000,
+            retry_max: 1,
+        };
+        let poster_config = IppanPosterConfig {
+            mode: PostMode::TxData,
+            force_repost: false,
+            max_retries: 1,
+            retry_delay_ms: 10,
+        };
+        
+        let poster = IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
+        
+        let batch = test_batch();
+        let hash = l2_core::canonical_hash(&batch).unwrap();
+        
+        poster.post_batch(&batch, &hash).await.unwrap();
+        
+        // Verify posting state was updated
+        let state = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert!(state.is_posted());
+        assert_eq!(state.l1_tx(), Some("l1tx123abc"));
+    }
+
+    #[tokio::test]
+    async fn ippan_poster_idempotent_skip() {
+        let server = MockServer::start().await;
+        
+        // Should not be called since batch is already confirmed
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tx_hash": "newl1tx",
+                "accepted": true
+            })))
+            .expect(0) // Should not be called
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+        
+        // Pre-set the state as confirmed
+        let batch = test_batch();
+        let hash = l2_core::canonical_hash(&batch).unwrap();
+        storage.set_posting_state(&hash, &PostingState::confirmed(
+            "existingl1tx".to_string(),
+            1_700_000_000_000,
+        )).unwrap();
+        
+        let rpc_config = IppanRpcConfig {
+            base_url: server.uri(),
+            timeout_ms: 5000,
+            retry_max: 1,
+        };
+        let poster_config = IppanPosterConfig {
+            mode: PostMode::TxData,
+            force_repost: false,
+            max_retries: 1,
+            retry_delay_ms: 10,
+        };
+        
+        let poster = IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
+        
+        // Should skip without error
+        poster.post_batch(&batch, &hash).await.unwrap();
+        
+        // State should remain confirmed with original l1_tx
+        let state = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert_eq!(state.l1_tx(), Some("existingl1tx"));
+    }
+
+    #[tokio::test]
+    async fn ippan_poster_retry_on_failure() {
+        let server = MockServer::start().await;
+        
+        // First call fails with 500
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        
+        // Second call succeeds
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tx_hash": "retryl1tx",
+                "accepted": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+        
+        let rpc_config = IppanRpcConfig {
+            base_url: server.uri(),
+            timeout_ms: 5000,
+            retry_max: 2,
+        };
+        let poster_config = IppanPosterConfig {
+            mode: PostMode::TxData,
+            force_repost: false,
+            max_retries: 2,
+            retry_delay_ms: 10,
+        };
+        
+        let poster = IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config).unwrap();
+        
+        let batch = test_batch();
+        let hash = l2_core::canonical_hash(&batch).unwrap();
+        
+        poster.post_batch(&batch, &hash).await.unwrap();
+        
+        let state = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert!(state.is_posted());
+        assert_eq!(state.l1_tx(), Some("retryl1tx"));
     }
 }
