@@ -20,10 +20,12 @@ fn fin_api_submit_create_asset_and_mint_updates_state_and_writes_receipts() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let fin_db = tmp.path().join("fin_db");
     let receipts_dir = tmp.path().join("receipts");
+    let audit_db = tmp.path().join("audit_db");
 
     let l1 = Arc::new(MockL1Client::default());
     let store = FinStore::open(&fin_db).expect("open fin store");
-    let api = FinApi::new(l1.clone(), store, receipts_dir.clone());
+    let audit = fin_node::audit_store::AuditStore::open(&audit_db).expect("audit store");
+    let api = FinApi::new(l1.clone(), store, receipts_dir.clone()).with_audit(Some(audit));
 
     // 1) Create asset
     let create_body = serde_json::json!({

@@ -2,6 +2,7 @@
 #![deny(clippy::float_arithmetic)]
 #![deny(clippy::float_cmp)]
 
+pub mod audit_store;
 pub mod bootstrap;
 pub mod bootstrap_mirror_health;
 pub mod bootstrap_store;

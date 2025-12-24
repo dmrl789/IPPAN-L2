@@ -2,6 +2,8 @@
 #![deny(clippy::float_arithmetic)]
 #![deny(clippy::float_cmp)]
 
+mod audit;
+mod audit_store;
 mod bootstrap;
 mod bootstrap_mirror_health;
 mod bootstrap_remote;
@@ -110,6 +112,97 @@ enum Command {
         #[command(subcommand)]
         cmd: BootstrapCommand,
     },
+
+    /// Audit mode: deterministic export + replay verification.
+    Audit {
+        #[command(subcommand)]
+        cmd: AuditCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum AuditHubArg {
+    Fin,
+    Data,
+    Linkage,
+    System,
+}
+
+impl AuditHubArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditHubArg::Fin => "fin",
+            AuditHubArg::Data => "data",
+            AuditHubArg::Linkage => "linkage",
+            AuditHubArg::System => "system",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Export an AuditBundleV1 tar archive.
+    Export(AuditExportArgs),
+    /// Replay an AuditBundleV1 tar archive (verify + reconstruct state).
+    Replay(AuditReplayArgs),
+    /// Sign an AuditBundleV1 manifest (feature: bootstrap-signing).
+    Sign(AuditSignArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct AuditExportArgs {
+    /// Output path for the audit bundle tar.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Export only events at/after this epoch (inclusive).
+    #[arg(long)]
+    from_epoch: Option<u64>,
+    /// Export only events at/before this epoch (inclusive).
+    #[arg(long)]
+    to_epoch: Option<u64>,
+
+    /// Restrict to a hub. May be provided multiple times. Default: all hubs.
+    #[arg(long, value_enum)]
+    hub: Vec<AuditHubArg>,
+
+    /// Filter by dataset id (32-byte hex).
+    #[arg(long)]
+    dataset_id: Option<String>,
+    /// Filter by asset id (32-byte hex).
+    #[arg(long)]
+    asset_id: Option<String>,
+    /// Filter by account id.
+    #[arg(long)]
+    account: Option<String>,
+
+    /// Include proof reference files (JSON). Accepts true/false.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    include_proofs: bool,
+
+    /// Include canonical envelope files. Accepts true/false.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    include_envelopes: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct AuditReplayArgs {
+    /// Input audit bundle tar path.
+    #[arg(long)]
+    from: PathBuf,
+    /// Verify hashes/signatures and compare state hashes if present.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    verify: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct AuditSignArgs {
+    /// Bundle tar path (in-place rewrite).
+    #[arg(long)]
+    bundle: PathBuf,
+    /// Path to a 32-byte ed25519 secret key file.
+    #[arg(long)]
+    key_path: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -434,6 +527,10 @@ fn main() {
                 .as_ref()
                 .map(|c| c.storage.recon_db_dir.clone())
                 .unwrap_or_else(|| "recon_db".to_string());
+            let audit_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.audit_db_dir.clone())
+                .unwrap_or_else(|| "audit_db".to_string());
             let bootstrap_db_dir = cfg
                 .as_ref()
                 .map(|c| c.storage.bootstrap_db_dir.clone())
@@ -506,6 +603,10 @@ fn main() {
                 .unwrap_or_else(|e| exit_err(&e.to_string()));
             let bootstrap_opt = Some(bootstrap.clone());
 
+            let audit_store = audit_store::AuditStore::open(audit_db_dir.as_str())
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+            let audit_opt = Some(audit_store.clone());
+
             let fin_api = fin_api::FinApi::new_with_policy_recon_and_limits(
                 l1.clone(),
                 store,
@@ -514,7 +615,8 @@ fn main() {
                 recon_store.clone(),
                 fin_limits,
             )
-            .with_bootstrap(bootstrap_opt.clone());
+            .with_bootstrap(bootstrap_opt.clone())
+            .with_audit(audit_opt.clone());
 
             let data_store = hub_data::DataStore::open(data_db_dir.as_str())
                 .unwrap_or_else(|e| exit_err(&e.to_string()));
@@ -527,7 +629,8 @@ fn main() {
                 recon_store.clone(),
                 data_limits,
             )
-            .with_bootstrap(bootstrap_opt.clone());
+            .with_bootstrap(bootstrap_opt.clone())
+            .with_audit(audit_opt.clone());
 
             let linkage_policy = cfg
                 .as_ref()
@@ -549,7 +652,8 @@ fn main() {
                 linkage_policy,
                 recon_store.clone(),
             )
-            .with_bootstrap(bootstrap_opt.clone());
+            .with_bootstrap(bootstrap_opt.clone())
+            .with_audit(audit_opt.clone());
 
             let snapshots_cfg = cfg
                 .as_ref()
@@ -602,6 +706,7 @@ fn main() {
                     .unwrap_or(86_400);
                 pruning_loop = Some(pruning::PruningLoop {
                     receipts_dir: PathBuf::from(&receipts_dir),
+                    audit_db_dir: Some(PathBuf::from(&audit_db_dir)),
                     retention,
                     limits,
                     interval_secs: interval,
@@ -1274,6 +1379,65 @@ fn main() {
                         }))
                         .unwrap()
                     );
+                }
+            }
+        }
+        Command::Audit { cmd } => {
+            let receipts_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.receipts_dir.as_str())
+                .unwrap_or("receipts");
+            let fin_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.fin_db_dir.as_str())
+                .unwrap_or("fin_db");
+            let data_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.data_db_dir.as_str())
+                .unwrap_or("data_db");
+            let audit_db_dir = cfg
+                .as_ref()
+                .map(|c| c.storage.audit_db_dir.as_str())
+                .unwrap_or("audit_db");
+
+            match cmd {
+                AuditCommand::Export(a) => {
+                    let out_path = a.out.clone();
+                    let hubs: std::collections::BTreeSet<String> =
+                        a.hub.iter().map(|h| h.as_str().to_string()).collect();
+                    let opt = crate::audit::AuditExportOptions {
+                        out: a.out,
+                        from_epoch: a.from_epoch,
+                        to_epoch: a.to_epoch,
+                        hubs,
+                        dataset_id: a.dataset_id,
+                        asset_id: a.asset_id,
+                        account: a.account,
+                        include_proofs: a.include_proofs,
+                        include_envelopes: a.include_envelopes,
+                    };
+                    crate::audit::export_audit_bundle_v1(
+                        audit_db_dir,
+                        fin_db_dir,
+                        data_db_dir,
+                        receipts_dir,
+                        opt,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!("{}", out_path.display());
+                }
+                AuditCommand::Replay(a) => {
+                    crate::audit::replay_audit_bundle_v1(crate::audit::AuditReplayOptions {
+                        from: a.from,
+                        verify: a.verify,
+                    })
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!("ok");
+                }
+                AuditCommand::Sign(a) => {
+                    crate::audit::sign_audit_bundle_v1(&a.bundle, &a.key_path)
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!("ok");
                 }
             }
         }

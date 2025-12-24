@@ -22,14 +22,20 @@ fn setup() -> (
     let receipts = tmp.path().join("receipts");
     let fin_db = tmp.path().join("fin_db");
     let data_db = tmp.path().join("data_db");
+    let audit_db = tmp.path().join("audit_db");
     let l1 = Arc::new(MockL1Client::default());
 
     let fin_store = hub_fin::FinStore::open(&fin_db).expect("fin store");
     let data_store = hub_data::DataStore::open(&data_db).expect("data store");
 
-    let fin_api = FinApi::new(l1.clone(), fin_store.clone(), receipts.clone());
-    let data_api = DataApi::new(l1, data_store.clone(), receipts.clone());
-    let linkage_api = LinkageApi::new(fin_api.clone(), data_api.clone(), receipts);
+    let audit = fin_node::audit_store::AuditStore::open(&audit_db).expect("audit store");
+
+    let fin_api = FinApi::new(l1.clone(), fin_store.clone(), receipts.clone())
+        .with_audit(Some(audit.clone()));
+    let data_api =
+        DataApi::new(l1, data_store.clone(), receipts.clone()).with_audit(Some(audit.clone()));
+    let linkage_api =
+        LinkageApi::new(fin_api.clone(), data_api.clone(), receipts).with_audit(Some(audit));
 
     (tmp, fin_api, fin_store, data_api, data_store, linkage_api)
 }

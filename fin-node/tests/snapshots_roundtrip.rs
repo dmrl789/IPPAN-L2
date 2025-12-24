@@ -69,12 +69,14 @@ fn snapshot_roundtrip_restores_identical_state() {
     let data_db = tmp.path().join("data_db");
     let recon_db = tmp.path().join("recon_db");
     let receipts_dir = tmp.path().join("receipts");
+    let audit_db = tmp.path().join("audit_db");
     fs::create_dir_all(&receipts_dir).expect("receipts dir");
 
     let l1 = Arc::new(MockL1Client::default());
     let fin_store = hub_fin::FinStore::open(&fin_db).expect("fin store");
     let data_store = hub_data::DataStore::open(&data_db).expect("data store");
     let recon_store = ReconStore::open(&recon_db).expect("recon store");
+    let audit = fin_node::audit_store::AuditStore::open(&audit_db).expect("audit store");
 
     let fin_api = FinApi::new_with_policy_and_recon(
         l1.clone(),
@@ -82,21 +84,24 @@ fn snapshot_roundtrip_restores_identical_state() {
         receipts_dir.clone(),
         fin_node::policy_runtime::PolicyRuntime::default(),
         Some(recon_store.clone()),
-    );
+    )
+    .with_audit(Some(audit.clone()));
     let data_api = DataApi::new_with_policy_and_recon(
         l1.clone(),
         data_store.clone(),
         receipts_dir.clone(),
         fin_node::policy_runtime::PolicyRuntime::default(),
         Some(recon_store.clone()),
-    );
+    )
+    .with_audit(Some(audit.clone()));
     let linkage_api = LinkageApi::new_with_policy_and_recon(
         fin_api.clone(),
         data_api.clone(),
         receipts_dir.clone(),
         l2_core::hub_linkage::EntitlementPolicy::Optimistic,
         Some(recon_store.clone()),
-    );
+    )
+    .with_audit(Some(audit));
 
     // Seed FIN state: create asset (deterministic asset_id) and mint balance to buyer.
     let issuer = AccountId::new("acc-issuer");
