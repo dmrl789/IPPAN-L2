@@ -559,7 +559,7 @@ mod tests {
         // Uses the same hash function as l2_core::canonical_hash_bytes
         let envelope_bytes_hash = l2_core::canonical_hash_bytes(&envelope_bytes);
         assert_eq!(
-            hex::encode(&envelope_bytes_hash),
+            hex::encode(envelope_bytes_hash),
             "e132dcf254f041adf57b73868feee2936088e1da30d9b638cc6e8c4d62f9ac89",
             "BatchEnvelope canonical bytes hash changed - breaking change!"
         );
