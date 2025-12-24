@@ -169,6 +169,15 @@ struct Metrics {
     batches_failed: IntGauge,
     leader_is_leader: IntGauge,
     leader_epoch_idx: IntGauge,
+    // Forced inclusion metrics
+    forced_queue_depth: IntGauge,
+    #[allow(dead_code)] // Will be used when forced inclusion is fully wired
+    forced_included_total: IntCounter,
+    // Bridge metrics
+    #[allow(dead_code)] // Will be used when bridge verification is complete
+    bridge_deposits_total: IntCounter,
+    #[allow(dead_code)] // Will be used when bridge posting is complete
+    bridge_withdrawals_total: IntCounter,
 }
 
 impl Metrics {
@@ -247,6 +256,30 @@ impl Metrics {
         ))
         .expect("epoch idx gauge");
 
+        let forced_queue_depth = IntGauge::with_opts(Opts::new(
+            "l2_forced_queue_depth",
+            "Number of forced inclusion tickets queued",
+        ))
+        .expect("forced queue depth gauge");
+
+        let forced_included_total = IntCounter::with_opts(Opts::new(
+            "l2_forced_included_total",
+            "Total forced inclusion tickets included",
+        ))
+        .expect("forced included counter");
+
+        let bridge_deposits_total = IntCounter::with_opts(Opts::new(
+            "l2_bridge_deposits_total",
+            "Total bridge deposits processed",
+        ))
+        .expect("bridge deposits counter");
+
+        let bridge_withdrawals_total = IntCounter::with_opts(Opts::new(
+            "l2_bridge_withdrawals_total",
+            "Total bridge withdrawals requested",
+        ))
+        .expect("bridge withdrawals counter");
+
         // Register all metrics
         for metric in [
             Box::new(uptime_ms.clone()) as Box<dyn prometheus::core::Collector>,
@@ -261,6 +294,10 @@ impl Metrics {
             Box::new(batches_failed.clone()),
             Box::new(leader_is_leader.clone()),
             Box::new(leader_epoch_idx.clone()),
+            Box::new(forced_queue_depth.clone()),
+            Box::new(forced_included_total.clone()),
+            Box::new(bridge_deposits_total.clone()),
+            Box::new(bridge_withdrawals_total.clone()),
         ] {
             registry.register(metric).expect("register metric");
         }
@@ -279,6 +316,10 @@ impl Metrics {
             batches_failed,
             leader_is_leader,
             leader_epoch_idx,
+            forced_queue_depth,
+            forced_included_total,
+            bridge_deposits_total,
+            bridge_withdrawals_total,
         }
     }
 
@@ -430,8 +471,9 @@ struct StatusResponse {
     leader: LeaderInfo,
     queue: QueueInfo,
     batcher: BatcherInfo,
-    bridge: BridgeInfo,
+    bridge: BridgeStatusInfo,
     posting: PostingInfo,
+    forced_inclusion: ForcedInclusionInfo,
 }
 
 #[derive(Serialize)]
@@ -476,9 +518,11 @@ struct BatcherInfo {
 }
 
 #[derive(Serialize)]
-struct BridgeInfo {
+struct BridgeStatusInfo {
     enabled: bool,
     last_event_time: Option<u64>,
+    deposits_total: u64,
+    withdrawals_total: u64,
 }
 
 #[derive(Serialize)]
@@ -487,6 +531,14 @@ struct PostingInfo {
     posted: u64,
     confirmed: u64,
     failed: u64,
+}
+
+#[derive(Serialize)]
+struct ForcedInclusionInfo {
+    enabled: bool,
+    queue_depth: u64,
+    max_epochs: u64,
+    max_per_account_per_epoch: u64,
 }
 
 // ============== Main Entry Point ==============
@@ -790,6 +842,13 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
         }
     };
 
+    // Get bridge counts
+    let deposits_total = state.storage.count_deposits().unwrap_or(0);
+    let withdrawals_total = state.storage.count_withdrawals().unwrap_or(0);
+
+    // Get forced queue counts
+    let forced_counts = state.storage.count_forced_queue().unwrap_or_default();
+
     let response = StatusResponse {
         service: ServiceInfo {
             name: "ippan-l2-node",
@@ -806,15 +865,23 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
             last_batch_hash: batcher_snapshot.last_batch_hash,
             last_post_time: batcher_snapshot.last_post_time_ms,
         },
-        bridge: BridgeInfo {
+        bridge: BridgeStatusInfo {
             enabled: state.bridge.is_some(),
             last_event_time: bridge_snapshot.last_event_time_ms,
+            deposits_total,
+            withdrawals_total,
         },
         posting: PostingInfo {
             pending: posting_counts.pending,
             posted: posting_counts.posted,
             confirmed: posting_counts.confirmed,
             failed: posting_counts.failed,
+        },
+        forced_inclusion: ForcedInclusionInfo {
+            enabled: true,
+            queue_depth: forced_counts.queued,
+            max_epochs: state.forced_config.max_epochs,
+            max_per_account_per_epoch: state.forced_config.max_per_account_per_epoch,
         },
     };
 
@@ -842,6 +909,14 @@ async fn metrics_handler(state: axum::extract::State<AppState>) -> impl IntoResp
     // Update leader state metrics
     let leader_state = state.get_leader_state().await;
     state.metrics.update_leader_state(&leader_state);
+
+    // Update forced queue metrics
+    if let Ok(forced_counts) = state.storage.count_forced_queue() {
+        state
+            .metrics
+            .forced_queue_depth
+            .set(i64::try_from(forced_counts.queued).unwrap_or(i64::MAX));
+    }
 
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();
