@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 use crate::audit_store::{AuditStore, EventRecordV1};
+use crate::crypto;
 use hub_data::DataEnvelopeV1;
 use hub_fin::FinEnvelopeV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
@@ -18,6 +20,8 @@ pub enum AuditError {
     InvalidBundle(String),
     #[error("serde error: {0}")]
     Serde(String),
+    #[error("encryption error: {0}")]
+    Encryption(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +87,28 @@ pub fn export_audit_bundle_v1(
     receipts_dir: &str,
     opt: AuditExportOptions,
 ) -> Result<(), AuditError> {
-    let audit = AuditStore::open(audit_db_dir).map_err(|e| AuditError::Store(e.to_string()))?;
+    export_audit_bundle_v1_with_key_provider(
+        audit_db_dir,
+        fin_db_dir,
+        data_db_dir,
+        receipts_dir,
+        opt,
+        None,
+        false,
+    )
+}
+
+pub fn export_audit_bundle_v1_with_key_provider(
+    audit_db_dir: &str,
+    fin_db_dir: &str,
+    data_db_dir: &str,
+    receipts_dir: &str,
+    opt: AuditExportOptions,
+    key_provider: Option<Arc<dyn l2_core::storage_encryption::KeyProvider>>,
+    allow_plaintext_read: bool,
+) -> Result<(), AuditError> {
+    let audit = AuditStore::open_with_encryption(audit_db_dir, key_provider, allow_plaintext_read)
+        .map_err(|e| AuditError::Store(e.to_string()))?;
     let receipts_dir = PathBuf::from(receipts_dir);
 
     let events = audit
@@ -209,6 +234,74 @@ pub fn export_audit_bundle_v1(
     build_deterministic_tar(root, &opt.out)?;
 
     Ok(())
+}
+
+pub fn export_audit_bundle_v1_encrypted(
+    audit_db_dir: &str,
+    fin_db_dir: &str,
+    data_db_dir: &str,
+    receipts_dir: &str,
+    opt: AuditExportOptions,
+    provider: Arc<dyn l2_core::storage_encryption::KeyProvider>,
+) -> Result<(), AuditError> {
+    let tmp = tempfile::tempdir().map_err(|e| AuditError::Io(e.to_string()))?;
+    let inner = tmp.path().join("audit.tar");
+    let mut opt2 = opt.clone();
+    opt2.out = inner.clone();
+    export_audit_bundle_v1_with_key_provider(
+        audit_db_dir,
+        fin_db_dir,
+        data_db_dir,
+        receipts_dir,
+        opt2,
+        Some(provider.clone()),
+        false,
+    )?;
+
+    // Read manifest.root_hash for AAD binding.
+    let inner_bytes = fs::read(&inner).map_err(|e| AuditError::Io(e.to_string()))?;
+    let manifest = extract_audit_manifest_from_tar_bytes(&inner_bytes)?;
+    let aad = format!(
+        "type=audit;root_hash={};audit_bundle_version={}",
+        manifest.root_hash, manifest.audit_bundle_version
+    )
+    .into_bytes();
+
+    crypto::archive::write_encrypted_archive_v1(
+        &opt.out,
+        provider.as_ref(),
+        "audit",
+        &aad,
+        &inner_bytes,
+    )
+    .map_err(|e| AuditError::Encryption(e.to_string()))?;
+    Ok(())
+}
+
+pub fn replay_audit_bundle_v1_encrypted(
+    opt: AuditReplayOptions,
+    provider: Arc<dyn l2_core::storage_encryption::KeyProvider>,
+) -> Result<(), AuditError> {
+    let (_hdr, inner_bytes) =
+        crypto::archive::read_encrypted_archive_v1(&opt.from, provider.as_ref(), Some("audit"))
+            .map_err(|e| AuditError::Encryption(e.to_string()))?;
+    let tmp = tempfile::tempdir().map_err(|e| AuditError::Io(e.to_string()))?;
+    let inner = tmp.path().join("audit.tar");
+    fs::write(&inner, &inner_bytes).map_err(|e| AuditError::Io(e.to_string()))?;
+    replay_audit_bundle_v1(AuditReplayOptions {
+        from: inner,
+        verify: opt.verify,
+    })
+}
+
+fn extract_audit_manifest_from_tar_bytes(bytes: &[u8]) -> Result<AuditManifestV1, AuditError> {
+    let tmp = tempfile::tempdir().map_err(|e| AuditError::Io(e.to_string()))?;
+    let root = tmp.path();
+    let cursor = std::io::Cursor::new(bytes);
+    let mut ar = tar::Archive::new(cursor);
+    ar.unpack(root).map_err(|e| AuditError::Io(e.to_string()))?;
+    let raw = fs::read(root.join("manifest.json")).map_err(|e| AuditError::Io(e.to_string()))?;
+    serde_json::from_slice(&raw).map_err(|e| AuditError::Serde(e.to_string()))
 }
 
 pub fn replay_audit_bundle_v1(opt: AuditReplayOptions) -> Result<(), AuditError> {

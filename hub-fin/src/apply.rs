@@ -14,6 +14,7 @@ use crate::validation::{
 };
 use l2_core::hub_linkage::PurchaseId;
 use l2_core::policy::{PolicyDenyCode, PolicyMode};
+use l2_core::storage_encryption::SledValueCipher;
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
@@ -82,6 +83,7 @@ pub fn apply_with_policy_and_limits(
     let action = env.action.clone();
     let action_id = env.action_id;
 
+    let cipher = store.value_cipher();
     let r = (store.tree(), store.changelog_tree()).transaction(|(tree, clog)| {
         let mut ctx = ChangelogTxCtx::load(clog)
             .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
@@ -89,6 +91,7 @@ pub fn apply_with_policy_and_limits(
             tree,
             clog,
             &mut ctx,
+            cipher,
             action_id,
             &action,
             mode,
@@ -135,6 +138,7 @@ fn apply_tx_with_changelog(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     action: &FinActionV1,
     mode: PolicyMode,
@@ -147,7 +151,9 @@ fn apply_tx_with_changelog(
         .map(|_| true)
         .unwrap_or(false)
     {
-        if let Some(existing) = tree.get(keys::apply_receipt(action_id))? {
+        if let Some(existing) =
+            tx_get_plain(tree, cipher, keys::apply_receipt(action_id).as_slice())?
+        {
             let mut receipt: ApplyReceipt = serde_json::from_slice(&existing)
                 .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
             receipt.outcome = ApplyOutcome::AlreadyApplied;
@@ -170,6 +176,7 @@ fn apply_tx_with_changelog(
             tree,
             changelog,
             ctx,
+            cipher,
             action_id,
             a,
             mode,
@@ -180,6 +187,7 @@ fn apply_tx_with_changelog(
             tree,
             changelog,
             ctx,
+            cipher,
             action_id,
             a,
             mode,
@@ -190,6 +198,7 @@ fn apply_tx_with_changelog(
             tree,
             changelog,
             ctx,
+            cipher,
             action_id,
             a,
             mode,
@@ -203,11 +212,16 @@ fn apply_tx_with_changelog(
             "receipt canonicalization failed: {e}"
         )))
     })?;
-    tree.insert(keys::apply_receipt(action_id), receipt_bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::apply_receipt(action_id).as_slice(),
+        receipt_bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::apply_receipt(action_id), &receipt_bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(keys::applied(action_id), sled::IVec::from(&b"1"[..]))?;
+    tx_put_plain(tree, cipher, keys::applied(action_id).as_slice(), b"1")?;
     ctx.record_put(changelog, &keys::applied(action_id), b"1")
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(receipt)
@@ -218,6 +232,7 @@ fn apply_create_asset_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &CreateAssetV1,
     mode: PolicyMode,
@@ -246,7 +261,12 @@ fn apply_create_asset_v1_tx(
     }
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::asset(a.asset_id), bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::asset(a.asset_id).as_slice(),
+        bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::asset(a.asset_id), &bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
@@ -266,6 +286,7 @@ fn apply_mint_units_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &MintUnitsV1,
     mode: PolicyMode,
@@ -275,7 +296,7 @@ fn apply_mint_units_v1_tx(
     validate_mint_units_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
-    let asset = get_asset_tx(tree, a.asset_id)?.ok_or_else(|| {
+    let asset = get_asset_tx(tree, cipher, a.asset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("asset_id not found".to_string()))
     })?;
 
@@ -302,14 +323,14 @@ fn apply_mint_units_v1_tx(
     }
 
     let bal_key = keys::balance(a.asset_id, &a.to_account.0);
-    let old = match tree.get(&bal_key)? {
-        Some(v) => AmountU128(decode_u128_be(&v)?),
+    let old = match tx_get_plain(tree, cipher, &bal_key)? {
+        Some(v) => AmountU128(decode_u128_be_plain(v.as_slice())?),
         None => AmountU128(0),
     };
     let new = validate_amount_addition(old, a.amount)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Rejected(e)))?;
     let bal_bytes = encode_u128_be(new.0).to_vec();
-    tree.insert(bal_key.as_slice(), bal_bytes.as_slice())?;
+    tx_put_plain(tree, cipher, bal_key.as_slice(), bal_bytes.as_slice())?;
     ctx.record_put(changelog, &bal_key, &bal_bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
@@ -330,6 +351,7 @@ fn apply_transfer_units_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &TransferUnitsV1,
     mode: PolicyMode,
@@ -339,7 +361,7 @@ fn apply_transfer_units_v1_tx(
     validate_transfer_units_v1_with_limits(a, limits)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
-    let asset = get_asset_tx(tree, a.asset_id)?.ok_or_else(|| {
+    let asset = get_asset_tx(tree, cipher, a.asset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("asset_id not found".to_string()))
     })?;
 
@@ -389,12 +411,12 @@ fn apply_transfer_units_v1_tx(
 
     let from_key = keys::balance(a.asset_id, &a.from_account.0);
     let to_key = keys::balance(a.asset_id, &a.to_account.0);
-    let from_old = match tree.get(&from_key)? {
-        Some(v) => AmountU128(decode_u128_be(&v)?),
+    let from_old = match tx_get_plain(tree, cipher, &from_key)? {
+        Some(v) => AmountU128(decode_u128_be_plain(v.as_slice())?),
         None => AmountU128(0),
     };
-    let to_old = match tree.get(&to_key)? {
-        Some(v) => AmountU128(decode_u128_be(&v)?),
+    let to_old = match tx_get_plain(tree, cipher, &to_key)? {
+        Some(v) => AmountU128(decode_u128_be_plain(v.as_slice())?),
         None => AmountU128(0),
     };
 
@@ -405,10 +427,10 @@ fn apply_transfer_units_v1_tx(
 
     let from_bytes = encode_u128_be(from_new.0).to_vec();
     let to_bytes = encode_u128_be(to_new.0).to_vec();
-    tree.insert(from_key.as_slice(), from_bytes.as_slice())?;
+    tx_put_plain(tree, cipher, from_key.as_slice(), from_bytes.as_slice())?;
     ctx.record_put(changelog, &from_key, &from_bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(to_key.as_slice(), to_bytes.as_slice())?;
+    tx_put_plain(tree, cipher, to_key.as_slice(), to_bytes.as_slice())?;
     ctx.record_put(changelog, &to_key, &to_bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
@@ -428,14 +450,14 @@ fn encode_u128_be(v: u128) -> [u8; 16] {
     v.to_be_bytes()
 }
 
-fn decode_u128_be(v: &sled::IVec) -> Result<u128, ConflictableTransactionError<TxError>> {
+fn decode_u128_be_plain(v: &[u8]) -> Result<u128, ConflictableTransactionError<TxError>> {
     if v.len() != 16 {
         return Err(ConflictableTransactionError::Abort(TxError::Store(
             "invalid u128 encoding".to_string(),
         )));
     }
     let mut b = [0u8; 16];
-    b.copy_from_slice(v.as_ref());
+    b.copy_from_slice(v);
     Ok(u128::from_be_bytes(b))
 }
 
@@ -456,12 +478,49 @@ fn policy_deny(
 
 fn get_asset_tx(
     tree: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
     asset_id: AssetId32,
 ) -> Result<Option<CreateAssetV1>, ConflictableTransactionError<TxError>> {
-    let Some(v) = tree.get(keys::asset(asset_id))? else {
+    let key = keys::asset(asset_id);
+    let Some(v) = tx_get_plain(tree, cipher, key.as_slice())? else {
         return Ok(None);
     };
     serde_json::from_slice::<CreateAssetV1>(&v)
         .map(Some)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))
+}
+
+fn tx_get_plain(
+    tree: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, ConflictableTransactionError<TxError>> {
+    let Some(v) = tree.get(key)? else {
+        return Ok(None);
+    };
+    if let Some(c) = cipher {
+        let plain = c
+            .decrypt_value(key, v.as_ref())
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        Ok(Some(plain))
+    } else {
+        Ok(Some(v.to_vec()))
+    }
+}
+
+fn tx_put_plain(
+    tree: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
+    key: &[u8],
+    plaintext: &[u8],
+) -> Result<(), ConflictableTransactionError<TxError>> {
+    if let Some(c) = cipher {
+        let stored = c
+            .encrypt_value(key, plaintext)
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        tree.insert(key, stored.as_slice())?;
+    } else {
+        tree.insert(key, plaintext)?;
+    }
+    Ok(())
 }

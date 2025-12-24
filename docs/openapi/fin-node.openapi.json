@@ -164,6 +164,26 @@
         }
       }
     },
+    "/api/v1/encryption/status": {
+      "get": {
+        "tags": ["Encryption"],
+        "summary": "Encryption-at-rest status (operational)",
+        "responses": {
+          "200": {
+            "description": "Encryption status",
+            "headers": {
+              "X-Request-Id": { "$ref": "#/components/headers/X-Request-Id" },
+              "X-Api-Version": { "$ref": "#/components/headers/X-Api-Version" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EncryptionStatusResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/recon/pending": {
       "get": {
         "tags": ["Recon"],
@@ -1041,6 +1061,19 @@
               "additionalProperties": true
             }
           }
+        },
+        "additionalProperties": false
+      },
+      "EncryptionStatusResponse": {
+        "type": "object",
+        "required": ["schema_version", "enabled", "provider", "keyring_ids", "plaintext_allowed"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "enabled": { "type": "boolean" },
+          "provider": { "type": "string" },
+          "current_key_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "keyring_ids": { "type": "array", "items": { "type": "string" } },
+          "plaintext_allowed": { "type": "boolean" }
         },
         "additionalProperties": false
       },

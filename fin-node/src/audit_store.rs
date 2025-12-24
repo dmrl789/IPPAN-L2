@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use l2_core::finality::SubmitState;
+use l2_core::storage_encryption::{KeyProvider, SledValueCipher};
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 const TREE_NAME: &str = "fin-node-audit";
 const LAST_SEQ_KEY: &[u8] = b"audit:last_seq";
@@ -83,29 +85,57 @@ impl AuditSubjectsV1 {
 #[derive(Debug, Clone)]
 pub struct AuditStore {
     tree: sled::Tree,
+    cipher: Option<SledValueCipher>,
 }
 
 impl AuditStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditStoreError> {
+        Self::open_with_encryption(path, None, false)
+    }
+
+    pub fn open_with_encryption(
+        path: impl AsRef<Path>,
+        provider: Option<Arc<dyn KeyProvider>>,
+        allow_plaintext_read: bool,
+    ) -> Result<Self, AuditStoreError> {
         let db = sled::open(path)?;
         let tree = db.open_tree(TREE_NAME)?;
-        Ok(Self { tree })
+        let cipher =
+            provider.map(|p| SledValueCipher::new(p, TREE_NAME.to_string(), allow_plaintext_read));
+        Ok(Self { tree, cipher })
+    }
+
+    fn decrypt_for_store(&self, key: &[u8], stored: &[u8]) -> Result<Vec<u8>, AuditStoreError> {
+        let Some(c) = self.cipher.as_ref() else {
+            return Ok(stored.to_vec());
+        };
+        c.decrypt_value(key, stored)
+            .map_err(|e| AuditStoreError::Serde(e.to_string()))
+    }
+
+    fn encrypt_for_store(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AuditStoreError> {
+        let Some(c) = self.cipher.as_ref() else {
+            return Ok(plaintext.to_vec());
+        };
+        c.encrypt_value(key, plaintext)
+            .map_err(|e| AuditStoreError::Serde(e.to_string()))
     }
 
     #[allow(dead_code)]
     pub fn open_temporary() -> Result<Self, AuditStoreError> {
         let db = sled::Config::new().temporary(true).open()?;
         let tree = db.open_tree(TREE_NAME)?;
-        Ok(Self { tree })
+        Ok(Self { tree, cipher: None })
     }
 
     pub fn append_event(&self, mut e: EventRecordV1) -> Result<u64, AuditStoreError> {
         e.schema_version = 1;
         e.subjects = e.subjects.normalize();
 
+        let cipher = self.cipher.clone();
         let r: Result<u64, TransactionError<String>> =
             self.tree.transaction(|t: &TransactionalTree| {
-                let last = seq_get(t).map_err(|e| {
+                let last = seq_get(t, cipher.as_ref()).map_err(|e| {
                     ConflictableTransactionError::Abort(format!("read last_seq failed: {e}"))
                 })?;
                 let next = last.saturating_add(1);
@@ -115,8 +145,13 @@ impl AuditStore {
                     ConflictableTransactionError::Abort(format!("event json encode failed: {e}"))
                 })?;
 
-                t.insert(LAST_SEQ_KEY, next.to_be_bytes().to_vec())?;
-                t.insert(event_key(next), bytes)?;
+                tx_put_plain(t, cipher.as_ref(), LAST_SEQ_KEY, &next.to_be_bytes())?;
+                tx_put_plain(
+                    t,
+                    cipher.as_ref(),
+                    event_key(next).as_slice(),
+                    bytes.as_slice(),
+                )?;
                 Ok(next)
             });
 
@@ -135,9 +170,10 @@ impl AuditStore {
         bytes: &[u8],
     ) -> Result<(), AuditStoreError> {
         let key = envelope_key(hub, action_id_hex);
-        let cas = self
-            .tree
-            .compare_and_swap(key, None as Option<&[u8]>, Some(bytes))?;
+        let stored = self.encrypt_for_store(&key, bytes)?;
+        let cas =
+            self.tree
+                .compare_and_swap(key, None as Option<&[u8]>, Some(stored.as_slice()))?;
         if cas.is_err() {
             // Already present; do not overwrite.
         }
@@ -149,18 +185,21 @@ impl AuditStore {
         hub: &str,
         action_id_hex: &str,
     ) -> Result<Option<Vec<u8>>, AuditStoreError> {
-        Ok(self
-            .tree
-            .get(envelope_key(hub, action_id_hex))?
-            .map(|v| v.to_vec()))
+        let key = envelope_key(hub, action_id_hex);
+        let Some(v) = self.tree.get(&key)? else {
+            return Ok(None);
+        };
+        let plain = self.decrypt_for_store(&key, v.as_ref())?;
+        Ok(Some(plain))
     }
 
     #[allow(dead_code)]
     pub fn iter_events(&self) -> Result<Vec<EventRecordV1>, AuditStoreError> {
         let mut out = Vec::new();
         for r in self.tree.scan_prefix(EVENT_PREFIX) {
-            let (_k, v) = r?;
-            let e: EventRecordV1 = serde_json::from_slice(&v)
+            let (k, v) = r?;
+            let plain = self.decrypt_for_store(k.as_ref(), v.as_ref())?;
+            let e: EventRecordV1 = serde_json::from_slice(&plain)
                 .map_err(|e| AuditStoreError::Serde(format!("event decode failed: {e}")))?;
             out.push(e);
         }
@@ -178,8 +217,9 @@ impl AuditStore {
     ) -> Result<Vec<EventRecordV1>, AuditStoreError> {
         let mut out = Vec::new();
         for r in self.tree.scan_prefix(EVENT_PREFIX) {
-            let (_k, v) = r?;
-            let e: EventRecordV1 = serde_json::from_slice(&v)
+            let (k, v) = r?;
+            let plain = self.decrypt_for_store(k.as_ref(), v.as_ref())?;
+            let e: EventRecordV1 = serde_json::from_slice(&plain)
                 .map_err(|e| AuditStoreError::Serde(format!("event decode failed: {e}")))?;
 
             if let Some(min) = from_epoch {
@@ -241,7 +281,8 @@ impl AuditStore {
                 break;
             }
             let (k, v) = r?;
-            let e: EventRecordV1 = serde_json::from_slice(&v)
+            let plain = self.decrypt_for_store(k.as_ref(), v.as_ref())?;
+            let e: EventRecordV1 = serde_json::from_slice(&plain)
                 .map_err(|e| AuditStoreError::Serde(format!("event decode failed: {e}")))?;
             if e.occurred_at_unix_secs < cutoff_unix_secs {
                 keys.push(k.to_vec());
@@ -258,16 +299,42 @@ impl AuditStore {
     }
 }
 
-fn seq_get(t: &TransactionalTree) -> Result<u64, sled::transaction::UnabortableTransactionError> {
+fn seq_get(
+    t: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
+) -> Result<u64, ConflictableTransactionError<String>> {
     let Some(v) = t.get(LAST_SEQ_KEY)? else {
         return Ok(0);
     };
-    if v.len() != 8 {
+    let bytes = if let Some(c) = cipher {
+        c.decrypt_value(LAST_SEQ_KEY, v.as_ref())
+            .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?
+    } else {
+        v.to_vec()
+    };
+    if bytes.len() != 8 {
         return Ok(0);
     }
     let mut b = [0u8; 8];
-    b.copy_from_slice(&v);
+    b.copy_from_slice(&bytes);
     Ok(u64::from_be_bytes(b))
+}
+
+fn tx_put_plain(
+    t: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
+    key: &[u8],
+    plaintext: &[u8],
+) -> Result<(), ConflictableTransactionError<String>> {
+    if let Some(c) = cipher {
+        let stored = c
+            .encrypt_value(key, plaintext)
+            .map_err(|e| ConflictableTransactionError::Abort(e.to_string()))?;
+        t.insert(key, stored.as_slice())?;
+    } else {
+        t.insert(key, plaintext)?;
+    }
+    Ok(())
 }
 
 fn event_key(seq: u64) -> Vec<u8> {

@@ -14,6 +14,7 @@ use crate::validation::{
     validate_register_dataset_v1_with_limits, ValidationError, ValidationLimits,
 };
 use l2_core::policy::{PolicyDenyCode, PolicyMode};
+use l2_core::storage_encryption::SledValueCipher;
 use l2_core::AccountId;
 use serde::{Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError, TransactionalTree};
@@ -82,6 +83,7 @@ pub fn apply_with_policy_and_limits(
     let action = env.action.clone();
     let action_id = env.action_id;
 
+    let cipher = store.value_cipher();
     let r = (store.tree(), store.changelog_tree()).transaction(|(tree, clog)| {
         let mut ctx = ChangelogTxCtx::load(clog)
             .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
@@ -89,6 +91,7 @@ pub fn apply_with_policy_and_limits(
             tree,
             clog,
             &mut ctx,
+            cipher,
             action_id,
             &action,
             mode,
@@ -135,6 +138,7 @@ fn apply_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     action: &DataActionV1,
     mode: PolicyMode,
@@ -147,7 +151,9 @@ fn apply_tx(
         .map(|_| true)
         .unwrap_or(false)
     {
-        if let Some(existing) = tree.get(keys::apply_receipt(action_id))? {
+        if let Some(existing) =
+            tx_get_plain(tree, cipher, keys::apply_receipt(action_id).as_slice())?
+        {
             let mut receipt: ApplyReceipt = serde_json::from_slice(&existing).map_err(|e| {
                 ConflictableTransactionError::Abort(TxError::Store(format!(
                     "failed decoding apply receipt: {e}"
@@ -170,28 +176,30 @@ fn apply_tx(
 
     let receipt = match action {
         DataActionV1::RegisterDatasetV1(a) => {
-            apply_register_dataset_v1_tx(tree, changelog, ctx, action_id, a, limits)?
+            apply_register_dataset_v1_tx(tree, changelog, ctx, cipher, action_id, a, limits)?
         }
         DataActionV1::IssueLicenseV1(a) => apply_issue_license_v1_tx(
             tree,
             changelog,
             ctx,
+            cipher,
             action_id,
             a,
             mode,
             admin_accounts,
             limits,
         )?,
-        DataActionV1::AppendAttestationV1(a) => {
-            apply_append_attestation_v1_tx(tree, changelog, ctx, action_id, a, mode, limits)?
-        }
+        DataActionV1::AppendAttestationV1(a) => apply_append_attestation_v1_tx(
+            tree, changelog, ctx, cipher, action_id, a, mode, limits,
+        )?,
         DataActionV1::CreateListingV1(a) => {
-            apply_create_listing_v1_tx(tree, changelog, ctx, action_id, a, mode, limits)?
+            apply_create_listing_v1_tx(tree, changelog, ctx, cipher, action_id, a, mode, limits)?
         }
         DataActionV1::GrantEntitlementV1(a) => apply_grant_entitlement_v1_tx(
             tree,
             changelog,
             ctx,
+            cipher,
             action_id,
             a,
             mode,
@@ -199,10 +207,10 @@ fn apply_tx(
             limits,
         )?,
         DataActionV1::AddLicensorV1(a) => {
-            apply_add_licensor_v1_tx(tree, changelog, ctx, action_id, a, mode)?
+            apply_add_licensor_v1_tx(tree, changelog, ctx, cipher, action_id, a, mode)?
         }
         DataActionV1::AddAttestorV1(a) => {
-            apply_add_attestor_v1_tx(tree, changelog, ctx, action_id, a, mode)?
+            apply_add_attestor_v1_tx(tree, changelog, ctx, cipher, action_id, a, mode)?
         }
     };
 
@@ -211,11 +219,16 @@ fn apply_tx(
             "receipt canonicalization failed: {e}"
         )))
     })?;
-    tree.insert(keys::apply_receipt(action_id), receipt_bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::apply_receipt(action_id).as_slice(),
+        receipt_bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::apply_receipt(action_id), &receipt_bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(keys::applied(action_id), sled::IVec::from(&b"1"[..]))?;
+    tx_put_plain(tree, cipher, keys::applied(action_id).as_slice(), b"1")?;
     ctx.record_put(changelog, &keys::applied(action_id), b"1")
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(receipt)
@@ -225,6 +238,7 @@ fn apply_register_dataset_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &RegisterDatasetV1,
     limits: &ValidationLimits,
@@ -238,7 +252,12 @@ fn apply_register_dataset_v1_tx(
     }
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::dataset(a.dataset_id), bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::dataset(a.dataset_id).as_slice(),
+        bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::dataset(a.dataset_id), &bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
     Ok(ApplyReceipt {
@@ -258,13 +277,14 @@ fn apply_issue_license_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &IssueLicenseV1,
     mode: PolicyMode,
     _admin_accounts: &[AccountId],
     limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+    let dataset = get_dataset_tx(tree, cipher, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
     validate_issue_license_v1_with_limits(a, limits)
@@ -305,13 +325,20 @@ fn apply_issue_license_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::license(a.license_id), bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::license(a.license_id).as_slice(),
+        bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::license(a.license_id), &bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(
-        keys::license_by_dataset(a.dataset_id, a.license_id),
-        sled::IVec::from(&b"1"[..]),
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::license_by_dataset(a.dataset_id, a.license_id).as_slice(),
+        b"1",
     )?;
     ctx.record_put(
         changelog,
@@ -335,12 +362,13 @@ fn apply_append_attestation_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &crate::actions::AppendAttestationV1,
     mode: PolicyMode,
     limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+    let dataset = get_dataset_tx(tree, cipher, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
     validate_append_attestation_v1_with_limits(a, limits)
@@ -380,13 +408,20 @@ fn apply_append_attestation_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::attestation(a.attestation_id), bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::attestation(a.attestation_id).as_slice(),
+        bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::attestation(a.attestation_id), &bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(
-        keys::attestation_by_dataset(a.dataset_id, a.attestation_id),
-        sled::IVec::from(&b"1"[..]),
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::attestation_by_dataset(a.dataset_id, a.attestation_id).as_slice(),
+        b"1",
     )?;
     ctx.record_put(
         changelog,
@@ -410,12 +445,13 @@ fn apply_create_listing_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &CreateListingV1,
     mode: PolicyMode,
     limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+    let dataset = get_dataset_tx(tree, cipher, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
     validate_create_listing_v1_with_limits(a, limits)
@@ -438,7 +474,7 @@ fn apply_create_listing_v1_tx(
         )));
     }
 
-    if let Some(existing) = tree.get(keys::listing(a.listing_id))? {
+    if let Some(existing) = tx_get_plain(tree, cipher, keys::listing(a.listing_id).as_slice())? {
         let existing_listing: CreateListingV1 = serde_json::from_slice(&existing).map_err(|e| {
             ConflictableTransactionError::Abort(TxError::Store(format!(
                 "failed decoding existing listing: {e}"
@@ -463,13 +499,20 @@ fn apply_create_listing_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::listing(a.listing_id), bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::listing(a.listing_id).as_slice(),
+        bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::listing(a.listing_id), &bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(
-        keys::listing_by_dataset(a.dataset_id, a.listing_id),
-        sled::IVec::from(&b"1"[..]),
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::listing_by_dataset(a.dataset_id, a.listing_id).as_slice(),
+        b"1",
     )?;
     ctx.record_put(
         changelog,
@@ -494,6 +537,7 @@ fn apply_grant_entitlement_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &GrantEntitlementV1,
     mode: PolicyMode,
@@ -501,9 +545,12 @@ fn apply_grant_entitlement_v1_tx(
     limits: &ValidationLimits,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
     // Listing must exist (and be consistent with dataset_id).
-    let listing_bytes = tree.get(keys::listing(a.listing_id))?.ok_or_else(|| {
-        ConflictableTransactionError::Abort(TxError::Rejected("listing_id not found".to_string()))
-    })?;
+    let listing_bytes = tx_get_plain(tree, cipher, keys::listing(a.listing_id).as_slice())?
+        .ok_or_else(|| {
+            ConflictableTransactionError::Abort(TxError::Rejected(
+                "listing_id not found".to_string(),
+            ))
+        })?;
     let listing: CreateListingV1 = serde_json::from_slice(&listing_bytes).map_err(|e| {
         ConflictableTransactionError::Abort(TxError::Store(format!("failed decoding listing: {e}")))
     })?;
@@ -517,7 +564,7 @@ fn apply_grant_entitlement_v1_tx(
         .map_err(|e| ConflictableTransactionError::Abort(TxError::from(e)))?;
 
     // Policy: entitlement grant must be performed by dataset.owner (or admin in strict).
-    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+    let dataset = get_dataset_tx(tree, cipher, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
     if mode == PolicyMode::Strict && a.actor.is_none() {
@@ -534,7 +581,8 @@ fn apply_grant_entitlement_v1_tx(
     }
 
     // Idempotency by purchase_id: duplicates are a success/no-op.
-    if let Some(existing) = tree.get(keys::entitlement(a.purchase_id))? {
+    if let Some(existing) = tx_get_plain(tree, cipher, keys::entitlement(a.purchase_id).as_slice())?
+    {
         let existing_ent: GrantEntitlementV1 = serde_json::from_slice(&existing).map_err(|e| {
             ConflictableTransactionError::Abort(TxError::Store(format!(
                 "failed decoding existing entitlement: {e}"
@@ -559,13 +607,20 @@ fn apply_grant_entitlement_v1_tx(
 
     let bytes = serde_json::to_vec(a)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
-    tree.insert(keys::entitlement(a.purchase_id), bytes.as_slice())?;
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::entitlement(a.purchase_id).as_slice(),
+        bytes.as_slice(),
+    )?;
     ctx.record_put(changelog, &keys::entitlement(a.purchase_id), &bytes)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(
-        keys::ent_by_dataset(a.dataset_id, a.purchase_id),
-        sled::IVec::from(&b"1"[..]),
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::ent_by_dataset(a.dataset_id, a.purchase_id).as_slice(),
+        b"1",
     )?;
     ctx.record_put(
         changelog,
@@ -574,9 +629,11 @@ fn apply_grant_entitlement_v1_tx(
     )
     .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
 
-    tree.insert(
-        keys::ent_by_licensee(&a.licensee.0, a.purchase_id),
-        sled::IVec::from(&b"1"[..]),
+    tx_put_plain(
+        tree,
+        cipher,
+        keys::ent_by_licensee(&a.licensee.0, a.purchase_id).as_slice(),
+        b"1",
     )?;
     ctx.record_put(
         changelog,
@@ -601,11 +658,12 @@ fn apply_add_licensor_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &AddLicensorV1,
     mode: PolicyMode,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+    let dataset = get_dataset_tx(tree, cipher, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
     if mode == PolicyMode::Strict && a.actor != dataset.owner {
@@ -617,7 +675,7 @@ fn apply_add_licensor_v1_tx(
     let key = keys::licensor_allow(a.dataset_id, &a.licensor.0);
     let already = tree.get(&key)?.is_some();
     if !already {
-        tree.insert(key, sled::IVec::from(&b"1"[..]))?;
+        tx_put_plain(tree, cipher, key.as_slice(), b"1")?;
         ctx.record_put(
             changelog,
             &keys::licensor_allow(a.dataset_id, &a.licensor.0),
@@ -645,11 +703,12 @@ fn apply_add_attestor_v1_tx(
     tree: &TransactionalTree,
     changelog: &TransactionalTree,
     ctx: &mut ChangelogTxCtx,
+    cipher: Option<&SledValueCipher>,
     action_id: ActionId,
     a: &AddAttestorV1,
     mode: PolicyMode,
 ) -> Result<ApplyReceipt, ConflictableTransactionError<TxError>> {
-    let dataset = get_dataset_tx(tree, a.dataset_id)?.ok_or_else(|| {
+    let dataset = get_dataset_tx(tree, cipher, a.dataset_id)?.ok_or_else(|| {
         ConflictableTransactionError::Abort(TxError::Rejected("dataset_id not found".to_string()))
     })?;
     if mode == PolicyMode::Strict && a.actor != dataset.owner {
@@ -661,7 +720,7 @@ fn apply_add_attestor_v1_tx(
     let key = keys::attestor_allow(a.dataset_id, &a.attestor.0);
     let already = tree.get(&key)?.is_some();
     if !already {
-        tree.insert(key, sled::IVec::from(&b"1"[..]))?;
+        tx_put_plain(tree, cipher, key.as_slice(), b"1")?;
         ctx.record_put(
             changelog,
             &keys::attestor_allow(a.dataset_id, &a.attestor.0),
@@ -687,14 +746,51 @@ fn apply_add_attestor_v1_tx(
 
 fn get_dataset_tx(
     tree: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
     dataset_id: DatasetId,
 ) -> Result<Option<RegisterDatasetV1>, ConflictableTransactionError<TxError>> {
-    let Some(v) = tree.get(keys::dataset(dataset_id))? else {
+    let key = keys::dataset(dataset_id);
+    let Some(v) = tx_get_plain(tree, cipher, key.as_slice())? else {
         return Ok(None);
     };
     serde_json::from_slice::<RegisterDatasetV1>(&v)
         .map(Some)
         .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))
+}
+
+fn tx_get_plain(
+    tree: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, ConflictableTransactionError<TxError>> {
+    let Some(v) = tree.get(key)? else {
+        return Ok(None);
+    };
+    if let Some(c) = cipher {
+        let plain = c
+            .decrypt_value(key, v.as_ref())
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        Ok(Some(plain))
+    } else {
+        Ok(Some(v.to_vec()))
+    }
+}
+
+fn tx_put_plain(
+    tree: &TransactionalTree,
+    cipher: Option<&SledValueCipher>,
+    key: &[u8],
+    plaintext: &[u8],
+) -> Result<(), ConflictableTransactionError<TxError>> {
+    if let Some(c) = cipher {
+        let stored = c
+            .encrypt_value(key, plaintext)
+            .map_err(|e| ConflictableTransactionError::Abort(TxError::Store(e.to_string())))?;
+        tree.insert(key, stored.as_slice())?;
+    } else {
+        tree.insert(key, plaintext)?;
+    }
+    Ok(())
 }
 
 fn is_admin(actor: &AccountId, admin_accounts: &[AccountId]) -> bool {

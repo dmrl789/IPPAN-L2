@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::config::SnapshotsConfig;
+use crate::crypto;
 use crate::metrics;
 use crate::recon_store::ReconStore;
 use hub_data::DataStore;
@@ -31,6 +32,8 @@ pub enum SnapshotError {
     HashMismatch,
     #[error("hook failed: {0}")]
     HookFailed(String),
+    #[error("encryption error: {0}")]
+    Encryption(String),
 }
 
 pub const SNAPSHOT_VERSION_V1: u32 = 1;
@@ -175,6 +178,47 @@ pub fn create_snapshot_v1_tar(
         .with_label_values(&["ok"])
         .inc();
     Ok(manifest)
+}
+
+/// Create an encrypted snapshot container (EncryptedArchiveV1 with inner SnapshotV1 tar).
+pub fn create_snapshot_v1_encrypted(
+    cfg: &SnapshotsConfig,
+    out_path: &Path,
+    sources: SnapshotSources<'_>,
+    provider: &dyn l2_core::storage_encryption::KeyProvider,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    let tmp = tempfile::tempdir()?;
+    let inner = tmp.path().join("snapshot.tar");
+    let manifest = create_snapshot_v1_tar(cfg, &inner, sources)?;
+    let bytes = fs::read(&inner)?;
+    let aad = format!(
+        "type=snapshot;hash={};snapshot_version={}",
+        manifest.hash, manifest.snapshot_version
+    )
+    .into_bytes();
+    crypto::archive::write_encrypted_archive_v1(out_path, provider, "snapshot", &aad, &bytes)
+        .map_err(|e| SnapshotError::Encryption(e.to_string()))?;
+    Ok(manifest)
+}
+
+/// Restore an encrypted snapshot container produced by `create_snapshot_v1_encrypted`.
+pub fn restore_snapshot_v1_encrypted(
+    cfg: &SnapshotsConfig,
+    from_path: &Path,
+    fin: &FinStore,
+    data: &DataStore,
+    recon: Option<&ReconStore>,
+    receipts_dir: &Path,
+    force: bool,
+    provider: &dyn l2_core::storage_encryption::KeyProvider,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    let (_hdr, tar_bytes) =
+        crypto::archive::read_encrypted_archive_v1(from_path, provider, Some("snapshot"))
+            .map_err(|e| SnapshotError::Encryption(e.to_string()))?;
+    let tmp = tempfile::tempdir()?;
+    let inner = tmp.path().join("snapshot.tar");
+    fs::write(&inner, &tar_bytes)?;
+    restore_snapshot_v1_tar(cfg, &inner, fin, data, recon, receipts_dir, force)
 }
 
 /// Restore SnapshotV1 from a tar archive into the provided stores/receipts dir.

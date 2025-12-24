@@ -23,5 +23,9 @@ base64 = "0.22"
 sled = "0.34"
 thiserror = "1"
 
+[features]
+default = []
+encryption-at-rest = ["l2-core/encryption-at-rest"]
+
 [dev-dependencies]
 tempfile = "3"
