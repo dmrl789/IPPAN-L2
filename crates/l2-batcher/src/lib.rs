@@ -7,6 +7,21 @@
 #![deny(clippy::cast_sign_loss)]
 #![deny(clippy::disallowed_types)]
 
+//! Batching and posting for IPPAN L2.
+//!
+//! This crate provides the batcher loop that collects transactions, forms batches,
+//! and posts them to L1 via either the legacy IPPAN RPC endpoint or the new
+//! contract-based `L2BatchEnvelopeV1` submission.
+//!
+//! ## Posting Modes
+//!
+//! - **Legacy (IppanBatchPoster)**: Posts raw batch JSON to `/tx` endpoint.
+//! - **Contract (ContractBatchPoster)**: Builds `BatchEnvelope` → `L2BatchEnvelopeV1`
+//!   and submits via `L1Client::submit_batch` for proper idempotency and finality tracking.
+
+pub mod async_l1_client;
+pub mod contract_bridge;
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +34,14 @@ use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, error, info, warn};
+
+// Re-exports for convenience
+pub use async_l1_client::{AsyncL1Client, BlockingL1ClientAdapter};
+pub use contract_bridge::{
+    batch_envelope_to_l1_envelope, batch_to_l1_envelope, BridgeConfig, BridgeError, BridgeResult,
+    ContentType, BATCH_ENVELOPE_CONTENT_TYPE_BINARY, BATCH_ENVELOPE_CONTENT_TYPE_JSON,
+    BATCH_ENVELOPE_SCHEMA_VERSION,
+};
 
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
@@ -306,6 +329,261 @@ impl BatchPoster for IppanBatchPoster {
             retries = retry_count,
             reason = %reason,
             "batch posting failed after all retries"
+        );
+        self.storage.set_posting_state(
+            hash,
+            &PostingState::failed(reason.clone(), now_ms(), retry_count),
+        )?;
+        Err(BatcherError::Poster(reason))
+    }
+}
+
+// ============== Contract-based Batch Poster ==============
+
+/// Configuration for contract-based batch poster.
+#[derive(Debug, Clone)]
+pub struct ContractPosterConfig {
+    /// Bridge configuration for envelope construction.
+    pub bridge: BridgeConfig,
+    /// Force repost even if already posted/confirmed.
+    pub force_repost: bool,
+    /// Maximum number of posting retries.
+    pub max_retries: u32,
+    /// Base retry delay in milliseconds.
+    pub retry_delay_ms: u64,
+}
+
+impl Default for ContractPosterConfig {
+    fn default() -> Self {
+        Self {
+            bridge: BridgeConfig::default(),
+            force_repost: false,
+            max_retries: 3,
+            retry_delay_ms: 500,
+        }
+    }
+}
+
+impl ContractPosterConfig {
+    /// Create configuration from environment variables.
+    pub fn from_env() -> Self {
+        use l2_core::l1_contract::FixedAmountV1;
+        use l2_core::L2HubId;
+
+        let hub = std::env::var("L2_HUB_ID")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "fin" => Some(L2HubId::Fin),
+                "data" => Some(L2HubId::Data),
+                "m2m" => Some(L2HubId::M2m),
+                "world" => Some(L2HubId::World),
+                "bridge" => Some(L2HubId::Bridge),
+                _ => None,
+            })
+            .unwrap_or(L2HubId::Fin);
+
+        let content_type = std::env::var("L2_CONTENT_TYPE")
+            .ok()
+            .map(|s| match s.to_lowercase().as_str() {
+                "binary" | "octet-stream" => ContentType::Binary,
+                _ => ContentType::Json,
+            })
+            .unwrap_or(ContentType::Json);
+
+        let fee = std::env::var("L2_BATCH_FEE")
+            .ok()
+            .and_then(|s| s.parse::<i128>().ok())
+            .map(FixedAmountV1)
+            .unwrap_or(FixedAmountV1(0));
+
+        let force_repost = std::env::var("L2_FORCE_REPOST")
+            .map(|s| s == "1" || s.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let max_retries = std::env::var("L2_POST_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+
+        let retry_delay_ms = std::env::var("L2_POST_RETRY_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+
+        Self {
+            bridge: BridgeConfig {
+                hub,
+                content_type,
+                fee,
+            },
+            force_repost,
+            max_retries,
+            retry_delay_ms,
+        }
+    }
+}
+
+/// Contract-based batch poster using `L2BatchEnvelopeV1` and `L1Client::submit_batch`.
+///
+/// This poster builds proper `BatchEnvelope` → `L2BatchEnvelopeV1` envelopes
+/// and submits them via the L1 contract client, providing:
+/// - Deterministic idempotency keys
+/// - Proper finality/inclusion tracking
+/// - Versioned envelope format
+pub struct ContractBatchPoster<C> {
+    l1_client: C,
+    storage: Arc<Storage>,
+    config: ContractPosterConfig,
+    /// Last posted batch hash (for prev_batch_hash linking).
+    last_batch_hash: Mutex<Option<Hash32>>,
+}
+
+impl<C> ContractBatchPoster<C>
+where
+    C: AsyncL1Client + Send + Sync,
+{
+    /// Create a new contract-based batch poster.
+    pub fn new(l1_client: C, storage: Arc<Storage>, config: ContractPosterConfig) -> Self {
+        Self {
+            l1_client,
+            storage,
+            config,
+            last_batch_hash: Mutex::new(None),
+        }
+    }
+
+    /// Check if batch should be posted (idempotency check).
+    fn should_post(&self, hash: &Hash32) -> Result<bool, BatcherError> {
+        let state = self.storage.get_posting_state(hash)?;
+        match state {
+            None => Ok(true),
+            Some(PostingState::Pending { .. }) => Ok(true),
+            Some(PostingState::Posted { .. }) => Ok(self.config.force_repost),
+            Some(PostingState::Confirmed { .. }) => Ok(self.config.force_repost),
+            Some(PostingState::Failed { retry_count, .. }) => {
+                Ok(retry_count < self.config.max_retries)
+            }
+        }
+    }
+
+    /// Post batch using contract envelope format.
+    async fn do_post(&self, batch: &Batch, hash: &Hash32) -> Result<String, BatcherError> {
+        use l2_core::l1_contract::L1ClientError;
+
+        // Get previous batch hash for linking
+        let prev_hash = {
+            let guard = self.last_batch_hash.lock().await;
+            contract_bridge::get_prev_batch_hash(guard.as_ref())
+        };
+
+        // Build the L1 envelope
+        let bridge_result = batch_to_l1_envelope(batch, hash, &prev_hash, &self.config.bridge)
+            .map_err(|e| BatcherError::Poster(format!("bridge error: {e}")))?;
+
+        debug!(
+            batch_hash = %hash.to_hex(),
+            idempotency_key = %bridge_result.idempotency_key_hex,
+            "submitting batch via contract envelope"
+        );
+
+        // Submit to L1
+        let result = self
+            .l1_client
+            .submit_batch(&bridge_result.l2_envelope)
+            .await
+            .map_err(|e| match e {
+                L1ClientError::Timeout => BatcherError::Poster("L1 request timeout".to_string()),
+                L1ClientError::HttpStatus(s) => {
+                    BatcherError::Poster(format!("L1 HTTP error: {s}"))
+                }
+                L1ClientError::RetryExhausted { attempts, .. } => {
+                    BatcherError::Poster(format!("L1 retry exhausted after {attempts} attempts"))
+                }
+                other => BatcherError::Poster(format!("L1 error: {other}")),
+            })?;
+
+        if !result.accepted && !result.already_known {
+            let msg = result
+                .message
+                .unwrap_or_else(|| "submission rejected".to_string());
+            return Err(BatcherError::Poster(msg));
+        }
+
+        // Update last batch hash for chaining
+        {
+            let mut guard = self.last_batch_hash.lock().await;
+            *guard = Some(*hash);
+        }
+
+        // Return the L1 tx ID if available
+        Ok(result
+            .l1_tx_id
+            .map(|id| id.0)
+            .unwrap_or_else(|| bridge_result.idempotency_key_hex))
+    }
+}
+
+#[async_trait]
+impl<C> BatchPoster for ContractBatchPoster<C>
+where
+    C: AsyncL1Client + Send + Sync,
+{
+    async fn post_batch(&self, batch: &Batch, hash: &Hash32) -> Result<(), BatcherError> {
+        // Idempotency check
+        if !self.should_post(hash)? {
+            info!(hash = %hash.to_hex(), "batch already posted (contract), skipping");
+            return Ok(());
+        }
+
+        // Mark as pending
+        self.storage
+            .set_posting_state(hash, &PostingState::pending(now_ms()))?;
+
+        // Attempt posting with bounded retries
+        let mut last_error: Option<String> = None;
+        let mut retry_count: u32 = 0;
+
+        while retry_count <= self.config.max_retries {
+            match self.do_post(batch, hash).await {
+                Ok(l1_tx) => {
+                    info!(
+                        hash = %hash.to_hex(),
+                        l1_tx = %l1_tx,
+                        "batch posted successfully via contract envelope"
+                    );
+                    self.storage
+                        .set_posting_state(hash, &PostingState::posted(l1_tx, now_ms()))?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        hash = %hash.to_hex(),
+                        attempt = retry_count + 1,
+                        error = %err,
+                        "contract batch posting failed"
+                    );
+                    last_error = Some(err.to_string());
+                    retry_count = retry_count.saturating_add(1);
+
+                    if retry_count <= self.config.max_retries {
+                        let delay_ms = self
+                            .config
+                            .retry_delay_ms
+                            .saturating_mul(2u64.saturating_pow(retry_count.saturating_sub(1)));
+                        let delay = Duration::from_millis(delay_ms.min(10_000));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted
+        let reason = last_error.unwrap_or_else(|| "unknown error".to_string());
+        error!(
+            hash = %hash.to_hex(),
+            retries = retry_count,
+            reason = %reason,
+            "contract batch posting failed after all retries"
         );
         self.storage.set_posting_state(
             hash,
@@ -981,5 +1259,203 @@ mod ippan_poster_tests {
         let state = storage.get_posting_state(&hash).unwrap().unwrap();
         assert!(state.is_posted());
         assert_eq!(state.l1_tx(), Some("retryl1tx"));
+    }
+}
+
+#[cfg(test)]
+mod contract_poster_tests {
+    use super::*;
+    use l2_core::l1_contract::mock_client::MockL1Client;
+    use l2_core::l1_contract::FixedAmountV1;
+    use l2_core::L2HubId;
+    use tempfile::tempdir;
+
+    fn test_batch() -> Batch {
+        Batch {
+            chain_id: ChainId(1337),
+            batch_number: 1,
+            txs: vec![Tx {
+                chain_id: ChainId(1337),
+                nonce: 1,
+                from: "alice".to_string(),
+                payload: vec![1, 2, 3],
+            }],
+            created_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_poster_success() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+
+        let mock = MockL1Client::new("testnet");
+        let adapter = BlockingL1ClientAdapter::new(mock);
+
+        let config = ContractPosterConfig {
+            bridge: BridgeConfig {
+                hub: L2HubId::Fin,
+                content_type: ContentType::Json,
+                fee: FixedAmountV1(0),
+            },
+            force_repost: false,
+            max_retries: 1,
+            retry_delay_ms: 10,
+        };
+
+        let poster = ContractBatchPoster::new(adapter, Arc::clone(&storage), config);
+
+        let batch = test_batch();
+        let hash = l2_core::canonical_hash(&batch).unwrap();
+
+        poster.post_batch(&batch, &hash).await.unwrap();
+
+        // Verify posting state was updated
+        let state = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert!(state.is_posted());
+        // The L1 tx ID should be set (mock returns a deterministic ID)
+        assert!(state.l1_tx().is_some());
+    }
+
+    #[tokio::test]
+    async fn contract_poster_idempotent_skip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+
+        // Pre-set the state as confirmed
+        let batch = test_batch();
+        let hash = l2_core::canonical_hash(&batch).unwrap();
+        storage
+            .set_posting_state(
+                &hash,
+                &PostingState::confirmed("existingl1tx".to_string(), 1_700_000_000_000),
+            )
+            .unwrap();
+
+        let mock = MockL1Client::new("testnet");
+        let adapter = BlockingL1ClientAdapter::new(mock);
+
+        let config = ContractPosterConfig {
+            bridge: BridgeConfig::default(),
+            force_repost: false,
+            max_retries: 1,
+            retry_delay_ms: 10,
+        };
+
+        let poster = ContractBatchPoster::new(adapter, Arc::clone(&storage), config);
+
+        // Should skip without error
+        poster.post_batch(&batch, &hash).await.unwrap();
+
+        // State should remain confirmed with original l1_tx
+        let state = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert_eq!(state.l1_tx(), Some("existingl1tx"));
+    }
+
+    #[tokio::test]
+    async fn contract_poster_idempotent_replay_on_l1() {
+        // Test that submitting the same batch twice with force_repost works
+        // Note: Due to prev_batch_hash chaining, the second submission will have
+        // a different idempotency key (prev_hash != zero_hash). This tests that
+        // the poster handles L1 submission correctly even with force_repost.
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+
+        let mock = MockL1Client::new("testnet");
+        let adapter = BlockingL1ClientAdapter::new(mock);
+
+        let config = ContractPosterConfig {
+            bridge: BridgeConfig::default(),
+            force_repost: true,
+            max_retries: 1,
+            retry_delay_ms: 10,
+        };
+
+        let poster = ContractBatchPoster::new(adapter, Arc::clone(&storage), config);
+
+        let batch = test_batch();
+        let hash = l2_core::canonical_hash(&batch).unwrap();
+
+        // First post
+        poster.post_batch(&batch, &hash).await.unwrap();
+        let state1 = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert!(state1.is_posted());
+        let l1_tx_1 = state1.l1_tx().unwrap().to_string();
+
+        // Second post (force_repost = true, so it will post again)
+        // The prev_batch_hash will be different (hash of batch1 vs zero),
+        // resulting in a different idempotency key and L1 tx ID.
+        poster.post_batch(&batch, &hash).await.unwrap();
+        let state2 = storage.get_posting_state(&hash).unwrap().unwrap();
+        assert!(state2.is_posted());
+        let l1_tx_2 = state2.l1_tx().unwrap().to_string();
+
+        // L1 tx IDs will be different because prev_hash changed
+        // (first post: prev=zero, second post: prev=hash1)
+        // Both submissions succeed, which is the important part
+        assert!(!l1_tx_1.is_empty());
+        assert!(!l1_tx_2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn contract_poster_batch_chaining() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Arc::new(Storage::open(dir.path()).expect("open"));
+
+        let mock = MockL1Client::new("testnet");
+        let adapter = BlockingL1ClientAdapter::new(mock);
+
+        let config = ContractPosterConfig::default();
+        let poster = ContractBatchPoster::new(adapter, Arc::clone(&storage), config);
+
+        // Post first batch
+        let batch1 = Batch {
+            chain_id: ChainId(1337),
+            batch_number: 1,
+            txs: vec![Tx {
+                chain_id: ChainId(1337),
+                nonce: 1,
+                from: "alice".to_string(),
+                payload: vec![1, 2, 3],
+            }],
+            created_ms: 1_700_000_000_000,
+        };
+        let hash1 = l2_core::canonical_hash(&batch1).unwrap();
+        poster.post_batch(&batch1, &hash1).await.unwrap();
+
+        // Post second batch
+        let batch2 = Batch {
+            chain_id: ChainId(1337),
+            batch_number: 2,
+            txs: vec![Tx {
+                chain_id: ChainId(1337),
+                nonce: 2,
+                from: "bob".to_string(),
+                payload: vec![4, 5, 6],
+            }],
+            created_ms: 1_700_000_001_000,
+        };
+        let hash2 = l2_core::canonical_hash(&batch2).unwrap();
+        poster.post_batch(&batch2, &hash2).await.unwrap();
+
+        // Both batches should be posted
+        let state1 = storage.get_posting_state(&hash1).unwrap().unwrap();
+        let state2 = storage.get_posting_state(&hash2).unwrap().unwrap();
+        assert!(state1.is_posted());
+        assert!(state2.is_posted());
+
+        // L1 tx IDs should be different (different batches)
+        assert_ne!(state1.l1_tx(), state2.l1_tx());
+    }
+
+    #[test]
+    fn contract_poster_config_defaults() {
+        let config = ContractPosterConfig::default();
+        assert_eq!(config.bridge.hub, L2HubId::Fin);
+        assert_eq!(config.bridge.content_type, ContentType::Json);
+        assert_eq!(config.bridge.fee, FixedAmountV1(0));
+        assert!(!config.force_repost);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.retry_delay_ms, 500);
     }
 }
