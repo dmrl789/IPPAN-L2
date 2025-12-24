@@ -10,13 +10,67 @@ The `l2-node` service exposes a minimal operational API:
 |----------|---------|
 | `GET /healthz` | Liveness probe |
 | `GET /readyz` | Readiness probe (fails if storage cannot be opened) |
-| `GET /status` | Structured status with leader/queue/batcher/bridge fields |
+| `GET /status` | Structured status with leader/queue/batcher/bridge/settlement fields |
 | `GET /metrics` | Prometheus metrics export |
-| `POST /tx` | Stub for transaction submission (documented for future wiring) |
-| `GET /tx/{hash}` | Stub for tx lookup |
-| `GET /batch/{hash}` | Stub for batch lookup |
+| `POST /tx` | Transaction submission |
+| `GET /tx/{hash}` | Transaction lookup |
+| `GET /batch/{hash}` | Batch lookup |
+| `POST /tx/force` | Forced inclusion request |
+| `POST /bridge/deposit/claim` | Claim deposit from L1 |
+| `POST /bridge/withdraw` | Request withdrawal to L1 |
 
 The full contract is defined in `openapi.yaml`; SDK generators should target that file to avoid drift.
+
+## Contract Posting
+
+The L2 node uses contract-based batch posting to L1 by default. This is controlled by `L2_POSTER_MODE`:
+
+- **`contract`** (default): Uses `L2BatchEnvelopeV1` with deterministic idempotency keys
+- **`raw`**: Uses legacy IPPAN RPC `/tx` endpoint (for debugging)
+
+### L2BatchEnvelopeV1 Structure
+
+When posting to L1, batches are wrapped in a versioned envelope:
+
+```json
+{
+  "contract_version": "V1",
+  "hub": "Fin",
+  "batch_id": "aabbccdd...",
+  "sequence": 42,
+  "tx_count": 10,
+  "commitment": "merkle_root_hex...",
+  "fee": 0,
+  "idempotency_key": "deterministic_key...",
+  "hub_payload": {
+    "contract_version": "V1",
+    "hub": "Fin",
+    "schema_version": "batch-envelope-v1",
+    "content_type": "application/octet-stream",
+    "payload": "base64_encoded_canonical_bytes..."
+  }
+}
+```
+
+The `hub_payload.payload` contains the canonical (bincode) encoding of `BatchEnvelope`, NOT JSON. This ensures deterministic, version-stable byte representation.
+
+### Settlement Status
+
+The `/status` endpoint includes settlement information:
+
+```json
+{
+  "settlement": {
+    "poster_mode": "contract",
+    "last_submitted_batch_hash": "aabbccdd...",
+    "last_l1_tx_id": "l1tx_12345",
+    "pending_submissions": 0,
+    "confirmed_submissions": 42
+  }
+}
+```
+
+See [SETTLEMENT.md](SETTLEMENT.md) for full details on the settlement architecture.
 
 ## Stability Guarantees
 

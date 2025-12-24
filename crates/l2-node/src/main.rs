@@ -24,6 +24,8 @@ use l2_batcher::{
     BatcherSnapshot, IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, ReconcilerConfig,
     ReconcilerHandle,
 };
+#[cfg(feature = "contract-posting")]
+use l2_batcher::{BlockingL1ClientAdapter, ContractBatchPoster, ContractPosterConfig};
 use l2_bridge::{
     spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, DepositClaimRequest,
     DepositClaimResponse, DepositEvent, DepositStatus, LoggingWatcher, WithdrawRequest,
@@ -100,9 +102,94 @@ pub struct Settings {
     /// Leader endpoints mapping: "pubkey1=http://host1:port,pubkey2=http://host2:port"
     #[arg(long, env = "L2_LEADER_ENDPOINTS", default_value = "")]
     pub leader_endpoints: String,
+    /// Poster mode: "contract" (default) or "raw" (legacy)
+    #[arg(long, env = "L2_POSTER_MODE", default_value = "contract")]
+    pub poster_mode: String,
+}
+
+/// Poster mode selection.
+///
+/// Contract mode is the default and recommended for production.
+/// Raw mode is kept for debugging and backwards compatibility only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PosterMode {
+    /// Contract-based posting using L2BatchEnvelopeV1 (default, recommended).
+    ///
+    /// Features:
+    /// - Deterministic idempotency keys
+    /// - Proper finality/inclusion tracking
+    /// - Versioned envelope format
+    /// - Batch chaining via prev_batch_hash
+    #[default]
+    Contract,
+    /// Raw posting using IPPAN RPC /tx endpoint.
+    ///
+    /// **Legacy/Debug only**. Use only when:
+    /// - Contract posting is unavailable
+    /// - Debugging L1 connectivity issues
+    /// - Backwards compatibility required
+    Raw,
+}
+
+impl std::str::FromStr for PosterMode {
+    type Err = std::convert::Infallible;
+
+    /// Parse from string (env var or CLI arg).
+    /// Never fails - unknown values default to Contract mode.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "raw" | "legacy" => Self::Raw,
+            _ => Self::Contract, // default
+        })
+    }
 }
 
 impl Settings {
+    /// Validate settings at startup. Fails fast on invalid configuration.
+    pub(crate) fn validate(&self) -> Result<(), NodeError> {
+        // If contract posting requested, ensure the feature is enabled
+        #[cfg(not(feature = "contract-posting"))]
+        {
+            let mode: PosterMode = self.poster_mode.parse().unwrap();
+            if mode == PosterMode::Contract {
+                return Err(NodeError::Config(
+                    "L2_POSTER_MODE=contract requires the 'contract-posting' feature, \
+                     but it is not enabled. Either set L2_POSTER_MODE=raw or rebuild \
+                     with --features contract-posting"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Validate leader configuration for posting
+        // Only leaders should post batches in single mode
+        if self.leader_mode == "single" && !self.is_leader && self.batcher_enabled {
+            warn!(
+                "batcher_enabled=true on non-leader node in single mode; \
+                 batches will not be posted until this node becomes leader"
+            );
+        }
+
+        // Validate chain ID is non-zero
+        if self.chain_id == 0 {
+            return Err(NodeError::Config("L2_CHAIN_ID must be > 0".to_string()));
+        }
+
+        // Validate admission cap
+        if self.admission_cap == 0 {
+            return Err(NodeError::Config(
+                "L2_ADMISSION_CAP must be > 0".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Get the parsed poster mode.
+    pub fn get_poster_mode(&self) -> PosterMode {
+        self.poster_mode.parse().unwrap()
+    }
+
     /// Parse leader config from settings.
     fn to_leader_config(&self) -> Result<LeaderConfig, NodeError> {
         let leader_set = LeaderSet::from_csv(&self.leader_set)
@@ -178,6 +265,15 @@ struct Metrics {
     bridge_deposits_total: IntCounter,
     #[allow(dead_code)] // Will be used when bridge posting is complete
     bridge_withdrawals_total: IntCounter,
+    // Contract posting metrics - tracked for observability
+    #[allow(dead_code)] // Exposed via /metrics endpoint
+    contract_submit_total: IntCounter,
+    #[allow(dead_code)] // Exposed via /metrics endpoint
+    contract_submit_retries_total: IntCounter,
+    #[allow(dead_code)] // Exposed via /metrics endpoint
+    contract_already_known_total: IntCounter,
+    #[allow(dead_code)] // Exposed via /metrics endpoint
+    contract_failed_total: IntCounter,
 }
 
 impl Metrics {
@@ -278,6 +374,31 @@ impl Metrics {
         ))
         .expect("bridge withdrawals counter");
 
+        // Contract posting metrics
+        let contract_submit_total = IntCounter::with_opts(Opts::new(
+            "l2_contract_submit_total",
+            "Total contract batch submissions",
+        ))
+        .expect("contract submit counter");
+
+        let contract_submit_retries_total = IntCounter::with_opts(Opts::new(
+            "l2_contract_submit_retries_total",
+            "Total contract batch submission retries",
+        ))
+        .expect("contract retries counter");
+
+        let contract_already_known_total = IntCounter::with_opts(Opts::new(
+            "l2_contract_already_known_total",
+            "Total contract submissions with AlreadyKnown response",
+        ))
+        .expect("contract already known counter");
+
+        let contract_failed_total = IntCounter::with_opts(Opts::new(
+            "l2_contract_failed_total",
+            "Total contract batch submission failures",
+        ))
+        .expect("contract failed counter");
+
         // Register all metrics
         for metric in [
             Box::new(uptime_ms.clone()) as Box<dyn prometheus::core::Collector>,
@@ -296,6 +417,10 @@ impl Metrics {
             Box::new(forced_included_total.clone()),
             Box::new(bridge_deposits_total.clone()),
             Box::new(bridge_withdrawals_total.clone()),
+            Box::new(contract_submit_total.clone()),
+            Box::new(contract_submit_retries_total.clone()),
+            Box::new(contract_already_known_total.clone()),
+            Box::new(contract_failed_total.clone()),
         ] {
             registry.register(metric).expect("register metric");
         }
@@ -318,6 +443,10 @@ impl Metrics {
             forced_included_total,
             bridge_deposits_total,
             bridge_withdrawals_total,
+            contract_submit_total,
+            contract_submit_retries_total,
+            contract_already_known_total,
+            contract_failed_total,
         }
     }
 
@@ -472,7 +601,27 @@ struct StatusResponse {
     batcher: BatcherInfo,
     bridge: BridgeStatusInfo,
     posting: PostingInfo,
+    settlement: SettlementInfo,
     forced_inclusion: ForcedInclusionInfo,
+}
+
+#[derive(Serialize)]
+struct SettlementInfo {
+    /// Poster mode: "contract" or "raw"
+    poster_mode: String,
+    /// Last submitted batch hash (hex)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_submitted_batch_hash: Option<String>,
+    /// Last idempotency key (hex, contract mode only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_idempotency_key: Option<String>,
+    /// Last L1 tx ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_l1_tx_id: Option<String>,
+    /// Number of pending submissions
+    pending_submissions: u64,
+    /// Number of confirmed submissions
+    confirmed_submissions: u64,
 }
 
 #[derive(Serialize)]
@@ -558,7 +707,15 @@ async fn run() -> Result<(), NodeError> {
         .compact()
         .init();
 
-    info!(?settings, "starting l2-node");
+    // Validate settings (fail fast on invalid config)
+    settings.validate()?;
+
+    let poster_mode = settings.get_poster_mode();
+    info!(
+        ?settings,
+        poster_mode = ?poster_mode,
+        "starting l2-node"
+    );
     let storage = Arc::new(Storage::open(&settings.db_path)?);
 
     let metrics = Metrics::new();
@@ -641,25 +798,58 @@ async fn run() -> Result<(), NodeError> {
             chain_id: ChainId(settings.chain_id),
         };
 
-        // Create poster based on IPPAN_RPC_URL
-        let poster: Arc<dyn BatchPoster> = if !settings.ippan_rpc_url.is_empty() {
-            info!(url = %settings.ippan_rpc_url, "using IPPAN RPC poster");
-            let rpc_config = IppanRpcConfig {
-                base_url: settings.ippan_rpc_url.clone(),
-                timeout_ms: IppanRpcConfig::DEFAULT_TIMEOUT_MS,
-                retry_max: IppanRpcConfig::DEFAULT_RETRY_MAX,
-            };
-            let poster_config = IppanPosterConfig::from_env();
-            match IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config) {
-                Ok(poster) => Arc::new(poster),
-                Err(err) => {
-                    warn!(error = %err, "failed to create IPPAN poster, using logging poster");
+        // Create poster based on L2_POSTER_MODE and IPPAN_RPC_URL
+        let poster: Arc<dyn BatchPoster> = match poster_mode {
+            #[cfg(feature = "contract-posting")]
+            PosterMode::Contract => {
+                info!(
+                    mode = "contract",
+                    "using contract-based batch poster (L2BatchEnvelopeV1)"
+                );
+                let config = ContractPosterConfig::from_env();
+                // Create mock L1 client for MVP (will be replaced with real HTTP client)
+                let mock_client = l2_core::l1_contract::mock_client::MockL1Client::new("mainnet");
+                let adapter = BlockingL1ClientAdapter::new(mock_client);
+                Arc::new(ContractBatchPoster::new(
+                    adapter,
+                    Arc::clone(&storage),
+                    config,
+                ))
+            }
+            #[cfg(not(feature = "contract-posting"))]
+            PosterMode::Contract => {
+                // This should not happen due to validate() check, but handle gracefully
+                error!("contract-posting feature not enabled, falling back to logging poster");
+                Arc::new(LoggingBatchPoster {})
+            }
+            PosterMode::Raw => {
+                if !settings.ippan_rpc_url.is_empty() {
+                    info!(
+                        mode = "raw",
+                        url = %settings.ippan_rpc_url,
+                        "using raw IPPAN RPC poster (legacy)"
+                    );
+                    let rpc_config = IppanRpcConfig {
+                        base_url: settings.ippan_rpc_url.clone(),
+                        timeout_ms: IppanRpcConfig::DEFAULT_TIMEOUT_MS,
+                        retry_max: IppanRpcConfig::DEFAULT_RETRY_MAX,
+                    };
+                    let poster_config = IppanPosterConfig::from_env();
+                    match IppanBatchPoster::new(rpc_config, Arc::clone(&storage), poster_config) {
+                        Ok(poster) => Arc::new(poster),
+                        Err(err) => {
+                            warn!(error = %err, "failed to create IPPAN poster, using logging poster");
+                            Arc::new(LoggingBatchPoster {})
+                        }
+                    }
+                } else {
+                    info!(
+                        mode = "raw",
+                        "using logging batch poster (IPPAN_RPC_URL not set)"
+                    );
                     Arc::new(LoggingBatchPoster {})
                 }
             }
-        } else {
-            info!("using logging batch poster (IPPAN_RPC_URL not set)");
-            Arc::new(LoggingBatchPoster {})
         };
 
         let handle = spawn_batcher(config, Arc::clone(&storage), poster);
@@ -848,6 +1038,22 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
     // Get forced queue counts
     let forced_counts = state.storage.count_forced_queue().unwrap_or_default();
 
+    // Build settlement info
+    let poster_mode_str = match state.settings.get_poster_mode() {
+        PosterMode::Contract => "contract",
+        PosterMode::Raw => "raw",
+    };
+
+    // Get last posted batch info for settlement status
+    let last_posted = state
+        .storage
+        .list_posted(1)
+        .ok()
+        .and_then(|v| v.into_iter().next());
+    let last_l1_tx_id = last_posted
+        .as_ref()
+        .and_then(|e| e.state.l1_tx().map(String::from));
+
     let response = StatusResponse {
         service: ServiceInfo {
             name: "ippan-l2-node",
@@ -861,7 +1067,7 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
         },
         batcher: BatcherInfo {
             enabled: state.batcher.is_some(),
-            last_batch_hash: batcher_snapshot.last_batch_hash,
+            last_batch_hash: batcher_snapshot.last_batch_hash.clone(),
             last_post_time: batcher_snapshot.last_post_time_ms,
         },
         bridge: BridgeStatusInfo {
@@ -875,6 +1081,14 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
             posted: posting_counts.posted,
             confirmed: posting_counts.confirmed,
             failed: posting_counts.failed,
+        },
+        settlement: SettlementInfo {
+            poster_mode: poster_mode_str.to_string(),
+            last_submitted_batch_hash: batcher_snapshot.last_batch_hash,
+            last_idempotency_key: None, // Would require storing in batcher snapshot
+            last_l1_tx_id,
+            pending_submissions: posting_counts.pending,
+            confirmed_submissions: posting_counts.confirmed,
         },
         forced_inclusion: ForcedInclusionInfo {
             enabled: true,

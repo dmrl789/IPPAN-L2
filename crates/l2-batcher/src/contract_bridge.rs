@@ -36,6 +36,9 @@ pub enum BridgeError {
     Serialization(String),
 }
 
+/// Maximum payload size for batch envelopes (1MB default).
+pub const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
+
 /// Configuration for bridge operations.
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -45,6 +48,8 @@ pub struct BridgeConfig {
     pub content_type: ContentType,
     /// Protocol fee for batch submission (scaled integer, 0 for MVP).
     pub fee: FixedAmountV1,
+    /// Maximum payload size in bytes.
+    pub max_payload_size: usize,
 }
 
 impl Default for BridgeConfig {
@@ -53,7 +58,90 @@ impl Default for BridgeConfig {
             hub: L2HubId::Fin,
             content_type: ContentType::Json,
             fee: FixedAmountV1(0),
+            max_payload_size: MAX_PAYLOAD_SIZE,
         }
+    }
+}
+
+impl BridgeConfig {
+    /// Validate configuration. Returns an error if invalid.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        // Validate schema version is set (constant, so always valid)
+        if BATCH_ENVELOPE_SCHEMA_VERSION.is_empty() {
+            return Err(BridgeError::Serialization(
+                "schema_version must not be empty".to_string(),
+            ));
+        }
+
+        // Validate content type produces valid MIME
+        let mime = self.content_type.as_mime();
+        if mime.is_empty() {
+            return Err(BridgeError::Serialization(
+                "content_type must produce valid MIME type".to_string(),
+            ));
+        }
+
+        // Validate max payload size
+        if self.max_payload_size == 0 {
+            return Err(BridgeError::Serialization(
+                "max_payload_size must be > 0".to_string(),
+            ));
+        }
+        if self.max_payload_size > 10 * 1024 * 1024 {
+            // 10MB hard limit
+            return Err(BridgeError::Serialization(
+                "max_payload_size must be <= 10MB".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Create from environment variables with validation.
+    pub fn from_env() -> Result<Self, BridgeError> {
+        use l2_core::l1_contract::FixedAmountV1;
+        use l2_core::L2HubId;
+
+        let hub = std::env::var("L2_HUB_ID")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "fin" => Some(L2HubId::Fin),
+                "data" => Some(L2HubId::Data),
+                "m2m" => Some(L2HubId::M2m),
+                "world" => Some(L2HubId::World),
+                "bridge" => Some(L2HubId::Bridge),
+                _ => None,
+            })
+            .unwrap_or(L2HubId::Fin);
+
+        let content_type = std::env::var("L2_CONTENT_TYPE")
+            .ok()
+            .map(|s| match s.to_lowercase().as_str() {
+                "binary" | "octet-stream" => ContentType::Binary,
+                _ => ContentType::Json,
+            })
+            .unwrap_or(ContentType::Json);
+
+        let fee = std::env::var("L2_BATCH_FEE")
+            .ok()
+            .and_then(|s| s.parse::<i128>().ok())
+            .map(FixedAmountV1)
+            .unwrap_or(FixedAmountV1(0));
+
+        let max_payload_size = std::env::var("L2_MAX_PAYLOAD_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MAX_PAYLOAD_SIZE);
+
+        let config = Self {
+            hub,
+            content_type,
+            fee,
+            max_payload_size,
+        };
+
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -143,15 +231,16 @@ pub fn batch_to_l1_envelope(
     let batch_envelope = BatchEnvelope::new_unsigned(batch_payload)?;
 
     // Step 6: Build HubPayloadEnvelopeV1
-    // The payload for the hub envelope is the canonical bytes of the BatchEnvelope
-    let envelope_bytes = serde_json::to_vec(&batch_envelope)
-        .map_err(|e| BridgeError::Serialization(e.to_string()))?;
+    // **CANONICAL RULE**: The payload is ALWAYS canonical bytes (bincode), NOT JSON.
+    // This ensures deterministic, version-stable byte representation for L1 settlement.
+    let envelope_bytes = batch_envelope_payload_bytes(&batch_envelope)?;
 
     let hub_payload = HubPayloadEnvelopeV1 {
         contract_version: ContractVersion::V1,
         hub: config.hub,
         schema_version: BATCH_ENVELOPE_SCHEMA_VERSION.to_string(),
-        content_type: config.content_type.as_mime().to_string(),
+        // Content type reflects the canonical binary encoding
+        content_type: BATCH_ENVELOPE_CONTENT_TYPE_BINARY.to_string(),
         payload: Base64Bytes(envelope_bytes),
     };
 
@@ -183,6 +272,9 @@ pub fn batch_to_l1_envelope(
 /// Use this when you already have a signed BatchEnvelope and want to
 /// create the L1 submission envelope.
 ///
+/// **CANONICAL RULE**: The payload is ALWAYS canonical bytes (bincode), NOT JSON.
+/// This ensures deterministic, version-stable byte representation for L1 settlement.
+///
 /// # Arguments
 /// * `envelope` - The (optionally signed) batch envelope
 /// * `batch_number` - Sequence number for the batch
@@ -192,15 +284,15 @@ pub fn batch_envelope_to_l1_envelope(
     batch_number: u64,
     config: &BridgeConfig,
 ) -> Result<L2BatchEnvelopeV1, BridgeError> {
-    // Serialize the batch envelope as the hub payload
-    let envelope_bytes =
-        serde_json::to_vec(envelope).map_err(|e| BridgeError::Serialization(e.to_string()))?;
+    // **CANONICAL RULE**: Use canonical bytes (bincode), NOT JSON
+    let envelope_bytes = batch_envelope_payload_bytes(envelope)?;
 
     let hub_payload = HubPayloadEnvelopeV1 {
         contract_version: ContractVersion::V1,
         hub: config.hub,
         schema_version: BATCH_ENVELOPE_SCHEMA_VERSION.to_string(),
-        content_type: BATCH_ENVELOPE_CONTENT_TYPE_JSON.to_string(),
+        // Content type reflects the canonical binary encoding
+        content_type: BATCH_ENVELOPE_CONTENT_TYPE_BINARY.to_string(),
         payload: Base64Bytes(envelope_bytes),
     };
 
@@ -244,6 +336,23 @@ pub fn now_ms() -> u64 {
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+// ============== Canonical Payload Helpers ==============
+
+/// Extract the canonical payload bytes from a BatchEnvelope.
+///
+/// **Canonical Rule**: The L1-settled payload is exactly:
+/// - `canonical_encode(BatchEnvelope)` bytes (bincode, little-endian, fixed-int)
+/// - NOT JSON
+///
+/// This ensures deterministic, version-stable byte representation.
+///
+/// # Usage
+/// The returned bytes are what gets embedded into `HubPayloadEnvelopeV1.payload`
+/// for contract-based settlement.
+pub fn batch_envelope_payload_bytes(envelope: &BatchEnvelope) -> Result<Vec<u8>, BridgeError> {
+    canonical_encode(envelope).map_err(BridgeError::from)
 }
 
 #[cfg(test)]
@@ -374,15 +483,20 @@ mod tests {
             hub: L2HubId::Fin,
             content_type: ContentType::Json,
             fee: FixedAmountV1(0),
+            max_payload_size: MAX_PAYLOAD_SIZE,
         };
 
         let result = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash, &config).unwrap();
 
         // This is the golden idempotency key - must remain stable across versions
         // If this changes, it means the envelope derivation has changed (breaking change)
+        //
+        // NOTE: This key changed when we switched from JSON to canonical binary encoding
+        // (canonical_encode) for the BatchEnvelope payload. This is intentional as
+        // canonical binary provides deterministic, version-stable byte representation.
         assert_eq!(
             result.idempotency_key_hex,
-            "0f4f0828bc53d38eeaa9e4bebcbea28a5fbd3a9ec7e0f08c7b94bd1077426676"
+            "bc97a01852f899e21e88b66a62acc25241159821132cbad34f0285e368bbc34e"
         );
     }
 
@@ -400,5 +514,141 @@ mod tests {
         let some_hash = Hash32([0xAA; 32]);
         let prev = get_prev_batch_hash(Some(&some_hash));
         assert_eq!(prev, some_hash);
+    }
+
+    // ========== Golden Vector Tests for Contract Settlement ===========
+
+    /// Golden vector: Fixed batch produces stable BatchEnvelope bytes.
+    ///
+    /// This test ensures the canonical encoding of BatchEnvelope is deterministic
+    /// and stable across versions. If this test fails, it indicates a breaking
+    /// change in the settlement format.
+    #[test]
+    fn golden_batch_envelope_canonical_bytes() {
+        // Fixed test batch
+        let batch = Batch {
+            chain_id: ChainId(1),
+            batch_number: 100,
+            txs: vec![
+                Tx {
+                    chain_id: ChainId(1),
+                    nonce: 1,
+                    from: "alice".to_string(),
+                    payload: vec![0x01, 0x02, 0x03],
+                },
+                Tx {
+                    chain_id: ChainId(1),
+                    nonce: 2,
+                    from: "bob".to_string(),
+                    payload: vec![0x04, 0x05, 0x06],
+                },
+            ],
+            created_ms: 1_700_000_000_000,
+        };
+
+        let batch_hash = canonical_hash(&batch).unwrap();
+        let prev_hash = BatchPayload::zero_hash();
+        let config = BridgeConfig::default();
+
+        let result = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash, &config).unwrap();
+
+        // Extract canonical bytes
+        let envelope_bytes = batch_envelope_payload_bytes(&result.batch_envelope).unwrap();
+
+        // Golden hash of the envelope bytes (must remain stable)
+        // Uses the same hash function as l2_core::canonical_hash_bytes
+        let envelope_bytes_hash = l2_core::canonical_hash_bytes(&envelope_bytes);
+        assert_eq!(
+            hex::encode(&envelope_bytes_hash),
+            "e132dcf254f041adf57b73868feee2936088e1da30d9b638cc6e8c4d62f9ac89",
+            "BatchEnvelope canonical bytes hash changed - breaking change!"
+        );
+    }
+
+    /// Golden vector: L2BatchEnvelopeV1 JSON is stable.
+    ///
+    /// This test ensures the L2BatchEnvelopeV1 JSON structure is deterministic.
+    #[test]
+    fn golden_l2_envelope_json_stable() {
+        let batch = Batch {
+            chain_id: ChainId(1),
+            batch_number: 50,
+            txs: vec![Tx {
+                chain_id: ChainId(1),
+                nonce: 1,
+                from: "test".to_string(),
+                payload: vec![0xAB, 0xCD],
+            }],
+            created_ms: 1_700_000_000_000,
+        };
+
+        let batch_hash = canonical_hash(&batch).unwrap();
+        let prev_hash = BatchPayload::zero_hash();
+        let config = BridgeConfig::default();
+
+        let result = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash, &config).unwrap();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&result.l2_envelope).unwrap();
+
+        // JSON should be deterministic
+        let json2 = serde_json::to_string(&result.l2_envelope).unwrap();
+        assert_eq!(json, json2);
+
+        // Verify key fields are present (checking actual serde output format)
+        assert!(
+            json.contains("\"hub\":\"Fin\""),
+            "Missing hub field: {}",
+            json
+        );
+        assert!(
+            json.contains("\"sequence\":50"),
+            "Missing sequence field: {}",
+            json
+        );
+        assert!(
+            json.contains("\"tx_count\":1"),
+            "Missing tx_count field: {}",
+            json
+        );
+    }
+
+    /// Test that same inputs always produce same idempotency key.
+    #[test]
+    fn idempotency_key_is_deterministic() {
+        let batch = test_batch();
+        let batch_hash = canonical_hash(&batch).unwrap();
+        let prev_hash = BatchPayload::zero_hash();
+        let config = BridgeConfig::default();
+
+        // Build envelope multiple times
+        let result1 = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash, &config).unwrap();
+        let result2 = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash, &config).unwrap();
+        let result3 = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash, &config).unwrap();
+
+        // All idempotency keys must match
+        assert_eq!(result1.idempotency_key_hex, result2.idempotency_key_hex);
+        assert_eq!(result2.idempotency_key_hex, result3.idempotency_key_hex);
+
+        // Idempotency key must be 64 hex chars (32 bytes)
+        assert_eq!(result1.idempotency_key_hex.len(), 64);
+    }
+
+    /// Test that different prev_batch_hash produces different idempotency key.
+    #[test]
+    fn different_prev_hash_different_idempotency_key() {
+        let batch = test_batch();
+        let batch_hash = canonical_hash(&batch).unwrap();
+        let config = BridgeConfig::default();
+
+        let prev_hash_zero = BatchPayload::zero_hash();
+        let prev_hash_non_zero = Hash32([0x11; 32]);
+
+        let result1 = batch_to_l1_envelope(&batch, &batch_hash, &prev_hash_zero, &config).unwrap();
+        let result2 =
+            batch_to_l1_envelope(&batch, &batch_hash, &prev_hash_non_zero, &config).unwrap();
+
+        // Different prev_hash should produce different idempotency keys
+        assert_ne!(result1.idempotency_key_hex, result2.idempotency_key_hex);
     }
 }

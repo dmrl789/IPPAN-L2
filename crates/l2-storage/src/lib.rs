@@ -617,6 +617,54 @@ impl Storage {
         Ok(ids)
     }
 
+    // ========== Batch Chaining APIs ==========
+
+    /// Get the last posted batch hash for a given hub and chain.
+    ///
+    /// Returns None if no batch has been posted yet (genesis case).
+    pub fn get_last_batch_hash(
+        &self,
+        hub: &str,
+        chain_id: u64,
+    ) -> Result<Option<Hash32>, StorageError> {
+        let key = format!("last_batch_hash:{}:{}", hub, chain_id);
+        match self.meta.get(key.as_bytes())? {
+            Some(ivec) => {
+                if ivec.len() != 32 {
+                    return Err(StorageError::Canonical(l2_core::CanonicalError::FromHex(
+                        "invalid batch hash length".to_string(),
+                    )));
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&ivec);
+                Ok(Some(Hash32(hash)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set the last posted batch hash for a given hub and chain.
+    ///
+    /// Should be called when a batch submission is accepted (or confirmed).
+    pub fn set_last_batch_hash(
+        &self,
+        hub: &str,
+        chain_id: u64,
+        hash: &Hash32,
+    ) -> Result<(), StorageError> {
+        let key = format!("last_batch_hash:{}:{}", hub, chain_id);
+        self.meta.insert(key.as_bytes(), &hash.0)?;
+        Ok(())
+    }
+
+    /// Clear the last batch hash for a given hub and chain.
+    ///
+    /// Used for testing or resetting state.
+    pub fn clear_last_batch_hash(&self, hub: &str, chain_id: u64) -> Result<bool, StorageError> {
+        let key = format!("last_batch_hash:{}:{}", hub, chain_id);
+        Ok(self.meta.remove(key.as_bytes())?.is_some())
+    }
+
     // ========== Audit Log APIs ==========
 
     /// Append an audit log entry.
@@ -982,6 +1030,58 @@ mod tests {
         assert_eq!(loaded.event_type, AuditEventType::DepositCreated);
 
         assert_eq!(storage.count_audit().unwrap(), 1);
+    }
+
+    #[test]
+    fn batch_chaining_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let hub = "fin";
+        let chain_id = 1337u64;
+        let hash = Hash32([0xAA; 32]);
+
+        // Initially no hash
+        assert!(storage
+            .get_last_batch_hash(hub, chain_id)
+            .unwrap()
+            .is_none());
+
+        // Set and retrieve
+        storage.set_last_batch_hash(hub, chain_id, &hash).unwrap();
+        assert_eq!(
+            storage.get_last_batch_hash(hub, chain_id).unwrap(),
+            Some(hash)
+        );
+
+        // Update to different hash
+        let hash2 = Hash32([0xBB; 32]);
+        storage.set_last_batch_hash(hub, chain_id, &hash2).unwrap();
+        assert_eq!(
+            storage.get_last_batch_hash(hub, chain_id).unwrap(),
+            Some(hash2)
+        );
+
+        // Different hub/chain should be independent
+        storage
+            .set_last_batch_hash("data", chain_id, &hash)
+            .unwrap();
+        assert_eq!(
+            storage.get_last_batch_hash(hub, chain_id).unwrap(),
+            Some(hash2)
+        );
+        assert_eq!(
+            storage.get_last_batch_hash("data", chain_id).unwrap(),
+            Some(hash)
+        );
+
+        // Clear
+        assert!(storage.clear_last_batch_hash(hub, chain_id).unwrap());
+        assert!(storage
+            .get_last_batch_hash(hub, chain_id)
+            .unwrap()
+            .is_none());
+        assert!(!storage.clear_last_batch_hash(hub, chain_id).unwrap());
     }
 
     #[test]
