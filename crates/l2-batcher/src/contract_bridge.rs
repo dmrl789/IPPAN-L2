@@ -5,7 +5,7 @@
 //! that is submitted to L1 via `L1Client::submit_batch`.
 #![forbid(unsafe_code)]
 
-use l2_core::batch_envelope::{BatchEnvelope, BatchEnvelopeError, BatchPayload, compute_tx_root};
+use l2_core::batch_envelope::{compute_tx_root, BatchEnvelope, BatchEnvelopeError, BatchPayload};
 use l2_core::canonical::{canonical_encode, canonical_hash, Batch, Hash32};
 use l2_core::l1_contract::{
     Base64Bytes, ContractError, ContractVersion, FixedAmountV1, HubPayloadEnvelopeV1,
@@ -116,16 +116,13 @@ pub fn batch_to_l1_envelope(
     let tx_root = compute_tx_root(&tx_hashes);
 
     // Step 2: Compute total tx bytes
-    let tx_bytes: u64 = batch
-        .txs
-        .iter()
-        .map(|tx| tx.payload.len() as u64)
-        .sum();
+    let tx_bytes: u64 = batch.txs.iter().map(|tx| tx.payload.len() as u64).sum();
 
     // Step 3: Encode the batch payload bytes
     let payload_bytes = match config.content_type {
-        ContentType::Json => serde_json::to_vec(batch)
-            .map_err(|e| BridgeError::Serialization(e.to_string()))?,
+        ContentType::Json => {
+            serde_json::to_vec(batch).map_err(|e| BridgeError::Serialization(e.to_string()))?
+        }
         ContentType::Binary => canonical_encode(batch)?,
     };
 
@@ -196,8 +193,8 @@ pub fn batch_envelope_to_l1_envelope(
     config: &BridgeConfig,
 ) -> Result<L2BatchEnvelopeV1, BridgeError> {
     // Serialize the batch envelope as the hub payload
-    let envelope_bytes = serde_json::to_vec(envelope)
-        .map_err(|e| BridgeError::Serialization(e.to_string()))?;
+    let envelope_bytes =
+        serde_json::to_vec(envelope).map_err(|e| BridgeError::Serialization(e.to_string()))?;
 
     let hub_payload = HubPayloadEnvelopeV1 {
         contract_version: ContractVersion::V1,
@@ -234,7 +231,9 @@ pub fn batch_envelope_to_l1_envelope(
 ///
 /// Returns zero hash if this is the first batch.
 pub fn get_prev_batch_hash(last_batch_hash: Option<&Hash32>) -> Hash32 {
-    last_batch_hash.copied().unwrap_or_else(BatchPayload::zero_hash)
+    last_batch_hash
+        .copied()
+        .unwrap_or_else(BatchPayload::zero_hash)
 }
 
 /// Helper to get the current timestamp in milliseconds.

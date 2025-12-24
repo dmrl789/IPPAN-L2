@@ -493,9 +493,7 @@ where
             .await
             .map_err(|e| match e {
                 L1ClientError::Timeout => BatcherError::Poster("L1 request timeout".to_string()),
-                L1ClientError::HttpStatus(s) => {
-                    BatcherError::Poster(format!("L1 HTTP error: {s}"))
-                }
+                L1ClientError::HttpStatus(s) => BatcherError::Poster(format!("L1 HTTP error: {s}")),
                 L1ClientError::RetryExhausted { attempts, .. } => {
                     BatcherError::Poster(format!("L1 retry exhausted after {attempts} attempts"))
                 }

@@ -19,7 +19,10 @@ pub trait AsyncL1Client: Send + Sync {
     async fn chain_status(&self) -> Result<L1ChainStatus, L1ClientError>;
 
     /// Submit a batch envelope to L1.
-    async fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError>;
+    async fn submit_batch(
+        &self,
+        batch: &L2BatchEnvelopeV1,
+    ) -> Result<L1SubmitResult, L1ClientError>;
 
     /// Query inclusion status by idempotency key.
     async fn get_inclusion(
@@ -72,7 +75,10 @@ where
             .map_err(|e| L1ClientError::Network(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError> {
+    async fn submit_batch(
+        &self,
+        batch: &L2BatchEnvelopeV1,
+    ) -> Result<L1SubmitResult, L1ClientError> {
         let client = Arc::clone(&self.client);
         let batch = batch.clone();
         tokio::task::spawn_blocking(move || client.submit_batch(&batch))
@@ -184,7 +190,13 @@ pub mod native_async {
         }
 
         fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-            match self.cfg.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            match self
+                .cfg
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 Some(key) => req.header("Authorization", key),
                 None => req,
             }
@@ -204,7 +216,10 @@ pub mod native_async {
             if !status.is_success() {
                 return Err(L1ClientError::HttpStatus(status.as_u16()));
             }
-            let parsed: T = resp.json().await.map_err(|e| L1ClientError::DecodeError(e.to_string()))?;
+            let parsed: T = resp
+                .json()
+                .await
+                .map_err(|e| L1ClientError::DecodeError(e.to_string()))?;
             Ok(Some(parsed))
         }
     }
@@ -214,19 +229,38 @@ pub mod native_async {
         async fn chain_status(&self) -> Result<L1ChainStatus, L1ClientError> {
             let path = Self::require_endpoint(&self.cfg.endpoints.chain_status, "chain_status")?;
             let url = self.join_url(path);
-            let resp = self.auth(self.client.get(&url)).send().await
-                .map_err(|e| if e.is_timeout() { L1ClientError::Timeout } else { L1ClientError::Network(e.to_string()) })?;
+            let resp = self.auth(self.client.get(&url)).send().await.map_err(|e| {
+                if e.is_timeout() {
+                    L1ClientError::Timeout
+                } else {
+                    L1ClientError::Network(e.to_string())
+                }
+            })?;
             if !resp.status().is_success() {
                 return Err(L1ClientError::HttpStatus(resp.status().as_u16()));
             }
-            resp.json().await.map_err(|e| L1ClientError::DecodeError(e.to_string()))
+            resp.json()
+                .await
+                .map_err(|e| L1ClientError::DecodeError(e.to_string()))
         }
 
-        async fn submit_batch(&self, batch: &L2BatchEnvelopeV1) -> Result<L1SubmitResult, L1ClientError> {
+        async fn submit_batch(
+            &self,
+            batch: &L2BatchEnvelopeV1,
+        ) -> Result<L1SubmitResult, L1ClientError> {
             let path = Self::require_endpoint(&self.cfg.endpoints.submit_batch, "submit_batch")?;
             let url = self.join_url(path);
-            let resp = self.auth(self.client.post(&url).json(batch)).send().await
-                .map_err(|e| if e.is_timeout() { L1ClientError::Timeout } else { L1ClientError::Network(e.to_string()) })?;
+            let resp = self
+                .auth(self.client.post(&url).json(batch))
+                .send()
+                .await
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        L1ClientError::Timeout
+                    } else {
+                        L1ClientError::Network(e.to_string())
+                    }
+                })?;
             let status = resp.status();
             if !status.is_success() {
                 // Try to parse error response for "already known" detection
@@ -238,18 +272,26 @@ pub mod native_async {
                 }
                 return Err(L1ClientError::HttpStatus(status.as_u16()));
             }
-            resp.json().await.map_err(|e| L1ClientError::DecodeError(e.to_string()))
+            resp.json()
+                .await
+                .map_err(|e| L1ClientError::DecodeError(e.to_string()))
         }
 
         async fn get_inclusion(
             &self,
             idempotency_key: &IdempotencyKey,
         ) -> Result<Option<L1InclusionProof>, L1ClientError> {
-            let path_tpl = Self::require_endpoint(&self.cfg.endpoints.get_inclusion, "get_inclusion")?;
+            let path_tpl =
+                Self::require_endpoint(&self.cfg.endpoints.get_inclusion, "get_inclusion")?;
             let path = path_tpl.replace("{id}", &Self::idempotency_key_str(idempotency_key));
             let url = self.join_url(&path);
-            let resp = self.auth(self.client.get(&url)).send().await
-                .map_err(|e| if e.is_timeout() { L1ClientError::Timeout } else { L1ClientError::Network(e.to_string()) })?;
+            let resp = self.auth(self.client.get(&url)).send().await.map_err(|e| {
+                if e.is_timeout() {
+                    L1ClientError::Timeout
+                } else {
+                    L1ClientError::Network(e.to_string())
+                }
+            })?;
             Self::json_404_none(resp).await
         }
 
@@ -257,11 +299,17 @@ pub mod native_async {
             &self,
             l1_tx_id: &L1TxId,
         ) -> Result<Option<L1InclusionProof>, L1ClientError> {
-            let path_tpl = Self::require_endpoint(&self.cfg.endpoints.get_finality, "get_finality")?;
+            let path_tpl =
+                Self::require_endpoint(&self.cfg.endpoints.get_finality, "get_finality")?;
             let path = path_tpl.replace("{l1_tx_id}", &l1_tx_id.0);
             let url = self.join_url(&path);
-            let resp = self.auth(self.client.get(&url)).send().await
-                .map_err(|e| if e.is_timeout() { L1ClientError::Timeout } else { L1ClientError::Network(e.to_string()) })?;
+            let resp = self.auth(self.client.get(&url)).send().await.map_err(|e| {
+                if e.is_timeout() {
+                    L1ClientError::Timeout
+                } else {
+                    L1ClientError::Network(e.to_string())
+                }
+            })?;
             Self::json_404_none(resp).await
         }
     }
@@ -271,9 +319,7 @@ pub mod native_async {
 mod tests {
     use super::*;
     use l2_core::l1_contract::mock_client::MockL1Client;
-    use l2_core::l1_contract::{
-        Base64Bytes, ContractVersion, FixedAmountV1, HubPayloadEnvelopeV1,
-    };
+    use l2_core::l1_contract::{Base64Bytes, ContractVersion, FixedAmountV1, HubPayloadEnvelopeV1};
     use l2_core::L2HubId;
 
     fn test_envelope() -> L2BatchEnvelopeV1 {
