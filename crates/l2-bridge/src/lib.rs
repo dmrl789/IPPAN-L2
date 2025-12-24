@@ -484,7 +484,10 @@ mod tests {
             })])
         }
 
-        async fn verify_deposit(&self, _l1_tx_hash: &str) -> Result<Option<DepositEvent>, BridgeError> {
+        async fn verify_deposit(
+            &self,
+            _l1_tx_hash: &str,
+        ) -> Result<Option<DepositEvent>, BridgeError> {
             Ok(None)
         }
     }

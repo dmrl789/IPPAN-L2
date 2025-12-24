@@ -30,8 +30,8 @@ impl PubKey {
 
     /// Parse a hex-encoded public key.
     pub fn from_hex(s: &str) -> Result<Self, LeaderError> {
-        let bytes = hex::decode(s)
-            .map_err(|e| LeaderError::InvalidPubKey(format!("invalid hex: {e}")))?;
+        let bytes =
+            hex::decode(s).map_err(|e| LeaderError::InvalidPubKey(format!("invalid hex: {e}")))?;
         if bytes.len() != 32 {
             return Err(LeaderError::InvalidPubKey(format!(
                 "expected 32 bytes, got {}",
@@ -575,5 +575,89 @@ mod tests {
         assert_eq!(set.index_of(&pk1), Some(0));
         assert_eq!(set.index_of(&pk2), Some(1));
         assert_eq!(set.index_of(&pk3), None);
+    }
+
+    #[test]
+    fn determinism_across_nodes() {
+        // Simulate 3 nodes with the same leader set
+        let pk1 = test_pubkey(0x11);
+        let pk2 = test_pubkey(0x22);
+        let pk3 = test_pubkey(0x33);
+        let set = LeaderSet::new(vec![pk1, pk2, pk3]);
+
+        // Create configs for each "node"
+        let config_node1 = LeaderConfig {
+            leader_set: set.clone(),
+            epoch_ms: 10_000,
+            genesis_ms: 1_000_000,
+            node_pubkey: pk1,
+        };
+        let config_node2 = LeaderConfig {
+            leader_set: set.clone(),
+            epoch_ms: 10_000,
+            genesis_ms: 1_000_000,
+            node_pubkey: pk2,
+        };
+        let config_node3 = LeaderConfig {
+            leader_set: set,
+            epoch_ms: 10_000,
+            genesis_ms: 1_000_000,
+            node_pubkey: pk3,
+        };
+
+        // All nodes should agree on the leader for each epoch
+        for epoch in 0..500 {
+            let leader1 = config_node1.leader_for_epoch(epoch);
+            let leader2 = config_node2.leader_for_epoch(epoch);
+            let leader3 = config_node3.leader_for_epoch(epoch);
+
+            assert_eq!(
+                leader1, leader2,
+                "nodes 1 and 2 disagree on leader for epoch {epoch}"
+            );
+            assert_eq!(
+                leader2, leader3,
+                "nodes 2 and 3 disagree on leader for epoch {epoch}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_boundary_consistency() {
+        let pk = test_pubkey(0xAA);
+        let set = LeaderSet::new(vec![pk]);
+
+        let config = LeaderConfig {
+            leader_set: set,
+            epoch_ms: 10_000,
+            genesis_ms: 0,
+            node_pubkey: pk,
+        };
+
+        // Test exact epoch boundaries
+        assert_eq!(config.epoch_at(0), 0);
+        assert_eq!(config.epoch_at(9_999), 0);
+        assert_eq!(config.epoch_at(10_000), 1);
+        assert_eq!(config.epoch_at(10_001), 1);
+        assert_eq!(config.epoch_at(19_999), 1);
+        assert_eq!(config.epoch_at(20_000), 2);
+
+        // Verify epoch start/end match
+        assert_eq!(config.epoch_start_ms(0), 0);
+        assert_eq!(config.epoch_end_ms(0), 10_000);
+        assert_eq!(config.epoch_start_ms(1), 10_000);
+        assert_eq!(config.epoch_end_ms(1), 20_000);
+    }
+
+    #[test]
+    fn leader_config_from_csv_with_whitespace() {
+        let pk1 = test_pubkey(0x01);
+        let pk2 = test_pubkey(0x02);
+        // Include whitespace around pubkeys
+        let csv = format!(" {} , {} ", pk1.to_hex(), pk2.to_hex());
+        let set = LeaderSet::from_csv(&csv).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&pk1));
+        assert!(set.contains(&pk2));
     }
 }

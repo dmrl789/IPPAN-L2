@@ -192,6 +192,9 @@ pub enum AuditEventType {
 }
 
 /// Audit log entry.
+///
+/// Note: We intentionally do NOT use `skip_serializing_if` for Option fields
+/// because bincode (used by canonical_encode) requires all fields to be present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     /// Entry ID (timestamp-based).
@@ -203,10 +206,8 @@ pub struct AuditEntry {
     /// Related entity ID (deposit_id, withdraw_id, tx_hash, etc.).
     pub entity_id: String,
     /// Related account (if applicable).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// Additional context as JSON.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
 }
 
@@ -447,7 +448,10 @@ impl Storage {
     }
 
     /// Get a forced inclusion ticket by tx hash.
-    pub fn get_forced_ticket(&self, tx_hash: &Hash32) -> Result<Option<InclusionTicket>, StorageError> {
+    pub fn get_forced_ticket(
+        &self,
+        tx_hash: &Hash32,
+    ) -> Result<Option<InclusionTicket>, StorageError> {
         self.forced_queue
             .get(tx_hash.0)
             .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
@@ -487,7 +491,11 @@ impl Storage {
     /// List forced tickets that must be included by a given epoch.
     ///
     /// Returns tickets where `created_epoch + max_epochs <= epoch`.
-    pub fn list_due_forced(&self, current_epoch: u64, limit: usize) -> Result<Vec<InclusionTicket>, StorageError> {
+    pub fn list_due_forced(
+        &self,
+        current_epoch: u64,
+        limit: usize,
+    ) -> Result<Vec<InclusionTicket>, StorageError> {
         let mut tickets = Vec::new();
         for result in self.forced_queue.iter() {
             if tickets.len() >= limit {
@@ -568,7 +576,8 @@ impl Storage {
 
     /// Store a withdrawal request.
     pub fn put_withdrawal(&self, withdraw_id: &str, data: &[u8]) -> Result<(), StorageError> {
-        self.bridge_withdrawals.insert(withdraw_id.as_bytes(), data)?;
+        self.bridge_withdrawals
+            .insert(withdraw_id.as_bytes(), data)?;
         Ok(())
     }
 
@@ -629,15 +638,15 @@ impl Storage {
     /// List recent audit entries (up to limit, newest first).
     pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StorageError> {
         let mut entries = Vec::new();
-        // Iterate in reverse to get newest first
-        for result in self.audit_log.iter().rev() {
-            if entries.len() >= limit {
-                break;
-            }
+        for result in self.audit_log.iter() {
             let (_key, value) = result?;
             let entry: AuditEntry = canonical_decode(&value)?;
             entries.push(entry);
         }
+        // Sort by timestamp descending (newest first)
+        entries.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+        // Truncate to limit
+        entries.truncate(limit);
         Ok(entries)
     }
 
@@ -899,5 +908,117 @@ mod tests {
         } else {
             panic!("expected Failed state");
         }
+    }
+
+    #[test]
+    fn bridge_deposits_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let deposit_id = "l1tx_abc123:0";
+        let data = b"deposit data".to_vec();
+
+        // Initially doesn't exist
+        assert!(!storage.deposit_exists(deposit_id).unwrap());
+        assert!(storage.get_deposit(deposit_id).unwrap().is_none());
+
+        // Store and retrieve
+        storage.put_deposit(deposit_id, &data).unwrap();
+        assert!(storage.deposit_exists(deposit_id).unwrap());
+        assert_eq!(storage.get_deposit(deposit_id).unwrap(), Some(data));
+        assert_eq!(storage.count_deposits().unwrap(), 1);
+    }
+
+    #[test]
+    fn bridge_withdrawals_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let withdraw_id = "wd_123";
+        let data = b"withdrawal data".to_vec();
+
+        // Initially doesn't exist
+        assert!(!storage.withdrawal_exists(withdraw_id).unwrap());
+        assert!(storage.get_withdrawal(withdraw_id).unwrap().is_none());
+
+        // Store and retrieve
+        storage.put_withdrawal(withdraw_id, &data).unwrap();
+        assert!(storage.withdrawal_exists(withdraw_id).unwrap());
+        assert_eq!(storage.get_withdrawal(withdraw_id).unwrap(), Some(data));
+        assert_eq!(storage.count_withdrawals().unwrap(), 1);
+    }
+
+    #[test]
+    fn list_withdrawal_ids() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Add some withdrawals
+        for i in 0..5 {
+            storage
+                .put_withdrawal(&format!("wd_{i}"), &[i as u8])
+                .unwrap();
+        }
+
+        let ids = storage.list_withdrawal_ids(10).unwrap();
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn audit_log_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let entry = AuditEntry::new(
+            AuditEventType::DepositCreated,
+            "deposit_123".to_string(),
+            Some("alice".to_string()),
+            Some(r#"{"amount":1000}"#.to_string()),
+        );
+
+        storage.append_audit(&entry).unwrap();
+
+        let loaded = storage.get_audit(&entry.id).unwrap().unwrap();
+        assert_eq!(loaded.entity_id, "deposit_123");
+        assert_eq!(loaded.account, Some("alice".to_string()));
+        assert_eq!(loaded.event_type, AuditEventType::DepositCreated);
+
+        assert_eq!(storage.count_audit().unwrap(), 1);
+    }
+
+    #[test]
+    fn audit_log_multiple_entries() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Add multiple entries with varying Option values
+        let entry1 = AuditEntry::new(
+            AuditEventType::DepositCreated,
+            "deposit_1".to_string(),
+            Some("alice".to_string()),
+            None,
+        );
+        let entry2 = AuditEntry::new(
+            AuditEventType::WithdrawCreated,
+            "withdraw_1".to_string(),
+            Some("bob".to_string()),
+            None,
+        );
+        let entry3 = AuditEntry::new(
+            AuditEventType::ForcedTicketCreated,
+            "ticket_1".to_string(),
+            None,
+            None,
+        );
+
+        storage.append_audit(&entry1).unwrap();
+        storage.append_audit(&entry2).unwrap();
+        storage.append_audit(&entry3).unwrap();
+
+        assert_eq!(storage.count_audit().unwrap(), 3);
+
+        // Test list_audit returns all entries
+        let entries = storage.list_audit(10).unwrap();
+        assert_eq!(entries.len(), 3);
     }
 }

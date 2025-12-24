@@ -280,10 +280,8 @@ mod tests {
     #[test]
     fn ticket_signing_bytes_deterministic() {
         let tx_hash = Hash32([0xAB; 32]);
-        let ticket1 =
-            InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
-        let ticket2 =
-            InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
+        let ticket1 = InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
+        let ticket2 = InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
 
         let bytes1 = ticket1.signing_bytes().unwrap();
         let bytes2 = ticket2.signing_bytes().unwrap();
@@ -293,10 +291,8 @@ mod tests {
     #[test]
     fn ticket_id_deterministic() {
         let tx_hash = Hash32([0xAB; 32]);
-        let ticket1 =
-            InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
-        let ticket2 =
-            InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
+        let ticket1 = InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
+        let ticket2 = InclusionTicket::new(tx_hash, "alice".to_string(), 1_000_000, 10_000, 3, 5);
 
         let id1 = ticket1.ticket_id().unwrap();
         let id2 = ticket2.ticket_id().unwrap();

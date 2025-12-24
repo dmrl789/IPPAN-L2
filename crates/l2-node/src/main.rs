@@ -250,11 +250,9 @@ impl Metrics {
         ))
         .expect("leader is_leader gauge");
 
-        let leader_epoch_idx = IntGauge::with_opts(Opts::new(
-            "l2_epoch_idx",
-            "Current epoch index",
-        ))
-        .expect("epoch idx gauge");
+        let leader_epoch_idx =
+            IntGauge::with_opts(Opts::new("l2_epoch_idx", "Current epoch index"))
+                .expect("epoch idx gauge");
 
         let forced_queue_depth = IntGauge::with_opts(Opts::new(
             "l2_forced_queue_depth",
@@ -335,7 +333,8 @@ impl Metrics {
     }
 
     fn update_leader_state(&self, state: &LeaderState) {
-        self.leader_is_leader.set(if state.is_leader { 1 } else { 0 });
+        self.leader_is_leader
+            .set(if state.is_leader { 1 } else { 0 });
         self.leader_epoch_idx
             .set(i64::try_from(state.epoch_idx).unwrap_or(i64::MAX));
     }
@@ -631,8 +630,8 @@ async fn run() -> Result<(), NodeError> {
     };
 
     // Determine if we should start batcher (leader-only in single mode, always in rotating mode)
-    let should_start_batcher = settings.batcher_enabled
-        && (settings.leader_mode == "rotating" || settings.is_leader);
+    let should_start_batcher =
+        settings.batcher_enabled && (settings.leader_mode == "rotating" || settings.is_leader);
 
     if should_start_batcher {
         let config = BatcherConfig {
@@ -1133,7 +1132,11 @@ async fn forward_tx_to_leader(
     debug!(url = %forward_url, "forwarding tx to leader");
 
     // Create signed forward headers (simplified for MVP - just include node pubkey)
-    let node_pubkey = state.leader_config.as_ref().map(|c| c.node_pubkey.to_hex()).unwrap_or_default();
+    let node_pubkey = state
+        .leader_config
+        .as_ref()
+        .map(|c| c.node_pubkey.to_hex())
+        .unwrap_or_default();
     let timestamp = now_ms();
 
     let result = state
@@ -1699,10 +1702,7 @@ async fn get_deposit(
 ) -> impl IntoResponse {
     match state.storage.get_deposit(&id) {
         Ok(Some(data)) => match l2_core::canonical_decode::<DepositEvent>(&data) {
-            Ok(deposit) => (
-                StatusCode::OK,
-                Json(serde_json::to_value(deposit).unwrap()),
-            ),
+            Ok(deposit) => (StatusCode::OK, Json(serde_json::to_value(deposit).unwrap())),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

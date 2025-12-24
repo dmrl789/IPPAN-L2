@@ -580,7 +580,10 @@ async fn run_loop(
                     forced_tx_hashes.push(tx_hash);
                 }
                 if !forced_tx_hashes.is_empty() {
-                    info!(count = forced_tx_hashes.len(), "including forced txs in batch");
+                    info!(
+                        count = forced_tx_hashes.len(),
+                        "including forced txs in batch"
+                    );
                 }
             }
             Err(err) => {
