@@ -562,7 +562,33 @@ async fn run_loop(
         let deadline = Instant::now() + Duration::from_millis(config.max_wait_ms);
         let mut batch_txs: Vec<Tx> = Vec::new();
         let mut batch_bytes: usize = 0;
+        let mut forced_tx_hashes: Vec<Hash32> = Vec::new();
 
+        // Step 1: First include due forced txs from storage
+        let forced_limit = config.max_batch_txs / 2; // Reserve half for forced
+        match get_forced_txs(&storage, forced_limit).await {
+            Ok(forced_txs) => {
+                for (tx, tx_hash) in forced_txs {
+                    if batch_txs.len() >= config.max_batch_txs
+                        || batch_bytes >= config.max_batch_bytes
+                    {
+                        break;
+                    }
+                    let tx_size = tx.payload.len();
+                    batch_txs.push(tx);
+                    batch_bytes += tx_size;
+                    forced_tx_hashes.push(tx_hash);
+                }
+                if !forced_tx_hashes.is_empty() {
+                    info!(count = forced_tx_hashes.len(), "including forced txs in batch");
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to get forced txs");
+            }
+        }
+
+        // Step 2: Fill remaining slots with normal pool txs
         while batch_txs.len() < config.max_batch_txs && batch_bytes < config.max_batch_bytes {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -614,17 +640,63 @@ async fn run_loop(
 
         match storage.put_batch(&batch) {
             Ok(hash) => {
+                // Mark forced txs as included
+                for forced_hash in &forced_tx_hashes {
+                    if let Err(err) = mark_forced_included(&storage, forced_hash, &hash) {
+                        warn!(
+                            error = %err,
+                            tx_hash = %forced_hash.to_hex(),
+                            "failed to mark forced tx as included"
+                        );
+                    }
+                }
+
                 if let Err(err) = poster.post_batch(&batch, &hash).await {
                     warn!(error = %err, "poster failed for batch");
                 }
                 let mut guard = state.lock().await;
                 guard.last_batch_hash = Some(hash);
                 guard.last_post_time_ms = Some(batch.created_ms);
-                debug!(batch_number, hash = %hash.to_hex(), "stored batch");
+                debug!(
+                    batch_number,
+                    hash = %hash.to_hex(),
+                    forced_count = forced_tx_hashes.len(),
+                    "stored batch"
+                );
             }
             Err(err) => warn!(error = %err, "failed to persist batch"),
         }
     }
+}
+
+/// Get queued forced txs from storage.
+async fn get_forced_txs(
+    storage: &Storage,
+    limit: usize,
+) -> Result<Vec<(Tx, Hash32)>, BatcherError> {
+    let tickets = storage.list_queued_forced(limit)?;
+    let mut txs = Vec::new();
+
+    for ticket in tickets {
+        if let Ok(Some(tx)) = storage.get_tx(&ticket.tx_hash) {
+            txs.push((tx, ticket.tx_hash));
+        }
+    }
+
+    Ok(txs)
+}
+
+/// Mark a forced tx as included in a batch.
+fn mark_forced_included(
+    storage: &Storage,
+    tx_hash: &Hash32,
+    batch_hash: &Hash32,
+) -> Result<(), BatcherError> {
+    if let Some(mut ticket) = storage.get_forced_ticket(tx_hash)? {
+        ticket.mark_included(*batch_hash);
+        storage.update_forced_ticket(&ticket)?;
+    }
+    Ok(())
 }
 
 async fn next_batch_number(storage: &Storage) -> Result<u64, BatcherError> {

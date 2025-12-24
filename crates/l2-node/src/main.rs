@@ -27,6 +27,10 @@ use l2_batcher::{
 use l2_bridge::{
     spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, LoggingWatcher,
 };
+use l2_core::forced_inclusion::{
+    ForceIncludeRequest, ForceIncludeResponse, ForceIncludeStatus, ForcedInclusionConfig,
+    InclusionTicket,
+};
 use l2_core::{canonical_hash, ChainId, Hash32, Tx};
 use l2_leader::{LeaderConfig, LeaderSet, LeaderState, PubKey};
 use l2_storage::{PostingStateCounts, Storage};
@@ -312,6 +316,8 @@ struct AppState {
     leader_state: Arc<RwLock<LeaderState>>,
     leader_endpoints: std::collections::HashMap<String, String>,
     http_client: reqwest::Client,
+    // Forced inclusion config
+    forced_config: ForcedInclusionConfig,
 }
 
 impl AppState {
@@ -626,6 +632,15 @@ async fn run() -> Result<(), NodeError> {
         bridge_handle = Some(handle);
     }
 
+    // Load forced inclusion config
+    let forced_config = ForcedInclusionConfig::from_env();
+    info!(
+        max_epochs = forced_config.max_epochs,
+        max_per_account = forced_config.max_per_account_per_epoch,
+        l1_commitments = forced_config.post_l1_commitments,
+        "forced inclusion config"
+    );
+
     let state = AppState {
         storage,
         start_instant: Instant::now(),
@@ -639,6 +654,7 @@ async fn run() -> Result<(), NodeError> {
         leader_state: Arc::clone(&leader_state),
         leader_endpoints,
         http_client,
+        forced_config,
     };
 
     // Spawn background task for leader state updates (rotating mode)
@@ -663,6 +679,9 @@ async fn run() -> Result<(), NodeError> {
         // Transaction endpoints
         .route("/tx", post(submit_tx))
         .route("/tx/{hash}", get(get_tx))
+        // Forced inclusion endpoints
+        .route("/tx/force", post(force_include_tx))
+        .route("/tx/force/{hash}", get(get_force_status))
         // Batch endpoints
         .route("/batch/{hash}", get(get_batch))
         .with_state(state.clone());
@@ -1216,6 +1235,230 @@ async fn get_tx(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "transaction not found"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("storage error: {e}")
+            })),
+        ),
+    }
+}
+
+// ============== Forced Inclusion Endpoints ==============
+
+async fn force_include_tx(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<ForceIncludeRequest>,
+) -> impl IntoResponse {
+    // Validate chain_id
+    if req.chain_id != state.settings.chain_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ForceIncludeResponse {
+                accepted: false,
+                tx_hash: String::new(),
+                ticket: None,
+                error: Some(format!(
+                    "chain_id mismatch: expected {}, got {}",
+                    state.settings.chain_id, req.chain_id
+                )),
+            }),
+        );
+    }
+
+    // Decode payload
+    let payload = match hex::decode(&req.payload) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ForceIncludeResponse {
+                    accepted: false,
+                    tx_hash: String::new(),
+                    ticket: None,
+                    error: Some(format!("invalid payload hex: {e}")),
+                }),
+            );
+        }
+    };
+
+    // Check payload size
+    if payload.len() > state.settings.max_tx_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ForceIncludeResponse {
+                accepted: false,
+                tx_hash: String::new(),
+                ticket: None,
+                error: Some(format!(
+                    "payload too large: {} > {}",
+                    payload.len(),
+                    state.settings.max_tx_size
+                )),
+            }),
+        );
+    }
+
+    // Create transaction
+    let tx = Tx {
+        chain_id: ChainId(req.chain_id),
+        nonce: req.nonce,
+        from: req.from.clone(),
+        payload,
+    };
+
+    // Compute hash
+    let tx_hash = match canonical_hash(&tx) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ForceIncludeResponse {
+                    accepted: false,
+                    tx_hash: String::new(),
+                    ticket: None,
+                    error: Some(format!("hash error: {e}")),
+                }),
+            );
+        }
+    };
+
+    // Check if tx already has a forced ticket
+    if let Ok(Some(existing)) = state.storage.get_forced_ticket(&tx_hash) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ForceIncludeResponse {
+                accepted: false,
+                tx_hash: tx_hash.to_hex(),
+                ticket: Some(existing),
+                error: Some("tx already has a forced inclusion ticket".to_string()),
+            }),
+        );
+    }
+
+    // Get current epoch
+    let current_ms = now_ms();
+    let current_epoch = state
+        .leader_config
+        .as_ref()
+        .map(|c| c.epoch_at(current_ms))
+        .unwrap_or(0);
+    let epoch_ms = state
+        .leader_config
+        .as_ref()
+        .map(|c| c.epoch_ms)
+        .unwrap_or(10_000);
+
+    // Check rate limit per account per epoch
+    let account_count = state
+        .storage
+        .count_forced_for_account_epoch(&req.from, current_epoch)
+        .unwrap_or(0);
+    if account_count >= state.forced_config.max_per_account_per_epoch {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ForceIncludeResponse {
+                accepted: false,
+                tx_hash: tx_hash.to_hex(),
+                ticket: None,
+                error: Some(format!(
+                    "exceeded forced tx limit for account this epoch: {} >= {}",
+                    account_count, state.forced_config.max_per_account_per_epoch
+                )),
+            }),
+        );
+    }
+
+    // Store transaction
+    if let Err(e) = state.storage.put_tx(&tx) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ForceIncludeResponse {
+                accepted: false,
+                tx_hash: tx_hash.to_hex(),
+                ticket: None,
+                error: Some(format!("storage error: {e}")),
+            }),
+        );
+    }
+
+    // Create inclusion ticket
+    let ticket = InclusionTicket::new(
+        tx_hash,
+        req.from,
+        current_ms,
+        epoch_ms,
+        state.forced_config.max_epochs,
+        current_epoch,
+    );
+
+    // Store ticket
+    if let Err(e) = state.storage.put_forced_ticket(&ticket) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ForceIncludeResponse {
+                accepted: false,
+                tx_hash: tx_hash.to_hex(),
+                ticket: None,
+                error: Some(format!("failed to store ticket: {e}")),
+            }),
+        );
+    }
+
+    info!(
+        tx_hash = %tx_hash.to_hex(),
+        requester = %ticket.requester,
+        expires_at = ticket.expires_at_ms,
+        "created forced inclusion ticket"
+    );
+
+    (
+        StatusCode::OK,
+        Json(ForceIncludeResponse {
+            accepted: true,
+            tx_hash: tx_hash.to_hex(),
+            ticket: Some(ticket),
+            error: None,
+        }),
+    )
+}
+
+async fn get_force_status(
+    state: axum::extract::State<AppState>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    // Parse hash
+    let tx_hash = match Hash32::from_hex(&hash) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid hash: {e}")
+                })),
+            );
+        }
+    };
+
+    // Look up ticket
+    match state.storage.get_forced_ticket(&tx_hash) {
+        Ok(Some(ticket)) => {
+            let response = ForceIncludeStatus {
+                tx_hash: tx_hash.to_hex(),
+                status: ticket.status,
+                ticket,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "forced inclusion ticket not found"
             })),
         ),
         Err(e) => (

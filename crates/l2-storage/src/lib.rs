@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use l2_core::forced_inclusion::{ForcedInclusionStatus, InclusionTicket};
 use l2_core::{canonical_decode, canonical_encode, canonical_hash, Batch, Hash32, Receipt, Tx};
 use serde::{Deserialize, Serialize};
 use sled::Tree;
@@ -145,6 +146,25 @@ impl PostingStateCounts {
     }
 }
 
+/// Counts of forced inclusion tickets by status.
+#[derive(Debug, Clone, Default)]
+pub struct ForcedQueueCounts {
+    pub queued: u64,
+    pub included: u64,
+    pub rejected: u64,
+    pub expired: u64,
+}
+
+impl ForcedQueueCounts {
+    /// Total number of tickets tracked.
+    pub fn total(&self) -> u64 {
+        self.queued
+            .saturating_add(self.included)
+            .saturating_add(self.rejected)
+            .saturating_add(self.expired)
+    }
+}
+
 pub struct Storage {
     #[allow(dead_code)]
     db: sled::Db,
@@ -153,6 +173,8 @@ pub struct Storage {
     receipts: Tree,
     meta: Tree,
     posting_state: Tree,
+    /// Forced inclusion queue (tx_hash -> InclusionTicket).
+    forced_queue: Tree,
 }
 
 impl Storage {
@@ -163,6 +185,7 @@ impl Storage {
         let receipts = db.open_tree("receipts")?;
         let meta = db.open_tree("meta")?;
         let posting_state = db.open_tree("posting_state")?;
+        let forced_queue = db.open_tree("forced_queue")?;
         let storage = Self {
             db,
             tx_pool,
@@ -170,6 +193,7 @@ impl Storage {
             receipts,
             meta,
             posting_state,
+            forced_queue,
         };
         storage.init_schema()?;
         Ok(storage)
@@ -319,6 +343,106 @@ impl Storage {
             }
         }
         Ok(counts)
+    }
+
+    // ========== Forced Queue APIs ==========
+
+    /// Store a forced inclusion ticket.
+    pub fn put_forced_ticket(&self, ticket: &InclusionTicket) -> Result<(), StorageError> {
+        let bytes = canonical_encode(ticket)?;
+        self.forced_queue.insert(ticket.tx_hash.0, bytes)?;
+        Ok(())
+    }
+
+    /// Get a forced inclusion ticket by tx hash.
+    pub fn get_forced_ticket(&self, tx_hash: &Hash32) -> Result<Option<InclusionTicket>, StorageError> {
+        self.forced_queue
+            .get(tx_hash.0)
+            .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Update a forced inclusion ticket.
+    pub fn update_forced_ticket(&self, ticket: &InclusionTicket) -> Result<(), StorageError> {
+        self.put_forced_ticket(ticket)
+    }
+
+    /// Delete a forced inclusion ticket.
+    pub fn delete_forced_ticket(&self, tx_hash: &Hash32) -> Result<bool, StorageError> {
+        let existed = self.forced_queue.remove(tx_hash.0)?.is_some();
+        Ok(existed)
+    }
+
+    /// List all queued forced tickets (status == Queued).
+    ///
+    /// Returns up to `limit` entries.
+    pub fn list_queued_forced(&self, limit: usize) -> Result<Vec<InclusionTicket>, StorageError> {
+        let mut tickets = Vec::new();
+        for result in self.forced_queue.iter() {
+            if tickets.len() >= limit {
+                break;
+            }
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.status == ForcedInclusionStatus::Queued {
+                tickets.push(ticket);
+            }
+        }
+        Ok(tickets)
+    }
+
+    /// List forced tickets that must be included by a given epoch.
+    ///
+    /// Returns tickets where `created_epoch + max_epochs <= epoch`.
+    pub fn list_due_forced(&self, current_epoch: u64, limit: usize) -> Result<Vec<InclusionTicket>, StorageError> {
+        let mut tickets = Vec::new();
+        for result in self.forced_queue.iter() {
+            if tickets.len() >= limit {
+                break;
+            }
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.status == ForcedInclusionStatus::Queued
+                && ticket.must_include_by_epoch() <= current_epoch
+            {
+                tickets.push(ticket);
+            }
+        }
+        Ok(tickets)
+    }
+
+    /// Count forced tickets by status.
+    pub fn count_forced_queue(&self) -> Result<ForcedQueueCounts, StorageError> {
+        let mut counts = ForcedQueueCounts::default();
+        for result in self.forced_queue.iter() {
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            match ticket.status {
+                ForcedInclusionStatus::Queued => counts.queued += 1,
+                ForcedInclusionStatus::Included => counts.included += 1,
+                ForcedInclusionStatus::Rejected => counts.rejected += 1,
+                ForcedInclusionStatus::Expired => counts.expired += 1,
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Check if an account has exceeded forced tx limit for an epoch.
+    pub fn count_forced_for_account_epoch(
+        &self,
+        account: &str,
+        epoch: u64,
+    ) -> Result<u64, StorageError> {
+        let mut count = 0u64;
+        for result in self.forced_queue.iter() {
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.requester == account && ticket.created_epoch == epoch {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
     }
 
     fn init_schema(&self) -> Result<(), StorageError> {
