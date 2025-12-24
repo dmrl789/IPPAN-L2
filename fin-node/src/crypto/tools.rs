@@ -146,6 +146,7 @@ pub fn rewrap_tree(
 /// Generate a new 32-byte master key and write it as hex.
 ///
 /// Returns the key bytes (caller should NOT print them).
+#[cfg(feature = "encryption-at-rest")]
 pub fn generate_and_write_key_hex(path: &Path, force: bool) -> Result<[u8; 32], EncryptToolError> {
     if path.exists() && !force {
         return Err(EncryptToolError::Io(std::io::Error::new(
@@ -154,18 +155,8 @@ pub fn generate_and_write_key_hex(path: &Path, force: bool) -> Result<[u8; 32], 
         )));
     }
     let mut key = [0u8; 32];
-    #[cfg(feature = "encryption-at-rest")]
-    {
-        getrandom::getrandom(&mut key)
-            .map_err(|e| EncryptToolError::Encrypt(format!("key gen failed: {e}")))?;
-    }
-    #[cfg(not(feature = "encryption-at-rest"))]
-    {
-        let _ = force;
-        return Err(EncryptToolError::Encrypt(
-            "encryption-at-rest feature not enabled".to_string(),
-        ));
-    }
+    getrandom::getrandom(&mut key)
+        .map_err(|e| EncryptToolError::Encrypt(format!("key gen failed: {e}")))?;
 
     let hex = hex::encode(key);
     std::fs::write(path, format!("{hex}\n"))?;
@@ -177,6 +168,19 @@ pub fn generate_and_write_key_hex(path: &Path, force: bool) -> Result<[u8; 32], 
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(key)
+}
+
+/// Generate a new 32-byte master key and write it as hex.
+///
+/// Returns the key bytes (caller should NOT print them).
+#[cfg(not(feature = "encryption-at-rest"))]
+pub fn generate_and_write_key_hex(
+    _path: &Path,
+    _force: bool,
+) -> Result<[u8; 32], EncryptToolError> {
+    Err(EncryptToolError::Encrypt(
+        "encryption-at-rest feature not enabled".to_string(),
+    ))
 }
 
 struct PinnedKeyProvider {

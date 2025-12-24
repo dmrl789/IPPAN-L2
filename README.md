@@ -35,23 +35,70 @@ cd IPPAN-L2
 # Build
 make build
 
-# Run generic L2 node (health/status/metrics)
-make run
-
 # Run tests
 make test
 ```
 
-Status surfaces once `make run` is active:
+### Running the L2 Node
 
 ```bash
+# Run with logging
+export RUST_LOG=info
+cargo run -p l2-node --release
+
+# Or with IPPAN DevNet posting enabled
+export IPPAN_RPC_URL=http://devnet.ippan.network:26657
+export L2_LEADER=1
+cargo run -p l2-node --release
+```
+
+### API Endpoints
+
+```bash
+# Health checks
 curl -s http://localhost:3000/healthz
 curl -s http://localhost:3000/readyz
+
+# Status with batch/posting info
 curl -s http://localhost:3000/status | jq
+
+# Prometheus metrics
 curl -s http://localhost:3000/metrics
+
+# Submit a transaction
+curl -X POST http://localhost:3000/tx \
+  -H "Content-Type: application/json" \
+  -d '{"chain_id": 1, "from": "alice", "nonce": 1, "payload": "48656c6c6f"}'
+
+# Query transaction
+curl -s http://localhost:3000/tx/<TX_HASH>
+
+# Query batch
+curl -s http://localhost:3000/batch/<BATCH_HASH>
+```
+
+### DevNet Smoke Test
+
+```bash
+# Run smoke test against local node
+./scripts/devnet_smoke.sh http://localhost:3000
 ```
 
 See [docs/DEV.md](docs/DEV.md) for detailed development instructions.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IPPAN_RPC_URL` | (empty) | IPPAN DevNet RPC endpoint for posting |
+| `L2_DB_PATH` | `./data/l2` | Sled database path |
+| `L2_LISTEN_ADDR` | `0.0.0.0:3000` | HTTP listen address |
+| `L2_CHAIN_ID` | `1` | L2 chain identifier |
+| `L2_LEADER` | `true` | Enable leader mode (accepts writes) |
+| `L2_ADMISSION_CAP` | `1024` | Max pending transactions (429 when full) |
+| `BATCHER_ENABLED` | `true` | Enable batch creation |
+
+See [docs/ops/devnet-runbook.md](docs/ops/devnet-runbook.md) for full configuration reference.
 
 ## Project Structure
 
@@ -93,17 +140,24 @@ IPPAN-L2/
 - [architecture.md](docs/architecture.md) - System architecture
 - [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) - Threat model and mitigations
 - [LEADER.md](docs/LEADER.md) - Sequencer/leader model and rotation notes
+- [DevNet Runbook](docs/ops/devnet-runbook.md) - Operations guide for DevNet deployment
 
 ## Status
 
 Production integration phase:
-- ✅ L2 core types (batches, proofs, hub IDs)
-- ✅ FIN Hub MVP v1 (CREATE_ASSET, MINT_UNITS, TRANSFER_UNITS; deterministic state + receipts)
-- ✅ DATA Hub MVP v1 (REGISTER_DATASET, ISSUE_LICENSE, APPEND_ATTESTATION, CREATE_LISTING, GRANT_ENTITLEMENT; deterministic state + receipts)
+- ✅ L2 core types (batches, proofs, hub IDs, canonical encoding)
+- ✅ BatchEnvelope with ed25519 sequencer signatures
+- ✅ FIN Hub MVP v1 (CREATE_ASSET, MINT_UNITS, TRANSFER_UNITS)
+- ✅ DATA Hub MVP v1 (REGISTER_DATASET, ISSUE_LICENSE, APPEND_ATTESTATION)
+- ✅ IPPAN RPC client (timeouts, retries, tx posting)
+- ✅ L2 Node with tx ingress + 429 backpressure
+- ✅ Single-leader sequencer mode
+- ✅ Batch posting to IPPAN DevNet
+- ✅ Reconciler for L1 confirmation tracking
+- ✅ Persistent posting state (Pending → Posted → Confirmed)
+- ✅ DevNet E2E tests
 - ✅ Ethereum Oracle integration
 - ✅ CI/CD pipeline
-- ✅ Security baseline
-- ✅ fin-node HTTP endpoints (health/ready/metrics + /fin/* + /data/* + /linkage/*)
 - 🔄 Production deployment (planned)
 
 This repo does **not** contain IPPAN CORE code. CORE lives in the main IPPAN repository.

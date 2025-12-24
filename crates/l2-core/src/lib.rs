@@ -15,12 +15,17 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod batch_envelope;
 pub mod canonical;
 pub mod finality;
 pub mod hub_linkage;
 pub mod l1_contract;
 pub mod policy;
 
+pub use batch_envelope::{
+    compute_tx_root, sign_envelope, verify_envelope, BatchEnvelope, BatchEnvelopeError,
+    BatchPayload, BATCH_SIGNING_DOMAIN_V1,
+};
 pub use canonical::{
     canonical_decode, canonical_encode, canonical_hash, Batch, CanonicalError, ChainId, Hash32,
     Receipt, Tx,

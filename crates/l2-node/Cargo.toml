@@ -22,6 +22,12 @@ l2-core = { path = "../l2-core" }
 l2-storage = { path = "../l2-storage" }
 l2-batcher = { path = "../l2-batcher" }
 l2-bridge = { path = "../l2-bridge" }
+ippan-rpc = { path = "../ippan-rpc" }
 thiserror = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hyper = { version = "1", features = ["server"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }

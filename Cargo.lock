@@ -2417,12 +2417,17 @@ name = "l2-batcher"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
+ "ippan-rpc",
  "l2-core",
  "l2-storage",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2463,14 +2468,18 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "hex",
  "hyper 1.8.1",
+ "ippan-rpc",
  "l2-batcher",
  "l2-bridge",
  "l2-core",
  "l2-storage",
  "prometheus",
+ "reqwest 0.11.27",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2482,6 +2491,7 @@ name = "l2-storage"
 version = "0.1.0"
 dependencies = [
  "l2-core",
+ "serde",
  "sled",
  "tempfile",
  "thiserror 1.0.69",

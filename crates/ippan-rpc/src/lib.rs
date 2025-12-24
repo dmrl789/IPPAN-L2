@@ -432,4 +432,119 @@ mod tests {
         let resp = client.get_tx("missing").await.unwrap();
         assert!(resp.is_none());
     }
+
+    #[tokio::test]
+    async fn tx_lookup_success() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "tx_hash": "abc123",
+            "status": "confirmed",
+            "height": 500,
+            "success": true
+        });
+        Mock::given(method("GET"))
+            .and(path("/tx/abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let client = IppanRpcClient::new(test_config(server.uri())).unwrap();
+        let resp = client.get_tx("abc123").await.unwrap();
+        assert!(resp.is_some());
+        let tx = resp.unwrap();
+        assert_eq!(tx.tx_hash, "abc123");
+        assert_eq!(tx.status, Some("confirmed".to_string()));
+        assert_eq!(tx.height, Some(500));
+        assert_eq!(tx.success, Some(true));
+    }
+
+    #[tokio::test]
+    async fn status_retries_on_500_then_fails() {
+        let server = MockServer::start().await;
+        // Return 500 for all attempts (max 3)
+        Mock::given(method("GET"))
+            .and(path("/status"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = IppanRpcClient::new(test_config(server.uri())).unwrap();
+        let result = client.status().await;
+        assert!(result.is_err());
+        if let Err(IppanRpcError::HttpStatus { status, body }) = result {
+            assert_eq!(status, 500);
+            assert_eq!(body, "internal error");
+        } else {
+            panic!("expected HttpStatus error");
+        }
+    }
+
+    #[tokio::test]
+    async fn json_parse_error_returns_decode_error() {
+        let server = MockServer::start().await;
+        // Return invalid JSON
+        Mock::given(method("GET"))
+            .and(path("/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
+            .mount(&server)
+            .await;
+
+        let client = IppanRpcClient::new(test_config(server.uri())).unwrap();
+        let result = client.status().await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IppanRpcError::Decode(_))));
+    }
+
+    #[cfg(feature = "tx-generic-endpoint")]
+    #[tokio::test]
+    async fn data_tx_submit_success() {
+        let server = MockServer::start().await;
+        let request = DataTxRequest {
+            data: "deadbeef".to_string(),
+            memo: Some("test memo".to_string()),
+            nonce: Some(42),
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .and(body_json(&request))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tx_hash": "xyz789",
+                "accepted": true,
+                "status": "pending"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = IppanRpcClient::new(test_config(server.uri())).unwrap();
+        let resp = client.submit_data_tx(&request).await.unwrap();
+        assert_eq!(resp.tx_hash, "xyz789");
+        assert_eq!(resp.accepted, Some(true));
+        assert_eq!(resp.status, Some("pending".to_string()));
+    }
+
+    #[tokio::test]
+    async fn config_rejects_empty_url() {
+        let config = IppanRpcConfig {
+            base_url: "".to_string(),
+            timeout_ms: 1000,
+            retry_max: 3,
+        };
+        let result = IppanRpcClient::new(config);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(IppanRpcError::Config(_))));
+    }
+
+    #[test]
+    fn backoff_delay_is_bounded() {
+        // Ensure backoff delay doesn't grow unbounded
+        assert_eq!(backoff_delay_ms(1), 100);
+        assert_eq!(backoff_delay_ms(2), 200);
+        assert_eq!(backoff_delay_ms(3), 400);
+        assert_eq!(backoff_delay_ms(4), 800);
+        assert_eq!(backoff_delay_ms(5), 1600);
+        assert_eq!(backoff_delay_ms(6), 2000); // Capped at 2s
+        assert_eq!(backoff_delay_ms(100), 2000); // Still capped
+    }
 }

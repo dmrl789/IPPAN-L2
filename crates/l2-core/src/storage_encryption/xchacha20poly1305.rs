@@ -13,6 +13,7 @@ fn random_nonce_24() -> Result<[u8; NONCE_BYTES], EncryptionError> {
 }
 
 #[cfg(not(feature = "encryption-at-rest"))]
+#[allow(dead_code)]
 fn random_nonce_24() -> Result<[u8; NONCE_BYTES], EncryptionError> {
     Err(EncryptionError::EncryptFailed(
         "encryption-at-rest feature not enabled".to_string(),

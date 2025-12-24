@@ -14,9 +14,14 @@ workspace = true
 async-trait = "0.1"
 l2-core = { path = "../l2-core" }
 l2-storage = { path = "../l2-storage" }
+ippan-rpc = { path = "../ippan-rpc" }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
