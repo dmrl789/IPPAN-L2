@@ -29,6 +29,9 @@ pub use canonical::{
 #[cfg(feature = "signed-envelopes")]
 pub mod signing;
 
+/// Optional operational encryption-at-rest primitives (feature: `encryption-at-rest`).
+pub mod storage_encryption;
+
 /// Generic transaction envelope shared by all IPPAN L2 hubs.
 ///
 /// This structure provides a deterministic wrapper around a hub identifier,

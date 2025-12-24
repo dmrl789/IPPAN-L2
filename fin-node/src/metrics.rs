@@ -292,6 +292,51 @@ pub static SNAPSHOT_DELTA_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 });
 
 // ============================================================
+// Encryption-at-rest metrics (feature: encryption-at-rest)
+// ============================================================
+
+pub static ENCRYPTION_ENCRYPT_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "encryption_encrypt_total",
+        "Total encryption operations (AEAD)",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static ENCRYPTION_DECRYPT_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "encryption_decrypt_total",
+        "Total decryption operations (AEAD)",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static ENCRYPTION_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "encryption_failures_total",
+            "Total encryption/decryption failures",
+        ),
+        &["reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static ENCRYPTION_REWRAP_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new("encryption_rewrap_seconds", "Rewrap duration (seconds)")
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0]);
+    let h = HistogramVec::new(opts, &["tree"]).expect("metric");
+    REGISTRY.register(Box::new(h.clone())).expect("register");
+    h
+});
+
+// ============================================================
 // Remote bootstrap (fetcher) metrics
 // ============================================================
 

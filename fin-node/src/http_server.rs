@@ -48,6 +48,17 @@ struct L1StatusSummary<'a> {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EncryptionStatus {
+    pub schema_version: u32,
+    pub enabled: bool,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_key_id: Option<String>,
+    pub keyring_ids: Vec<String>,
+    pub plaintext_allowed: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn serve(
     bind: &str,
@@ -64,6 +75,7 @@ pub fn serve(
     _cors: CorsConfig,
     max_inflight_requests: usize,
     bootstrap_db_dir: String,
+    encryption_status: EncryptionStatus,
     ha_state: Arc<HaState>,
     write_pause: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -220,6 +232,7 @@ pub fn serve(
                     }),
                 )
             }
+            ("GET", "/encryption/status") => json_response(200, &encryption_status),
             // OpenAPI (v1): served only under the versioned prefix.
             ("GET", "/openapi.json") if is_versioned => {
                 let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
@@ -1294,6 +1307,7 @@ fn route_label(method: &str, path: &str) -> &'static str {
         ("GET", "/openapi.json") => "GET /openapi.json",
         ("GET", "/ha/status") => "GET /ha/status",
         ("GET", "/bootstrap/sources/status") => "GET /bootstrap/sources/status",
+        ("GET", "/encryption/status") => "GET /encryption/status",
         ("GET", "/recon/pending") => "GET /recon/pending",
         ("POST", "/fin/actions") => "POST /fin/actions",
         ("POST", "/data/datasets") => "POST /data/datasets",

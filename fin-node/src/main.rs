@@ -9,6 +9,7 @@ mod bootstrap_mirror_health;
 mod bootstrap_remote;
 mod bootstrap_store;
 mod config;
+mod crypto;
 mod data_api;
 mod fin_api;
 mod ha;
@@ -118,6 +119,12 @@ enum Command {
         #[command(subcommand)]
         cmd: AuditCommand,
     },
+
+    /// Encryption-at-rest utilities (migrate/rotate/rewrap).
+    Encrypt {
+        #[command(subcommand)]
+        cmd: EncryptCommand,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
@@ -183,6 +190,10 @@ struct AuditExportArgs {
     /// Include canonical envelope files. Accepts true/false.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     include_envelopes: bool,
+
+    /// Wrap the bundle in an encrypted container (feature: encryption-at-rest).
+    #[arg(long, default_value_t = false)]
+    encrypt: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -193,6 +204,10 @@ struct AuditReplayArgs {
     /// Verify hashes/signatures and compare state hashes if present.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     verify: bool,
+
+    /// Decrypt an encrypted audit bundle container before replay (feature: encryption-at-rest).
+    #[arg(long, default_value_t = false)]
+    decrypt: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -205,6 +220,78 @@ struct AuditSignArgs {
     key_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum EncryptNamespace {
+    Fin,
+    Data,
+    Recon,
+    Audit,
+    Bootstrap,
+    Policy,
+}
+
+impl EncryptNamespace {
+    fn as_str(self) -> &'static str {
+        match self {
+            EncryptNamespace::Fin => "fin",
+            EncryptNamespace::Data => "data",
+            EncryptNamespace::Recon => "recon",
+            EncryptNamespace::Audit => "audit",
+            EncryptNamespace::Bootstrap => "bootstrap",
+            EncryptNamespace::Policy => "policy",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum EncryptCommand {
+    /// Encrypt plaintext DB values in-place (upgrade).
+    Migrate(EncryptMigrateArgs),
+    /// Re-encrypt existing encrypted values to a new key id.
+    Rewrap(EncryptRewrapArgs),
+    /// Generate a new master key file (operator updates config separately).
+    Rotate(EncryptRotateArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct EncryptMigrateArgs {
+    /// Plan only; print counts and exit.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    /// Actually write changes (required unless --dry-run).
+    #[arg(long, default_value_t = false)]
+    execute: bool,
+    /// Namespace(s) to migrate. If omitted, migrates all known namespaces.
+    #[arg(long, value_enum)]
+    namespace: Vec<EncryptNamespace>,
+}
+
+#[derive(Debug, clap::Args)]
+struct EncryptRewrapArgs {
+    /// Target key id (must be resolvable by the key provider).
+    #[arg(long)]
+    to: String,
+    /// Namespace(s) to rewrap. If omitted, rewraps all known namespaces.
+    #[arg(long, value_enum)]
+    namespace: Vec<EncryptNamespace>,
+    /// Plan only; do not write changes.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct EncryptRotateArgs {
+    /// New key id (e.g. k2).
+    #[arg(long)]
+    new_key_id: String,
+    /// Path to write the new key file (hex-encoded 32 bytes).
+    #[arg(long)]
+    new_key_path: PathBuf,
+    /// Overwrite if the file already exists.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum SnapshotCommand {
     /// Create a snapshot tar archive (SnapshotV1).
@@ -214,6 +301,10 @@ enum SnapshotCommand {
         /// If omitted, uses `[snapshots].output_dir` and a timestamped name.
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Wrap the snapshot tar in an encrypted container (feature: encryption-at-rest).
+        #[arg(long, default_value_t = false)]
+        encrypt: bool,
     },
     /// Create a base snapshot tar archive (SnapshotV1).
     ///
@@ -224,6 +315,10 @@ enum SnapshotCommand {
         /// If omitted, uses `[snapshots].output_dir` and a date-based name.
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Wrap the snapshot tar in an encrypted container (feature: encryption-at-rest).
+        #[arg(long, default_value_t = false)]
+        encrypt: bool,
     },
     /// Create a delta snapshot tar archive (DeltaSnapshotV1) from the current epoch.
     Delta {
@@ -232,6 +327,10 @@ enum SnapshotCommand {
         /// If omitted, uses `[snapshots].output_dir` and `delta-<from>-<to>.tar`.
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Wrap the delta tar in an encrypted container (feature: encryption-at-rest).
+        #[arg(long, default_value_t = false)]
+        encrypt: bool,
     },
     /// Generate/update a bootstrap index (`index.json`) for a snapshots directory.
     PublishIndex {
@@ -247,6 +346,10 @@ enum SnapshotCommand {
         /// Overwrite existing local state (dangerous).
         #[arg(long, default_value_t = false)]
         force: bool,
+
+        /// Decrypt an encrypted snapshot container before restore (feature: encryption-at-rest).
+        #[arg(long, default_value_t = false)]
+        decrypt: bool,
     },
 }
 
@@ -792,6 +895,35 @@ fn main() {
             let recon_shutdown = recon_store.clone();
             let stop_main = stop.clone();
 
+            let encryption_status = cfg
+                .as_ref()
+                .map(|c| {
+                    let mut current_key_id: Option<String> = None;
+                    if c.encryption.enabled && cfg!(feature = "encryption-at-rest") {
+                        if let Ok(Some(p)) =
+                            crate::crypto::key_provider::build_from_config(&c.encryption)
+                        {
+                            current_key_id = p.current_key().ok().map(|k| k.key_id);
+                        }
+                    }
+                    http_server::EncryptionStatus {
+                        schema_version: 1,
+                        enabled: c.encryption.enabled,
+                        provider: c.encryption.provider.clone(),
+                        current_key_id,
+                        keyring_ids: c.encryption.keyring.clone(),
+                        plaintext_allowed: c.encryption.allow_plaintext_read,
+                    }
+                })
+                .unwrap_or_else(|| http_server::EncryptionStatus {
+                    schema_version: 1,
+                    enabled: false,
+                    provider: "file".to_string(),
+                    current_key_id: None,
+                    keyring_ids: Vec::new(),
+                    plaintext_allowed: false,
+                });
+
             let r = http_server::serve(
                 bind,
                 l1,
@@ -813,6 +945,7 @@ fn main() {
                     .map(|c| c.server.max_inflight_requests)
                     .unwrap_or(64),
                 bootstrap_db_dir.clone(),
+                encryption_status,
                 ha_state,
                 snapshot_pause,
                 stop,
@@ -1416,28 +1549,233 @@ fn main() {
                         include_proofs: a.include_proofs,
                         include_envelopes: a.include_envelopes,
                     };
-                    crate::audit::export_audit_bundle_v1(
-                        audit_db_dir,
-                        fin_db_dir,
-                        data_db_dir,
-                        receipts_dir,
-                        opt,
-                    )
-                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    if a.encrypt {
+                        let cfg = cfg.as_ref().unwrap_or_else(|| {
+                            exit_err("audit export --encrypt requires a config (key provider)")
+                        });
+                        let kp = crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                            .unwrap_or_else(|e| exit_err(&e));
+                        let Some(p) = kp.clone() else {
+                            exit_err("audit export --encrypt requires [encryption].enabled=true");
+                        };
+                        crate::audit::export_audit_bundle_v1_encrypted(
+                            audit_db_dir,
+                            fin_db_dir,
+                            data_db_dir,
+                            receipts_dir,
+                            opt,
+                            p,
+                        )
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    } else {
+                        crate::audit::export_audit_bundle_v1(
+                            audit_db_dir,
+                            fin_db_dir,
+                            data_db_dir,
+                            receipts_dir,
+                            opt,
+                        )
+                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    }
                     println!("{}", out_path.display());
                 }
                 AuditCommand::Replay(a) => {
-                    crate::audit::replay_audit_bundle_v1(crate::audit::AuditReplayOptions {
+                    let opt = crate::audit::AuditReplayOptions {
                         from: a.from,
                         verify: a.verify,
-                    })
-                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    };
+                    if a.decrypt {
+                        let cfg = cfg.as_ref().unwrap_or_else(|| {
+                            exit_err("audit replay --decrypt requires a config (key provider)")
+                        });
+                        let kp = crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                            .unwrap_or_else(|e| exit_err(&e));
+                        let Some(p) = kp.clone() else {
+                            exit_err("audit replay --decrypt requires [encryption].enabled=true");
+                        };
+                        crate::audit::replay_audit_bundle_v1_encrypted(opt, p)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    } else {
+                        crate::audit::replay_audit_bundle_v1(opt)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    }
                     println!("ok");
                 }
                 AuditCommand::Sign(a) => {
                     crate::audit::sign_audit_bundle_v1(&a.bundle, &a.key_path)
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                     println!("ok");
+                }
+            }
+        }
+        Command::Encrypt { cmd } => {
+            let cfg = cfg.as_ref().unwrap_or_else(|| {
+                exit_err("encrypt commands require a config: pass --config or set IPPAN_L2_CONFIG")
+            });
+            let kp = crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                .unwrap_or_else(|e| exit_err(&e));
+            let Some(provider) = kp.clone() else {
+                exit_err("encrypt commands require [encryption].enabled=true");
+            };
+
+            match cmd {
+                EncryptCommand::Migrate(a) => {
+                    if !a.dry_run && !a.execute {
+                        exit_err("encrypt migrate requires --dry-run or --execute");
+                    }
+                    let execute = a.execute && !a.dry_run;
+                    let namespaces = if a.namespace.is_empty() {
+                        vec![
+                            EncryptNamespace::Fin,
+                            EncryptNamespace::Data,
+                            EncryptNamespace::Recon,
+                            EncryptNamespace::Audit,
+                            EncryptNamespace::Bootstrap,
+                            EncryptNamespace::Policy,
+                        ]
+                    } else {
+                        a.namespace
+                    };
+
+                    for ns in namespaces {
+                        let (db_dir, trees): (&str, Vec<&str>) = match ns {
+                            EncryptNamespace::Fin => (
+                                cfg.storage.fin_db_dir.as_str(),
+                                vec!["hub-fin", "hub-fin-changelog"],
+                            ),
+                            EncryptNamespace::Data => (
+                                cfg.storage.data_db_dir.as_str(),
+                                vec!["hub-data", "hub-data-changelog"],
+                            ),
+                            EncryptNamespace::Recon => (
+                                cfg.storage.recon_db_dir.as_str(),
+                                vec!["fin-node-recon", "fin-node-recon-changelog"],
+                            ),
+                            EncryptNamespace::Audit => {
+                                (cfg.storage.audit_db_dir.as_str(), vec!["fin-node-audit"])
+                            }
+                            EncryptNamespace::Bootstrap => (
+                                cfg.storage.bootstrap_db_dir.as_str(),
+                                vec!["fin-node-bootstrap", "fin-node-bootstrap-mirror-health"],
+                            ),
+                            EncryptNamespace::Policy => {
+                                (cfg.storage.policy_db_dir.as_str(), vec!["fin-node-policy"])
+                            }
+                        };
+
+                        for tree in trees {
+                            let r = crate::crypto::tools::migrate_tree(
+                                db_dir,
+                                tree,
+                                provider.clone(),
+                                execute,
+                            )
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "op": "migrate",
+                                    "namespace": ns.as_str(),
+                                    "tree": tree,
+                                    "db_dir": db_dir,
+                                    "execute": execute,
+                                    "scanned": r.scanned,
+                                    "plaintext": r.plaintext,
+                                    "already_encrypted": r.already_encrypted,
+                                    "updated": r.updated,
+                                }))
+                                .unwrap()
+                            );
+                        }
+                    }
+                }
+                EncryptCommand::Rewrap(a) => {
+                    let execute = !a.dry_run;
+                    // Validate target key exists.
+                    let _ = provider
+                        .key_by_id(a.to.trim())
+                        .unwrap_or_else(|e| exit_err(&format!("missing --to key id: {e}")));
+
+                    let namespaces = if a.namespace.is_empty() {
+                        vec![
+                            EncryptNamespace::Fin,
+                            EncryptNamespace::Data,
+                            EncryptNamespace::Recon,
+                            EncryptNamespace::Audit,
+                            EncryptNamespace::Bootstrap,
+                            EncryptNamespace::Policy,
+                        ]
+                    } else {
+                        a.namespace
+                    };
+
+                    for ns in namespaces {
+                        let (db_dir, trees): (&str, Vec<&str>) = match ns {
+                            EncryptNamespace::Fin => (
+                                cfg.storage.fin_db_dir.as_str(),
+                                vec!["hub-fin", "hub-fin-changelog"],
+                            ),
+                            EncryptNamespace::Data => (
+                                cfg.storage.data_db_dir.as_str(),
+                                vec!["hub-data", "hub-data-changelog"],
+                            ),
+                            EncryptNamespace::Recon => (
+                                cfg.storage.recon_db_dir.as_str(),
+                                vec!["fin-node-recon", "fin-node-recon-changelog"],
+                            ),
+                            EncryptNamespace::Audit => {
+                                (cfg.storage.audit_db_dir.as_str(), vec!["fin-node-audit"])
+                            }
+                            EncryptNamespace::Bootstrap => (
+                                cfg.storage.bootstrap_db_dir.as_str(),
+                                vec!["fin-node-bootstrap", "fin-node-bootstrap-mirror-health"],
+                            ),
+                            EncryptNamespace::Policy => {
+                                (cfg.storage.policy_db_dir.as_str(), vec!["fin-node-policy"])
+                            }
+                        };
+                        for tree in trees {
+                            let r = crate::crypto::tools::rewrap_tree(
+                                db_dir,
+                                tree,
+                                provider.clone(),
+                                a.to.trim(),
+                                execute,
+                            )
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "op": "rewrap",
+                                    "namespace": ns.as_str(),
+                                    "tree": tree,
+                                    "db_dir": db_dir,
+                                    "execute": execute,
+                                    "to_key_id": a.to.trim(),
+                                    "scanned": r.scanned,
+                                    "rewrapped": r.rewrapped,
+                                    "skipped_plaintext": r.skipped_plaintext,
+                                    "skipped_already_target": r.skipped_already_target,
+                                }))
+                                .unwrap()
+                            );
+                        }
+                    }
+                }
+                EncryptCommand::Rotate(a) => {
+                    let _key_bytes =
+                        crate::crypto::tools::generate_and_write_key_hex(&a.new_key_path, a.force)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "op": "rotate",
+                            "new_key_id": a.new_key_id,
+                            "new_key_path": a.new_key_path.display().to_string(),
+                            "note": "Key file written. Update [encryption].key_id/key_path/keyring and restart fin-node. Do NOT print or log key bytes.",
+                        }))
+                        .unwrap()
+                    );
                 }
             }
         }
@@ -1456,13 +1794,13 @@ fn main() {
             let bootstrap_db_dir = cfg.storage.bootstrap_db_dir.as_str();
 
             match cmd {
-                SnapshotCommand::Create { out } => {
+                SnapshotCommand::Create { out, encrypt } => {
                     // Create is a legacy alias for Base.
-                    let cmd = SnapshotCommand::Base { out };
+                    let cmd = SnapshotCommand::Base { out, encrypt };
                     // Re-enter the match with Base.
                     // NOTE: keep this as a direct tail-call style to avoid duplicating logic.
                     match cmd {
-                        SnapshotCommand::Base { out } => {
+                        SnapshotCommand::Base { out, encrypt } => {
                             // Leader-only enforcement (when HA is enabled).
                             let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
                                 exit_err(&format!("failed to init HA lock provider: {e}"))
@@ -1479,10 +1817,21 @@ fn main() {
                                 }
                             }
 
-                            let fin = hub_fin::FinStore::open(fin_db_dir)
-                                .unwrap_or_else(|e| exit_err(&e.to_string()));
-                            let data = hub_data::DataStore::open(data_db_dir)
-                                .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            let key_provider =
+                                crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                                    .unwrap_or_else(|e| exit_err(&e));
+                            let fin = hub_fin::FinStore::open_with_encryption(
+                                fin_db_dir,
+                                key_provider.clone(),
+                                cfg.encryption.allow_plaintext_read,
+                            )
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            let data = hub_data::DataStore::open_with_encryption(
+                                data_db_dir,
+                                key_provider.clone(),
+                                cfg.encryption.allow_plaintext_read,
+                            )
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                             let recon = recon_store::ReconStore::open(recon_db_dir).ok();
                             let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
                                 .unwrap_or_else(|e| exit_err(&e.to_string()));
@@ -1498,22 +1847,34 @@ fn main() {
                                 ))
                             });
 
-                            let manifest = snapshot::create_snapshot_v1_tar(
-                                &cfg.snapshots,
-                                &out_path,
-                                snapshot::SnapshotSources {
-                                    fin: &fin,
-                                    data: &data,
-                                    recon: recon.as_ref(),
-                                    receipts_dir: Path::new(receipts_dir),
-                                    node_id: if cfg.ha.enabled {
-                                        cfg.ha.node_id.as_str()
-                                    } else {
-                                        cfg.node.label.as_str()
-                                    },
+                            let sources = snapshot::SnapshotSources {
+                                fin: &fin,
+                                data: &data,
+                                recon: recon.as_ref(),
+                                receipts_dir: Path::new(receipts_dir),
+                                node_id: if cfg.ha.enabled {
+                                    cfg.ha.node_id.as_str()
+                                } else {
+                                    cfg.node.label.as_str()
                                 },
-                            )
-                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                            };
+                            let manifest = if encrypt {
+                                let Some(p) = key_provider.as_deref() else {
+                                    exit_err(
+                                        "snapshot --encrypt requires [encryption].enabled=true",
+                                    );
+                                };
+                                snapshot::create_snapshot_v1_encrypted(
+                                    &cfg.snapshots,
+                                    &out_path,
+                                    sources,
+                                    p,
+                                )
+                                .unwrap_or_else(|e| exit_err(&e.to_string()))
+                            } else {
+                                snapshot::create_snapshot_v1_tar(&cfg.snapshots, &out_path, sources)
+                                    .unwrap_or_else(|e| exit_err(&e.to_string()))
+                            };
 
                             // Set base snapshot id for subsequent deltas.
                             let _ = bootstrap.set_base_snapshot_id(&manifest.hash);
@@ -1566,7 +1927,7 @@ fn main() {
                         _ => unreachable!(),
                     }
                 }
-                SnapshotCommand::Base { out } => {
+                SnapshotCommand::Base { out, encrypt } => {
                     // Leader-only enforcement (when HA is enabled).
                     let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
                         exit_err(&format!("failed to init HA lock provider: {e}"))
@@ -1581,10 +1942,21 @@ fn main() {
                         }
                     }
 
-                    let fin = hub_fin::FinStore::open(fin_db_dir)
-                        .unwrap_or_else(|e| exit_err(&e.to_string()));
-                    let data = hub_data::DataStore::open(data_db_dir)
-                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let key_provider =
+                        crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                            .unwrap_or_else(|e| exit_err(&e));
+                    let fin = hub_fin::FinStore::open_with_encryption(
+                        fin_db_dir,
+                        key_provider.clone(),
+                        cfg.encryption.allow_plaintext_read,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open_with_encryption(
+                        data_db_dir,
+                        key_provider.clone(),
+                        cfg.encryption.allow_plaintext_read,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
                     let recon = recon_store::ReconStore::open(recon_db_dir).ok();
                     let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
@@ -1600,22 +1972,32 @@ fn main() {
                         ))
                     });
 
-                    let manifest = snapshot::create_snapshot_v1_tar(
-                        &cfg.snapshots,
-                        &out_path,
-                        snapshot::SnapshotSources {
-                            fin: &fin,
-                            data: &data,
-                            recon: recon.as_ref(),
-                            receipts_dir: Path::new(receipts_dir),
-                            node_id: if cfg.ha.enabled {
-                                cfg.ha.node_id.as_str()
-                            } else {
-                                cfg.node.label.as_str()
-                            },
+                    let sources = snapshot::SnapshotSources {
+                        fin: &fin,
+                        data: &data,
+                        recon: recon.as_ref(),
+                        receipts_dir: Path::new(receipts_dir),
+                        node_id: if cfg.ha.enabled {
+                            cfg.ha.node_id.as_str()
+                        } else {
+                            cfg.node.label.as_str()
                         },
-                    )
-                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    };
+                    let manifest = if encrypt {
+                        let Some(p) = key_provider.as_deref() else {
+                            exit_err("snapshot --encrypt requires [encryption].enabled=true");
+                        };
+                        snapshot::create_snapshot_v1_encrypted(
+                            &cfg.snapshots,
+                            &out_path,
+                            sources,
+                            p,
+                        )
+                        .unwrap_or_else(|e| exit_err(&e.to_string()))
+                    } else {
+                        snapshot::create_snapshot_v1_tar(&cfg.snapshots, &out_path, sources)
+                            .unwrap_or_else(|e| exit_err(&e.to_string()))
+                    };
 
                     // Set base snapshot id for subsequent deltas.
                     let _ = bootstrap.set_base_snapshot_id(&manifest.hash);
@@ -1663,7 +2045,7 @@ fn main() {
                         .unwrap()
                     );
                 }
-                SnapshotCommand::Delta { out } => {
+                SnapshotCommand::Delta { out, encrypt } => {
                     // Leader-only enforcement (when HA is enabled).
                     let lock = ha::build_lock_provider(&cfg.ha).unwrap_or_else(|e| {
                         exit_err(&format!("failed to init HA lock provider: {e}"))
@@ -1678,10 +2060,21 @@ fn main() {
                         }
                     }
 
-                    let fin = hub_fin::FinStore::open(fin_db_dir)
-                        .unwrap_or_else(|e| exit_err(&e.to_string()));
-                    let data = hub_data::DataStore::open(data_db_dir)
-                        .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let key_provider =
+                        crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                            .unwrap_or_else(|e| exit_err(&e));
+                    let fin = hub_fin::FinStore::open_with_encryption(
+                        fin_db_dir,
+                        key_provider.clone(),
+                        cfg.encryption.allow_plaintext_read,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open_with_encryption(
+                        data_db_dir,
+                        key_provider.clone(),
+                        cfg.encryption.allow_plaintext_read,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
                     let recon = recon_store::ReconStore::open(recon_db_dir).ok();
                     let bootstrap = bootstrap_store::BootstrapStore::open(bootstrap_db_dir)
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
@@ -1728,6 +2121,26 @@ fn main() {
                         },
                     )
                     .unwrap_or_else(|e| exit_err(&e.to_string()));
+
+                    if encrypt {
+                        let Some(p) = key_provider.as_deref() else {
+                            exit_err("snapshot delta --encrypt requires [encryption].enabled=true");
+                        };
+                        let bytes = std::fs::read(&out_path)
+                            .unwrap_or_else(|e| exit_err(&format!("read delta tar failed: {e}")));
+                        let aad = format!(
+                            "type=delta;hash={};delta_version={};from_epoch={};to_epoch={}",
+                            manifest.hash,
+                            manifest.delta_version,
+                            manifest.from_epoch,
+                            manifest.to_epoch
+                        )
+                        .into_bytes();
+                        crate::crypto::archive::write_encrypted_archive_v1(
+                            &out_path, p, "delta", &aad, &bytes,
+                        )
+                        .unwrap_or_else(|e| exit_err(&format!("delta encrypt failed: {e}")));
+                    }
 
                     // Clear epoch logs + advance to next epoch boundary.
                     let _ = fin.delete_changelog_epoch(from_epoch);
@@ -1776,23 +2189,57 @@ fn main() {
                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                     println!("{}", dir.join("index.json").display());
                 }
-                SnapshotCommand::Restore { from, force } => {
-                    let fin = hub_fin::FinStore::open(fin_db_dir)
-                        .unwrap_or_else(|e| exit_err(&e.to_string()));
-                    let data = hub_data::DataStore::open(data_db_dir)
-                        .unwrap_or_else(|e| exit_err(&e.to_string()));
-                    let recon = recon_store::ReconStore::open(recon_db_dir).ok();
-
-                    let manifest = snapshot::restore_snapshot_v1_tar(
-                        &cfg.snapshots,
-                        &from,
-                        &fin,
-                        &data,
-                        recon.as_ref(),
-                        Path::new(receipts_dir),
-                        force,
+                SnapshotCommand::Restore {
+                    from,
+                    force,
+                    decrypt,
+                } => {
+                    let key_provider =
+                        crate::crypto::key_provider::build_from_config(&cfg.encryption)
+                            .unwrap_or_else(|e| exit_err(&e));
+                    let fin = hub_fin::FinStore::open_with_encryption(
+                        fin_db_dir,
+                        key_provider.clone(),
+                        cfg.encryption.allow_plaintext_read,
                     )
                     .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let data = hub_data::DataStore::open_with_encryption(
+                        data_db_dir,
+                        key_provider.clone(),
+                        cfg.encryption.allow_plaintext_read,
+                    )
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                    let recon = recon_store::ReconStore::open(recon_db_dir).ok();
+
+                    let manifest = if decrypt {
+                        let Some(p) = key_provider.as_deref() else {
+                            exit_err(
+                                "snapshot restore --decrypt requires [encryption].enabled=true",
+                            );
+                        };
+                        snapshot::restore_snapshot_v1_encrypted(
+                            &cfg.snapshots,
+                            &from,
+                            &fin,
+                            &data,
+                            recon.as_ref(),
+                            Path::new(receipts_dir),
+                            force,
+                            p,
+                        )
+                        .unwrap_or_else(|e| exit_err(&e.to_string()))
+                    } else {
+                        snapshot::restore_snapshot_v1_tar(
+                            &cfg.snapshots,
+                            &from,
+                            &fin,
+                            &data,
+                            recon.as_ref(),
+                            Path::new(receipts_dir),
+                            force,
+                        )
+                        .unwrap_or_else(|e| exit_err(&e.to_string()))
+                    };
 
                     println!(
                         "{}",
