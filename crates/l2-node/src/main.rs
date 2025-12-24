@@ -19,8 +19,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use l2_batcher::{
-    spawn as spawn_batcher, BatcherConfig, BatcherHandle, BatcherSnapshot, BatchPoster,
-    IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster,
+    spawn as spawn_batcher, spawn_reconciler, BatcherConfig, BatcherHandle, BatcherSnapshot,
+    BatchPoster, IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, ReconcilerConfig,
+    ReconcilerHandle,
 };
 use l2_bridge::{
     spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, LoggingWatcher,
@@ -200,6 +201,8 @@ struct AppState {
     settings: Settings,
     batcher: Option<BatcherHandle>,
     bridge: Option<BridgeHandle>,
+    #[allow(dead_code)] // Held to keep background task alive
+    reconciler: Option<ReconcilerHandle>,
     metrics: Metrics,
     queue_depth: Arc<AtomicUsize>,
 }
@@ -349,6 +352,19 @@ async fn run() -> Result<(), NodeError> {
     
     let mut batcher_handle = None;
     let mut bridge_handle = None;
+    let mut reconciler_handle = None;
+
+    // Create RPC client for use by poster and reconciler
+    let rpc_client = if !settings.ippan_rpc_url.is_empty() {
+        let rpc_config = IppanRpcConfig {
+            base_url: settings.ippan_rpc_url.clone(),
+            timeout_ms: IppanRpcConfig::DEFAULT_TIMEOUT_MS,
+            retry_max: IppanRpcConfig::DEFAULT_RETRY_MAX,
+        };
+        ippan_rpc::IppanRpcClient::new(rpc_config).ok()
+    } else {
+        None
+    };
 
     if settings.batcher_enabled && settings.is_leader {
         let config = BatcherConfig {
@@ -381,6 +397,19 @@ async fn run() -> Result<(), NodeError> {
         
         let handle = spawn_batcher(config, Arc::clone(&storage), poster);
         batcher_handle = Some(handle);
+        
+        // Spawn reconciler (leader-only)
+        let reconciler_config = ReconcilerConfig::from_env();
+        info!(
+            interval_ms = reconciler_config.interval_ms,
+            batch_limit = reconciler_config.batch_limit,
+            "starting reconciler"
+        );
+        reconciler_handle = Some(spawn_reconciler(
+            reconciler_config,
+            Arc::clone(&storage),
+            rpc_client.clone(),
+        ));
     }
 
     if settings.bridge_enabled {
@@ -395,6 +424,7 @@ async fn run() -> Result<(), NodeError> {
         settings: settings.clone(),
         batcher: batcher_handle,
         bridge: bridge_handle,
+        reconciler: reconciler_handle,
         metrics,
         queue_depth,
     };

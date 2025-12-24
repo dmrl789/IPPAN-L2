@@ -323,6 +323,165 @@ pub struct PostingResult {
     pub error: Option<String>,
 }
 
+// ============== Reconciler ==============
+
+/// Configuration for the reconciler.
+#[derive(Debug, Clone)]
+pub struct ReconcilerConfig {
+    /// Interval between reconciliation cycles (ms).
+    pub interval_ms: u64,
+    /// Maximum batches to check per cycle.
+    pub batch_limit: usize,
+    /// Timeout threshold for considering a batch stale (ms).
+    pub stale_threshold_ms: u64,
+}
+
+impl Default for ReconcilerConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: 10_000, // 10 seconds
+            batch_limit: 100,
+            stale_threshold_ms: 300_000, // 5 minutes
+        }
+    }
+}
+
+impl ReconcilerConfig {
+    /// Create from environment variables.
+    pub fn from_env() -> Self {
+        let interval_ms = std::env::var("L2_RECONCILE_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        let batch_limit = std::env::var("L2_RECONCILE_BATCH_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let stale_threshold_ms = std::env::var("L2_RECONCILE_STALE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300_000);
+        
+        Self {
+            interval_ms,
+            batch_limit,
+            stale_threshold_ms,
+        }
+    }
+}
+
+/// Reconciler handle for controlling the background task.
+#[derive(Clone)]
+pub struct ReconcilerHandle {
+    _cancel: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Spawn the reconciler background task.
+///
+/// The reconciler periodically checks Posted batches and attempts to confirm them
+/// by querying the IPPAN RPC for transaction status.
+pub fn spawn_reconciler(
+    config: ReconcilerConfig,
+    storage: Arc<Storage>,
+    client: Option<IppanRpcClient>,
+) -> ReconcilerHandle {
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(run_reconciler(config, storage, client, cancel_rx));
+    ReconcilerHandle {
+        _cancel: Arc::new(cancel_tx),
+    }
+}
+
+async fn run_reconciler(
+    config: ReconcilerConfig,
+    storage: Arc<Storage>,
+    client: Option<IppanRpcClient>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(config.interval_ms));
+    
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = reconcile_cycle(&config, &storage, &client).await {
+                    warn!(error = %e, "reconciler cycle failed");
+                }
+            }
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    info!("reconciler shutting down");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn reconcile_cycle(
+    config: &ReconcilerConfig,
+    storage: &Storage,
+    client: &Option<IppanRpcClient>,
+) -> Result<(), BatcherError> {
+    // List posted batches
+    let posted = storage.list_posted(config.batch_limit)?;
+    
+    if posted.is_empty() {
+        debug!("no posted batches to reconcile");
+        return Ok(());
+    }
+    
+    info!(count = posted.len(), "reconciling posted batches");
+    
+    for entry in posted {
+        // Get the L1 tx hash from the state
+        let l1_tx = match &entry.state {
+            PostingState::Posted { l1_tx, .. } => l1_tx.clone(),
+            _ => continue, // Should not happen
+        };
+        
+        // Query IPPAN for transaction status
+        let confirmed = if let Some(rpc_client) = client {
+            match rpc_client.get_tx(&l1_tx).await {
+                Ok(Some(tx_info)) => {
+                    // Check if transaction is confirmed
+                    tx_info.success.unwrap_or(false) || tx_info.height.is_some()
+                }
+                Ok(None) => {
+                    // Transaction not found - might still be pending
+                    debug!(l1_tx = %l1_tx, "L1 tx not found yet");
+                    false
+                }
+                Err(e) => {
+                    warn!(l1_tx = %l1_tx, error = %e, "failed to query L1 tx");
+                    false
+                }
+            }
+        } else {
+            // No client - best effort mode, treat as confirmed after posting
+            // This is documented as a limitation in MVP
+            debug!(
+                batch_hash = %entry.batch_hash.to_hex(),
+                "no RPC client, treating posted as terminal (best-effort mode)"
+            );
+            true // Consider confirmed in best-effort mode
+        };
+        
+        if confirmed {
+            info!(
+                batch_hash = %entry.batch_hash.to_hex(),
+                l1_tx = %l1_tx,
+                "batch confirmed on L1"
+            );
+            storage.set_posting_state(
+                &entry.batch_hash,
+                &PostingState::confirmed(l1_tx, now_ms()),
+            )?;
+        }
+    }
+    
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BatcherSnapshot {
     pub queue_depth: usize,
