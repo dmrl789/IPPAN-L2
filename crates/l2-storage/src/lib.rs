@@ -165,6 +165,86 @@ impl ForcedQueueCounts {
     }
 }
 
+/// Audit log event types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventType {
+    /// Deposit claim created.
+    DepositCreated,
+    /// Deposit verified.
+    DepositVerified,
+    /// Deposit rejected.
+    DepositRejected,
+    /// Withdrawal request created.
+    WithdrawCreated,
+    /// Withdrawal posted to L1.
+    WithdrawPosted,
+    /// Withdrawal confirmed.
+    WithdrawConfirmed,
+    /// Withdrawal failed.
+    WithdrawFailed,
+    /// Forced inclusion ticket created.
+    ForcedTicketCreated,
+    /// Forced inclusion ticket included.
+    ForcedTicketIncluded,
+    /// Forced inclusion ticket expired.
+    ForcedTicketExpired,
+}
+
+/// Audit log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Entry ID (timestamp-based).
+    pub id: String,
+    /// Timestamp (ms since epoch).
+    pub timestamp_ms: u64,
+    /// Event type.
+    pub event_type: AuditEventType,
+    /// Related entity ID (deposit_id, withdraw_id, tx_hash, etc.).
+    pub entity_id: String,
+    /// Related account (if applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Additional context as JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+impl AuditEntry {
+    /// Create a new audit entry.
+    pub fn new(
+        event_type: AuditEventType,
+        entity_id: String,
+        account: Option<String>,
+        context: Option<String>,
+    ) -> Self {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let timestamp_ms = u64::try_from(timestamp_ms).unwrap_or(u64::MAX);
+        // ID is timestamp + random suffix for uniqueness
+        let id = format!("{timestamp_ms}:{:08x}", rand_u32());
+        Self {
+            id,
+            timestamp_ms,
+            event_type,
+            entity_id,
+            account,
+            context,
+        }
+    }
+}
+
+/// Simple deterministic pseudo-random based on system time.
+fn rand_u32() -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    nanos.wrapping_mul(1103515245).wrapping_add(12345)
+}
+
 pub struct Storage {
     #[allow(dead_code)]
     db: sled::Db,
@@ -179,6 +259,8 @@ pub struct Storage {
     bridge_deposits: Tree,
     /// Bridge withdrawals (withdraw_id -> WithdrawRequest).
     bridge_withdrawals: Tree,
+    /// Audit log (timestamp_id -> AuditEntry).
+    audit_log: Tree,
 }
 
 impl Storage {
@@ -192,6 +274,7 @@ impl Storage {
         let forced_queue = db.open_tree("forced_queue")?;
         let bridge_deposits = db.open_tree("bridge_deposits")?;
         let bridge_withdrawals = db.open_tree("bridge_withdrawals")?;
+        let audit_log = db.open_tree("audit_log")?;
         let storage = Self {
             db,
             tx_pool,
@@ -202,6 +285,7 @@ impl Storage {
             forced_queue,
             bridge_deposits,
             bridge_withdrawals,
+            audit_log,
         };
         storage.init_schema()?;
         Ok(storage)
@@ -522,6 +606,45 @@ impl Storage {
             }
         }
         Ok(ids)
+    }
+
+    // ========== Audit Log APIs ==========
+
+    /// Append an audit log entry.
+    pub fn append_audit(&self, entry: &AuditEntry) -> Result<(), StorageError> {
+        let bytes = canonical_encode(entry)?;
+        self.audit_log.insert(entry.id.as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// Get an audit entry by ID.
+    pub fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, StorageError> {
+        self.audit_log
+            .get(id.as_bytes())
+            .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// List recent audit entries (up to limit, newest first).
+    pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StorageError> {
+        let mut entries = Vec::new();
+        // Iterate in reverse to get newest first
+        for result in self.audit_log.iter().rev() {
+            if entries.len() >= limit {
+                break;
+            }
+            let (_key, value) = result?;
+            let entry: AuditEntry = canonical_decode(&value)?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Count audit log entries.
+    pub fn count_audit(&self) -> Result<u64, StorageError> {
+        let count = self.audit_log.len();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
     fn init_schema(&self) -> Result<(), StorageError> {
