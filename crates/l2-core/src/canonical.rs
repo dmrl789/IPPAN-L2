@@ -71,8 +71,8 @@ impl CanonicalError {
 fn encoder() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .allow_trailing_bytes(false)
         .with_little_endian()
+        .reject_trailing_bytes()
 }
 
 /// Serialize using canonical encoding.
@@ -106,7 +106,7 @@ mod tests {
         let encoded = canonical_encode(&tx).expect("encode");
         assert_eq!(
             hex::encode(&encoded),
-            "0905000000000000002a000000000000000600757365722d010300aabbcc"
+            "39050000000000002a000000000000000600000000000000757365722d310300000000000000aabbcc"
         );
     }
 
@@ -126,7 +126,7 @@ mod tests {
         let hash = canonical_hash(&batch).expect("hash");
         assert_eq!(
             hash.to_hex(),
-            "6c7c6e6fc7839740325ec3b11fdf50825d1b07682122e2812b8806e96862b7c1"
+            "cec12e2979f5daef8010bfcec615f02f5158bca069e27f3de6a906d7215972c2"
         );
     }
 

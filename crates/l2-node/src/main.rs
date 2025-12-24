@@ -54,7 +54,9 @@ enum NodeError {
     #[error("storage error: {0}")]
     Storage(#[from] l2_storage::StorageError),
     #[error("server error: {0}")]
-    Server(#[from] hyper::Error),
+    Server(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Clone)]
@@ -212,11 +214,12 @@ async fn run() -> Result<(), NodeError> {
         .parse()
         .expect("invalid listen addr");
     info!(%addr, "listening");
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(NodeError::from)?;
+        .map_err(|e| NodeError::Server(e.to_string()))?;
     Ok(())
 }
 
@@ -256,7 +259,8 @@ async fn ready(state: axum::extract::State<AppState>) -> impl IntoResponse {
 }
 
 async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
-    let uptime_ms = state.start_instant.elapsed().as_millis() as u64;
+    let uptime_millis = state.start_instant.elapsed().as_millis();
+    let uptime_ms = u64::try_from(uptime_millis).unwrap_or(u64::MAX);
     let batcher_snapshot: BatcherSnapshot = if let Some(handle) = &state.batcher {
         handle.snapshot().await
     } else {
@@ -298,9 +302,11 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
 }
 
 async fn metrics_handler(state: axum::extract::State<AppState>) -> impl IntoResponse {
-    let uptime_ms = state.start_instant.elapsed().as_millis() as i64;
+    let uptime_millis = state.start_instant.elapsed().as_millis();
+    let uptime_ms = i64::try_from(uptime_millis).unwrap_or(i64::MAX);
     let queue_depth = if let Some(handle) = &state.batcher {
-        handle.snapshot().await.queue_depth as i64
+        let depth = handle.snapshot().await.queue_depth;
+        i64::try_from(depth).unwrap_or(i64::MAX)
     } else {
         0
     };

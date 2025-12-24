@@ -15,3 +15,6 @@ l2-core = { path = "../l2-core" }
 sled = "0.34"
 thiserror = "1"
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

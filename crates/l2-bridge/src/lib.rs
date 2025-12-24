@@ -70,6 +70,8 @@ pub enum BridgeError {
     Storage(#[from] l2_storage::StorageError),
     #[error("watcher error: {0}")]
     Watcher(String),
+    #[error("canonical error: {0}")]
+    Canonical(#[from] l2_core::CanonicalError),
 }
 
 #[async_trait]
@@ -93,6 +95,7 @@ pub struct BridgeSnapshot {
     pub last_event_time_ms: Option<u64>,
 }
 
+#[derive(Clone)]
 struct BridgeState {
     last_event_time_ms: Option<u64>,
 }
@@ -108,6 +111,14 @@ impl From<BridgeState> for BridgeSnapshot {
 
 pub struct BridgeHandle {
     state: Arc<Mutex<BridgeState>>,
+}
+
+impl Clone for BridgeHandle {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 impl BridgeHandle {

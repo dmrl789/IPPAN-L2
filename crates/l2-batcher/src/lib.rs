@@ -69,6 +69,7 @@ pub struct BatcherSnapshot {
     pub last_post_time_ms: Option<u64>,
 }
 
+#[derive(Clone)]
 struct BatcherState {
     queue_depth: usize,
     last_batch_hash: Option<Hash32>,
@@ -88,6 +89,15 @@ impl From<BatcherState> for BatcherSnapshot {
 pub struct BatcherHandle {
     tx: mpsc::Sender<Tx>,
     state: Arc<Mutex<BatcherState>>,
+}
+
+impl Clone for BatcherHandle {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 impl BatcherHandle {
@@ -141,8 +151,9 @@ async fn run_loop(
             }
             match timeout(remaining, rx.recv()).await {
                 Ok(Some(tx)) => {
-                    batch_bytes += tx.payload.len();
+                    let tx_size = tx.payload.len();
                     batch_txs.push(tx);
+                    batch_bytes += tx_size;
                     let mut guard = state.lock().await;
                     guard.queue_depth = guard.queue_depth.saturating_sub(1);
                 }
@@ -154,8 +165,12 @@ async fn run_loop(
         if batch_txs.is_empty() {
             // Drain one pending message if available to avoid idle state.
             if let Some(tx) = rx.recv().await {
-                batch_bytes += tx.payload.len();
+                let tx_size = tx.payload.len();
                 batch_txs.push(tx);
+                #[allow(unused_assignments)]
+                {
+                    batch_bytes += tx_size;
+                }
                 let mut guard = state.lock().await;
                 guard.queue_depth = guard.queue_depth.saturating_sub(1);
             } else {
@@ -204,16 +219,17 @@ async fn next_batch_number(storage: &Storage) -> Result<u64, BatcherError> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis() as u64
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 pub fn build_handle_for_tests(
-    config: BatcherConfig,
-    storage: Arc<Storage>,
-    poster: Arc<dyn BatchPoster>,
+    _config: BatcherConfig,
+    _storage: Arc<Storage>,
+    _poster: Arc<dyn BatchPoster>,
 ) -> (BatcherHandle, mpsc::Receiver<Tx>) {
     let (tx, rx) = mpsc::channel(1024);
     let state = Arc::new(Mutex::new(BatcherState {

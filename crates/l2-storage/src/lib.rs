@@ -9,9 +9,7 @@
 
 use std::path::Path;
 
-use l2_core::{
-    canonical_decode, canonical_encode, canonical_hash, Batch, ChainId, Hash32, Receipt, Tx,
-};
+use l2_core::{canonical_decode, canonical_encode, canonical_hash, Batch, Hash32, Receipt, Tx};
 use sled::Tree;
 use thiserror::Error;
 use tracing::info;
@@ -33,6 +31,7 @@ pub enum StorageError {
 }
 
 pub struct Storage {
+    #[allow(dead_code)]
     db: sled::Db,
     tx_pool: Tree,
     batches: Tree,
@@ -136,6 +135,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use l2_core::ChainId;
     use tempfile::tempdir;
 
     #[test]
@@ -156,11 +156,15 @@ mod tests {
     #[test]
     fn schema_version_is_enforced() {
         let dir = tempdir().expect("tmpdir");
-        let storage = Storage::open(dir.path()).expect("open");
-        storage
-            .meta
-            .insert(META_SCHEMA_KEY, b"999")
-            .expect("overwrite");
+        {
+            let storage = Storage::open(dir.path()).expect("open");
+            storage
+                .meta
+                .insert(META_SCHEMA_KEY, b"999")
+                .expect("overwrite");
+            storage.meta.flush().expect("flush");
+        }
+        // Drop storage to ensure write is persisted
         let reopened = Storage::open(dir.path());
         assert!(matches!(reopened, Err(StorageError::SchemaMismatch { .. })));
     }
