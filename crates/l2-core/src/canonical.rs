@@ -91,6 +91,11 @@ pub fn canonical_hash<T: Serialize>(value: &T) -> Result<Hash32, CanonicalError>
     Ok(Hash32(blake3::hash(&bytes).into()))
 }
 
+/// Hash raw bytes using BLAKE3.
+pub fn canonical_hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    blake3::hash(bytes).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

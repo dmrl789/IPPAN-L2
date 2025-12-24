@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use l2_core::forced_inclusion::{ForcedInclusionStatus, InclusionTicket};
 use l2_core::{canonical_decode, canonical_encode, canonical_hash, Batch, Hash32, Receipt, Tx};
 use serde::{Deserialize, Serialize};
 use sled::Tree;
@@ -145,6 +146,106 @@ impl PostingStateCounts {
     }
 }
 
+/// Counts of forced inclusion tickets by status.
+#[derive(Debug, Clone, Default)]
+pub struct ForcedQueueCounts {
+    pub queued: u64,
+    pub included: u64,
+    pub rejected: u64,
+    pub expired: u64,
+}
+
+impl ForcedQueueCounts {
+    /// Total number of tickets tracked.
+    pub fn total(&self) -> u64 {
+        self.queued
+            .saturating_add(self.included)
+            .saturating_add(self.rejected)
+            .saturating_add(self.expired)
+    }
+}
+
+/// Audit log event types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventType {
+    /// Deposit claim created.
+    DepositCreated,
+    /// Deposit verified.
+    DepositVerified,
+    /// Deposit rejected.
+    DepositRejected,
+    /// Withdrawal request created.
+    WithdrawCreated,
+    /// Withdrawal posted to L1.
+    WithdrawPosted,
+    /// Withdrawal confirmed.
+    WithdrawConfirmed,
+    /// Withdrawal failed.
+    WithdrawFailed,
+    /// Forced inclusion ticket created.
+    ForcedTicketCreated,
+    /// Forced inclusion ticket included.
+    ForcedTicketIncluded,
+    /// Forced inclusion ticket expired.
+    ForcedTicketExpired,
+}
+
+/// Audit log entry.
+///
+/// Note: We intentionally do NOT use `skip_serializing_if` for Option fields
+/// because bincode (used by canonical_encode) requires all fields to be present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Entry ID (timestamp-based).
+    pub id: String,
+    /// Timestamp (ms since epoch).
+    pub timestamp_ms: u64,
+    /// Event type.
+    pub event_type: AuditEventType,
+    /// Related entity ID (deposit_id, withdraw_id, tx_hash, etc.).
+    pub entity_id: String,
+    /// Related account (if applicable).
+    pub account: Option<String>,
+    /// Additional context as JSON.
+    pub context: Option<String>,
+}
+
+impl AuditEntry {
+    /// Create a new audit entry.
+    pub fn new(
+        event_type: AuditEventType,
+        entity_id: String,
+        account: Option<String>,
+        context: Option<String>,
+    ) -> Self {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let timestamp_ms = u64::try_from(timestamp_ms).unwrap_or(u64::MAX);
+        // ID is timestamp + random suffix for uniqueness
+        let id = format!("{timestamp_ms}:{:08x}", rand_u32());
+        Self {
+            id,
+            timestamp_ms,
+            event_type,
+            entity_id,
+            account,
+            context,
+        }
+    }
+}
+
+/// Simple deterministic pseudo-random based on system time.
+fn rand_u32() -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    nanos.wrapping_mul(1103515245).wrapping_add(12345)
+}
+
 pub struct Storage {
     #[allow(dead_code)]
     db: sled::Db,
@@ -153,6 +254,14 @@ pub struct Storage {
     receipts: Tree,
     meta: Tree,
     posting_state: Tree,
+    /// Forced inclusion queue (tx_hash -> InclusionTicket).
+    forced_queue: Tree,
+    /// Bridge deposits (deposit_id -> DepositEvent).
+    bridge_deposits: Tree,
+    /// Bridge withdrawals (withdraw_id -> WithdrawRequest).
+    bridge_withdrawals: Tree,
+    /// Audit log (timestamp_id -> AuditEntry).
+    audit_log: Tree,
 }
 
 impl Storage {
@@ -163,6 +272,10 @@ impl Storage {
         let receipts = db.open_tree("receipts")?;
         let meta = db.open_tree("meta")?;
         let posting_state = db.open_tree("posting_state")?;
+        let forced_queue = db.open_tree("forced_queue")?;
+        let bridge_deposits = db.open_tree("bridge_deposits")?;
+        let bridge_withdrawals = db.open_tree("bridge_withdrawals")?;
+        let audit_log = db.open_tree("audit_log")?;
         let storage = Self {
             db,
             tx_pool,
@@ -170,6 +283,10 @@ impl Storage {
             receipts,
             meta,
             posting_state,
+            forced_queue,
+            bridge_deposits,
+            bridge_withdrawals,
+            audit_log,
         };
         storage.init_schema()?;
         Ok(storage)
@@ -319,6 +436,224 @@ impl Storage {
             }
         }
         Ok(counts)
+    }
+
+    // ========== Forced Queue APIs ==========
+
+    /// Store a forced inclusion ticket.
+    pub fn put_forced_ticket(&self, ticket: &InclusionTicket) -> Result<(), StorageError> {
+        let bytes = canonical_encode(ticket)?;
+        self.forced_queue.insert(ticket.tx_hash.0, bytes)?;
+        Ok(())
+    }
+
+    /// Get a forced inclusion ticket by tx hash.
+    pub fn get_forced_ticket(
+        &self,
+        tx_hash: &Hash32,
+    ) -> Result<Option<InclusionTicket>, StorageError> {
+        self.forced_queue
+            .get(tx_hash.0)
+            .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Update a forced inclusion ticket.
+    pub fn update_forced_ticket(&self, ticket: &InclusionTicket) -> Result<(), StorageError> {
+        self.put_forced_ticket(ticket)
+    }
+
+    /// Delete a forced inclusion ticket.
+    pub fn delete_forced_ticket(&self, tx_hash: &Hash32) -> Result<bool, StorageError> {
+        let existed = self.forced_queue.remove(tx_hash.0)?.is_some();
+        Ok(existed)
+    }
+
+    /// List all queued forced tickets (status == Queued).
+    ///
+    /// Returns up to `limit` entries.
+    pub fn list_queued_forced(&self, limit: usize) -> Result<Vec<InclusionTicket>, StorageError> {
+        let mut tickets = Vec::new();
+        for result in self.forced_queue.iter() {
+            if tickets.len() >= limit {
+                break;
+            }
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.status == ForcedInclusionStatus::Queued {
+                tickets.push(ticket);
+            }
+        }
+        Ok(tickets)
+    }
+
+    /// List forced tickets that must be included by a given epoch.
+    ///
+    /// Returns tickets where `created_epoch + max_epochs <= epoch`.
+    pub fn list_due_forced(
+        &self,
+        current_epoch: u64,
+        limit: usize,
+    ) -> Result<Vec<InclusionTicket>, StorageError> {
+        let mut tickets = Vec::new();
+        for result in self.forced_queue.iter() {
+            if tickets.len() >= limit {
+                break;
+            }
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.status == ForcedInclusionStatus::Queued
+                && ticket.must_include_by_epoch() <= current_epoch
+            {
+                tickets.push(ticket);
+            }
+        }
+        Ok(tickets)
+    }
+
+    /// Count forced tickets by status.
+    pub fn count_forced_queue(&self) -> Result<ForcedQueueCounts, StorageError> {
+        let mut counts = ForcedQueueCounts::default();
+        for result in self.forced_queue.iter() {
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            match ticket.status {
+                ForcedInclusionStatus::Queued => counts.queued += 1,
+                ForcedInclusionStatus::Included => counts.included += 1,
+                ForcedInclusionStatus::Rejected => counts.rejected += 1,
+                ForcedInclusionStatus::Expired => counts.expired += 1,
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Check if an account has exceeded forced tx limit for an epoch.
+    pub fn count_forced_for_account_epoch(
+        &self,
+        account: &str,
+        epoch: u64,
+    ) -> Result<u64, StorageError> {
+        let mut count = 0u64;
+        for result in self.forced_queue.iter() {
+            let (_key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.requester == account && ticket.created_epoch == epoch {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    // ========== Bridge Deposit APIs ==========
+
+    /// Store a deposit event.
+    pub fn put_deposit(&self, deposit_id: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.bridge_deposits.insert(deposit_id.as_bytes(), data)?;
+        Ok(())
+    }
+
+    /// Get a deposit event by ID.
+    pub fn get_deposit(&self, deposit_id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .bridge_deposits
+            .get(deposit_id.as_bytes())?
+            .map(|ivec| ivec.to_vec()))
+    }
+
+    /// Check if a deposit exists.
+    pub fn deposit_exists(&self, deposit_id: &str) -> Result<bool, StorageError> {
+        Ok(self.bridge_deposits.contains_key(deposit_id.as_bytes())?)
+    }
+
+    /// Count deposits.
+    pub fn count_deposits(&self) -> Result<u64, StorageError> {
+        let count = self.bridge_deposits.len();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    // ========== Bridge Withdrawal APIs ==========
+
+    /// Store a withdrawal request.
+    pub fn put_withdrawal(&self, withdraw_id: &str, data: &[u8]) -> Result<(), StorageError> {
+        self.bridge_withdrawals
+            .insert(withdraw_id.as_bytes(), data)?;
+        Ok(())
+    }
+
+    /// Get a withdrawal request by ID.
+    pub fn get_withdrawal(&self, withdraw_id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .bridge_withdrawals
+            .get(withdraw_id.as_bytes())?
+            .map(|ivec| ivec.to_vec()))
+    }
+
+    /// Check if a withdrawal exists.
+    pub fn withdrawal_exists(&self, withdraw_id: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .bridge_withdrawals
+            .contains_key(withdraw_id.as_bytes())?)
+    }
+
+    /// Count withdrawals.
+    pub fn count_withdrawals(&self) -> Result<u64, StorageError> {
+        let count = self.bridge_withdrawals.len();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    /// List withdrawal IDs (up to limit).
+    pub fn list_withdrawal_ids(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let mut ids = Vec::new();
+        for result in self.bridge_withdrawals.iter() {
+            if ids.len() >= limit {
+                break;
+            }
+            let (key, _value) = result?;
+            if let Ok(id) = String::from_utf8(key.to_vec()) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    // ========== Audit Log APIs ==========
+
+    /// Append an audit log entry.
+    pub fn append_audit(&self, entry: &AuditEntry) -> Result<(), StorageError> {
+        let bytes = canonical_encode(entry)?;
+        self.audit_log.insert(entry.id.as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// Get an audit entry by ID.
+    pub fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, StorageError> {
+        self.audit_log
+            .get(id.as_bytes())
+            .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// List recent audit entries (up to limit, newest first).
+    pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>, StorageError> {
+        let mut entries = Vec::new();
+        for result in self.audit_log.iter() {
+            let (_key, value) = result?;
+            let entry: AuditEntry = canonical_decode(&value)?;
+            entries.push(entry);
+        }
+        // Sort by timestamp descending (newest first)
+        entries.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+        // Truncate to limit
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    /// Count audit log entries.
+    pub fn count_audit(&self) -> Result<u64, StorageError> {
+        let count = self.audit_log.len();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
     fn init_schema(&self) -> Result<(), StorageError> {
@@ -573,5 +908,115 @@ mod tests {
         } else {
             panic!("expected Failed state");
         }
+    }
+
+    #[test]
+    fn bridge_deposits_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let deposit_id = "l1tx_abc123:0";
+        let data = b"deposit data".to_vec();
+
+        // Initially doesn't exist
+        assert!(!storage.deposit_exists(deposit_id).unwrap());
+        assert!(storage.get_deposit(deposit_id).unwrap().is_none());
+
+        // Store and retrieve
+        storage.put_deposit(deposit_id, &data).unwrap();
+        assert!(storage.deposit_exists(deposit_id).unwrap());
+        assert_eq!(storage.get_deposit(deposit_id).unwrap(), Some(data));
+        assert_eq!(storage.count_deposits().unwrap(), 1);
+    }
+
+    #[test]
+    fn bridge_withdrawals_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let withdraw_id = "wd_123";
+        let data = b"withdrawal data".to_vec();
+
+        // Initially doesn't exist
+        assert!(!storage.withdrawal_exists(withdraw_id).unwrap());
+        assert!(storage.get_withdrawal(withdraw_id).unwrap().is_none());
+
+        // Store and retrieve
+        storage.put_withdrawal(withdraw_id, &data).unwrap();
+        assert!(storage.withdrawal_exists(withdraw_id).unwrap());
+        assert_eq!(storage.get_withdrawal(withdraw_id).unwrap(), Some(data));
+        assert_eq!(storage.count_withdrawals().unwrap(), 1);
+    }
+
+    #[test]
+    fn list_withdrawal_ids() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Add some withdrawals
+        for i in 0u8..5 {
+            storage.put_withdrawal(&format!("wd_{i}"), &[i]).unwrap();
+        }
+
+        let ids = storage.list_withdrawal_ids(10).unwrap();
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn audit_log_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let entry = AuditEntry::new(
+            AuditEventType::DepositCreated,
+            "deposit_123".to_string(),
+            Some("alice".to_string()),
+            Some(r#"{"amount":1000}"#.to_string()),
+        );
+
+        storage.append_audit(&entry).unwrap();
+
+        let loaded = storage.get_audit(&entry.id).unwrap().unwrap();
+        assert_eq!(loaded.entity_id, "deposit_123");
+        assert_eq!(loaded.account, Some("alice".to_string()));
+        assert_eq!(loaded.event_type, AuditEventType::DepositCreated);
+
+        assert_eq!(storage.count_audit().unwrap(), 1);
+    }
+
+    #[test]
+    fn audit_log_multiple_entries() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Add multiple entries with varying Option values
+        let entry1 = AuditEntry::new(
+            AuditEventType::DepositCreated,
+            "deposit_1".to_string(),
+            Some("alice".to_string()),
+            None,
+        );
+        let entry2 = AuditEntry::new(
+            AuditEventType::WithdrawCreated,
+            "withdraw_1".to_string(),
+            Some("bob".to_string()),
+            None,
+        );
+        let entry3 = AuditEntry::new(
+            AuditEventType::ForcedTicketCreated,
+            "ticket_1".to_string(),
+            None,
+            None,
+        );
+
+        storage.append_audit(&entry1).unwrap();
+        storage.append_audit(&entry2).unwrap();
+        storage.append_audit(&entry3).unwrap();
+
+        assert_eq!(storage.count_audit().unwrap(), 3);
+
+        // Test list_audit returns all entries
+        let entries = storage.list_audit(10).unwrap();
+        assert_eq!(entries.len(), 3);
     }
 }

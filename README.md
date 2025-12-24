@@ -100,16 +100,67 @@ See [docs/DEV.md](docs/DEV.md) for detailed development instructions.
 
 See [docs/ops/devnet-runbook.md](docs/ops/devnet-runbook.md) for full configuration reference.
 
+### Leader Rotation (Multi-Node)
+
+For a rotating leader setup with censorship resistance:
+
+```bash
+# Common config for all nodes
+export L2_LEADER_MODE=rotating
+export L2_LEADER_SET="aabbccdd...,11223344...,55667788..."  # ed25519 pubkeys
+export L2_EPOCH_MS=10000                                    # 10 second epochs
+export L2_GENESIS_MS=1735000000000                          # Fixed genesis
+
+# Per-node config
+export L2_NODE_PUBKEY="aabbccdd..."   # This node's pubkey
+export L2_NODE_KEY_PATH="./node.key"  # Signing key path
+```
+
+See [Leader Rotation Runbook](docs/ops/leader-rotation.md) for multi-node setup instructions.
+
+### Forced Inclusion (Anti-Censorship)
+
+Users can force transaction inclusion if a leader is censoring:
+
+```bash
+# Submit forced inclusion request
+curl -X POST http://localhost:3000/tx/force \
+  -H "Content-Type: application/json" \
+  -d '{"chain_id":1,"from":"alice","nonce":1,"payload":"deadbeef"}'
+
+# Check status
+curl http://localhost:3000/tx/force/<TX_HASH>
+```
+
+See [Forced Inclusion Runbook](docs/ops/forced-inclusion.md) for details.
+
+### Bridge (Deposits & Withdrawals)
+
+```bash
+# Claim a deposit from L1
+curl -X POST http://localhost:3000/bridge/deposit/claim \
+  -H "Content-Type: application/json" \
+  -d '{"l1_tx_hash":"abc123..."}'
+
+# Request a withdrawal to L1
+curl -X POST http://localhost:3000/bridge/withdraw \
+  -H "Content-Type: application/json" \
+  -d '{"from":"alice_l2","to_l1":"alice_l1","asset":"IPN","amount":1000000,"nonce":1}'
+```
+
+See [Bridge Runbook](docs/ops/bridge.md) for details.
+
 ## Project Structure
 
 ```
 IPPAN-L2/
 ├── crates/
-│   ├── l2-core/       # Core types and primitives (canonical encoding + hashing)
-│   ├── l2-storage/    # Sled-backed persistence for tx/batches/receipts
-│   ├── l2-batcher/    # Deterministic batching loop + poster trait
-│   ├── l2-bridge/     # Bridge watcher skeleton
-│   └── l2-node/       # Axum HTTP node exposing health/status/metrics
+│   ├── l2-core/       # Core types, canonical encoding, forced inclusion
+│   ├── l2-storage/    # Sled-backed persistence for tx/batches/receipts/bridge
+│   ├── l2-batcher/    # Deterministic batching loop + poster + forced queue
+│   ├── l2-bridge/     # L1↔L2 bridge: deposits and withdrawals
+│   ├── l2-leader/     # Deterministic leader rotation and election
+│   └── l2-node/       # Axum HTTP node with full L2 API
 ├── l2-core/           # Legacy path kept for backward compatibility
 ├── hub-fin/           # Finance Hub implementation
 ├── hub-data/          # Data Hub implementation
@@ -141,6 +192,9 @@ IPPAN-L2/
 - [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) - Threat model and mitigations
 - [LEADER.md](docs/LEADER.md) - Sequencer/leader model and rotation notes
 - [DevNet Runbook](docs/ops/devnet-runbook.md) - Operations guide for DevNet deployment
+- [Leader Rotation Runbook](docs/ops/leader-rotation.md) - Multi-node leader rotation setup
+- [Forced Inclusion Runbook](docs/ops/forced-inclusion.md) - Anti-censorship mechanism
+- [Bridge Runbook](docs/ops/bridge.md) - L1↔L2 deposit and withdrawal operations
 
 ## Status
 
@@ -152,6 +206,9 @@ Production integration phase:
 - ✅ IPPAN RPC client (timeouts, retries, tx posting)
 - ✅ L2 Node with tx ingress + 429 backpressure
 - ✅ Single-leader sequencer mode
+- ✅ **Multi-leader rotation** (deterministic epoch-based leader election)
+- ✅ **Forced inclusion** (anti-censorship transaction submission)
+- ✅ **Bridge deposits/withdrawals** (L1↔L2 asset transfers)
 - ✅ Batch posting to IPPAN DevNet
 - ✅ Reconciler for L1 confirmation tracking
 - ✅ Persistent posting state (Pending → Posted → Confirmed)
