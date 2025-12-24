@@ -9,6 +9,7 @@ members = [
   "crates/l2-storage",
   "crates/l2-batcher",
   "crates/l2-bridge",
+  "crates/l2-leader",
   "crates/ippan-rpc",
 ]
 resolver = "2"

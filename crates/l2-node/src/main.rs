@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -28,12 +28,14 @@ use l2_bridge::{
     spawn as spawn_bridge, BridgeConfig, BridgeHandle, BridgeSnapshot, LoggingWatcher,
 };
 use l2_core::{canonical_hash, ChainId, Hash32, Tx};
+use l2_leader::{LeaderConfig, LeaderSet, LeaderState, PubKey};
 use l2_storage::{PostingStateCounts, Storage};
 use prometheus::{Encoder, IntCounter, IntGauge, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // ============== Configuration ==============
@@ -51,8 +53,10 @@ pub struct Settings {
     pub batcher_enabled: bool,
     #[arg(long, env = "BRIDGE_ENABLED", default_value_t = true)]
     pub bridge_enabled: bool,
+    /// Leader mode: "single" (legacy) or "rotating"
     #[arg(long, env = "L2_LEADER_MODE", default_value = "single")]
     pub leader_mode: String,
+    /// For "single" mode: whether this node is the leader
     #[arg(long, env = "L2_LEADER", default_value_t = true)]
     pub is_leader: bool,
     #[arg(long, env = "LEADER_ID", default_value = "sequencer-0")]
@@ -67,6 +71,65 @@ pub struct Settings {
     pub chain_id: u64,
     #[arg(long, env = "L2_MAX_TX_SIZE", default_value_t = 65536)]
     pub max_tx_size: usize,
+    // Leader rotation config (used when leader_mode = "rotating")
+    /// Comma-separated hex-encoded ed25519 pubkeys for leader set
+    #[arg(long, env = "L2_LEADER_SET", default_value = "")]
+    pub leader_set: String,
+    /// Epoch duration in milliseconds
+    #[arg(long, env = "L2_EPOCH_MS", default_value_t = 10_000)]
+    pub epoch_ms: u64,
+    /// Genesis timestamp in milliseconds (all nodes must agree)
+    #[arg(long, env = "L2_GENESIS_MS", default_value_t = 0)]
+    pub genesis_ms: u64,
+    /// This node's public key (hex)
+    #[arg(long, env = "L2_NODE_PUBKEY", default_value = "")]
+    pub node_pubkey: String,
+    // Forwarding config
+    /// Forward txs to leader when not leader (0 or 1)
+    #[arg(long, env = "L2_FORWARD_TO_LEADER", default_value_t = false)]
+    pub forward_to_leader: bool,
+    /// Fallback behavior when forwarding fails: "accept" or "reject"
+    #[arg(long, env = "L2_FORWARD_FALLBACK", default_value = "accept")]
+    pub forward_fallback: String,
+    /// Leader endpoints mapping: "pubkey1=http://host1:port,pubkey2=http://host2:port"
+    #[arg(long, env = "L2_LEADER_ENDPOINTS", default_value = "")]
+    pub leader_endpoints: String,
+}
+
+impl Settings {
+    /// Parse leader config from settings.
+    fn to_leader_config(&self) -> Result<LeaderConfig, NodeError> {
+        let leader_set = LeaderSet::from_csv(&self.leader_set)
+            .map_err(|e| NodeError::Config(format!("invalid leader set: {e}")))?;
+
+        let node_pubkey = if self.node_pubkey.is_empty() {
+            PubKey::new([0u8; 32])
+        } else {
+            PubKey::from_hex(&self.node_pubkey)
+                .map_err(|e| NodeError::Config(format!("invalid node pubkey: {e}")))?
+        };
+
+        Ok(LeaderConfig {
+            leader_set,
+            epoch_ms: self.epoch_ms,
+            genesis_ms: self.genesis_ms,
+            node_pubkey,
+        })
+    }
+
+    /// Parse leader endpoints mapping.
+    fn parse_leader_endpoints(&self) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        if self.leader_endpoints.is_empty() {
+            return map;
+        }
+        for pair in self.leader_endpoints.split(',') {
+            if let Some((pubkey, url)) = pair.split_once('=') {
+                map.insert(pubkey.trim().to_string(), url.trim().to_string());
+            }
+        }
+        map
+    }
 }
 
 #[derive(Debug, Error)]
@@ -79,6 +142,8 @@ enum NodeError {
     Server(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("config error: {0}")]
+    Config(String),
 }
 
 // ============== Metrics ==============
@@ -91,10 +156,13 @@ struct Metrics {
     queue_capacity: IntGauge,
     tx_submitted: IntCounter,
     tx_rejected: IntCounter,
+    tx_forwarded: IntCounter,
     batches_pending: IntGauge,
     batches_posted: IntGauge,
     batches_confirmed: IntGauge,
     batches_failed: IntGauge,
+    leader_is_leader: IntGauge,
+    leader_epoch_idx: IntGauge,
 }
 
 impl Metrics {
@@ -131,6 +199,12 @@ impl Metrics {
         ))
         .expect("tx rejected counter");
 
+        let tx_forwarded = IntCounter::with_opts(Opts::new(
+            "l2_tx_forwarded_total",
+            "Total transactions forwarded to leader",
+        ))
+        .expect("tx forwarded counter");
+
         let batches_pending = IntGauge::with_opts(Opts::new(
             "l2_batches_pending",
             "Number of batches pending posting",
@@ -155,6 +229,18 @@ impl Metrics {
         ))
         .expect("batches failed gauge");
 
+        let leader_is_leader = IntGauge::with_opts(Opts::new(
+            "l2_leader_is_leader",
+            "1 if this node is currently the leader, 0 otherwise",
+        ))
+        .expect("leader is_leader gauge");
+
+        let leader_epoch_idx = IntGauge::with_opts(Opts::new(
+            "l2_epoch_idx",
+            "Current epoch index",
+        ))
+        .expect("epoch idx gauge");
+
         // Register all metrics
         for metric in [
             Box::new(uptime_ms.clone()) as Box<dyn prometheus::core::Collector>,
@@ -162,10 +248,13 @@ impl Metrics {
             Box::new(queue_capacity.clone()),
             Box::new(tx_submitted.clone()),
             Box::new(tx_rejected.clone()),
+            Box::new(tx_forwarded.clone()),
             Box::new(batches_pending.clone()),
             Box::new(batches_posted.clone()),
             Box::new(batches_confirmed.clone()),
             Box::new(batches_failed.clone()),
+            Box::new(leader_is_leader.clone()),
+            Box::new(leader_epoch_idx.clone()),
         ] {
             registry.register(metric).expect("register metric");
         }
@@ -177,10 +266,13 @@ impl Metrics {
             queue_capacity,
             tx_submitted,
             tx_rejected,
+            tx_forwarded,
             batches_pending,
             batches_posted,
             batches_confirmed,
             batches_failed,
+            leader_is_leader,
+            leader_epoch_idx,
         }
     }
 
@@ -193,6 +285,12 @@ impl Metrics {
             .set(i64::try_from(counts.confirmed).unwrap_or(i64::MAX));
         self.batches_failed
             .set(i64::try_from(counts.failed).unwrap_or(i64::MAX));
+    }
+
+    fn update_leader_state(&self, state: &LeaderState) {
+        self.leader_is_leader.set(if state.is_leader { 1 } else { 0 });
+        self.leader_epoch_idx
+            .set(i64::try_from(state.epoch_idx).unwrap_or(i64::MAX));
     }
 }
 
@@ -209,6 +307,11 @@ struct AppState {
     reconciler: Option<ReconcilerHandle>,
     metrics: Metrics,
     queue_depth: Arc<AtomicUsize>,
+    // Leader rotation state
+    leader_config: Option<LeaderConfig>,
+    leader_state: Arc<RwLock<LeaderState>>,
+    leader_endpoints: std::collections::HashMap<String, String>,
+    http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -230,11 +333,47 @@ impl AppState {
     fn dequeue(&self) {
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
+
+    /// Check if this node is currently the leader.
+    async fn is_current_leader(&self) -> bool {
+        match &self.settings.leader_mode.as_str() {
+            &"rotating" => {
+                let state = self.leader_state.read().await;
+                state.is_leader
+            }
+            _ => self.settings.is_leader, // "single" mode
+        }
+    }
+
+    /// Get current leader state snapshot.
+    async fn get_leader_state(&self) -> LeaderState {
+        self.leader_state.read().await.clone()
+    }
+
+    /// Update leader state to current time.
+    async fn update_leader_state(&self) {
+        if let Some(config) = &self.leader_config {
+            let now_ms = now_ms();
+            let mut state = self.leader_state.write().await;
+            state.update(config, now_ms);
+        }
+    }
+
+    /// Get the URL for the current leader (for forwarding).
+    async fn get_leader_url(&self) -> Option<String> {
+        let state = self.leader_state.read().await;
+        if let Some(leader_pk) = &state.elected_leader {
+            let pk_hex = leader_pk.to_hex();
+            self.leader_endpoints.get(&pk_hex).cloned()
+        } else {
+            None
+        }
+    }
 }
 
 // ============== Request/Response Types ==============
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SubmitTxRequest {
     /// Chain ID (must match node configuration).
     chain_id: u64,
@@ -246,12 +385,14 @@ struct SubmitTxRequest {
     payload: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SubmitTxResponse {
     tx_hash: String,
     accepted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    forwarded: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -295,8 +436,21 @@ struct ServiceInfo {
 struct LeaderInfo {
     mode: String,
     is_leader: bool,
-    leader_pubkey: String,
-    term_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elected_leader_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch_idx: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch_start_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch_end_ms: Option<u64>,
+    // Legacy fields for single mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leader_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    term_id: Option<u64>,
     last_heartbeat_ms: u64,
 }
 
@@ -356,6 +510,50 @@ async fn run() -> Result<(), NodeError> {
         .queue_capacity
         .set(i64::try_from(settings.admission_cap).unwrap_or(i64::MAX));
 
+    // Parse leader config for rotating mode
+    let leader_config = if settings.leader_mode == "rotating" {
+        let config = settings.to_leader_config()?;
+        info!(
+            leader_count = config.leader_set.len(),
+            epoch_ms = config.epoch_ms,
+            genesis_ms = config.genesis_ms,
+            node_pubkey = %config.node_pubkey,
+            "rotating leader mode enabled"
+        );
+        Some(config)
+    } else {
+        None
+    };
+
+    // Initialize leader state
+    let initial_state = if let Some(config) = &leader_config {
+        LeaderState::from_config(config, now_ms())
+    } else {
+        LeaderState {
+            epoch_idx: 0,
+            elected_leader: None,
+            is_leader: settings.is_leader,
+            epoch_start_ms: 0,
+            epoch_end_ms: u64::MAX,
+        }
+    };
+    let leader_state = Arc::new(RwLock::new(initial_state));
+
+    // Parse leader endpoints for forwarding
+    let leader_endpoints = settings.parse_leader_endpoints();
+    if !leader_endpoints.is_empty() {
+        info!(
+            endpoints = ?leader_endpoints.keys().collect::<Vec<_>>(),
+            "leader endpoints configured for forwarding"
+        );
+    }
+
+    // HTTP client for forwarding
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| NodeError::Config(format!("failed to build http client: {e}")))?;
+
     let mut batcher_handle = None;
     let mut bridge_handle = None;
     let mut reconciler_handle = None;
@@ -372,7 +570,11 @@ async fn run() -> Result<(), NodeError> {
         None
     };
 
-    if settings.batcher_enabled && settings.is_leader {
+    // Determine if we should start batcher (leader-only in single mode, always in rotating mode)
+    let should_start_batcher = settings.batcher_enabled
+        && (settings.leader_mode == "rotating" || settings.is_leader);
+
+    if should_start_batcher {
         let config = BatcherConfig {
             max_batch_txs: 256,
             max_batch_bytes: 512 * 1024,
@@ -404,7 +606,7 @@ async fn run() -> Result<(), NodeError> {
         let handle = spawn_batcher(config, Arc::clone(&storage), poster);
         batcher_handle = Some(handle);
 
-        // Spawn reconciler (leader-only)
+        // Spawn reconciler (leader-only in production)
         let reconciler_config = ReconcilerConfig::from_env();
         info!(
             interval_ms = reconciler_config.interval_ms,
@@ -431,9 +633,27 @@ async fn run() -> Result<(), NodeError> {
         batcher: batcher_handle,
         bridge: bridge_handle,
         reconciler: reconciler_handle,
-        metrics,
+        metrics: metrics.clone(),
         queue_depth,
+        leader_config,
+        leader_state: Arc::clone(&leader_state),
+        leader_endpoints,
+        http_client,
     };
+
+    // Spawn background task for leader state updates (rotating mode)
+    if settings.leader_mode == "rotating" {
+        let update_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                update_state.update_leader_state().await;
+                let ls = update_state.get_leader_state().await;
+                update_state.metrics.update_leader_state(&ls);
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -514,19 +734,43 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
     // Get posting state counts
     let posting_counts = state.storage.count_posting_states().unwrap_or_default();
 
+    // Build leader info based on mode
+    let leader_info = if state.settings.leader_mode == "rotating" {
+        let leader_state = state.get_leader_state().await;
+        LeaderInfo {
+            mode: "rotating".to_string(),
+            is_leader: leader_state.is_leader,
+            elected_leader_pubkey: leader_state.elected_leader.map(|pk| pk.to_hex()),
+            epoch_ms: state.leader_config.as_ref().map(|c| c.epoch_ms),
+            epoch_idx: Some(leader_state.epoch_idx),
+            epoch_start_ms: Some(leader_state.epoch_start_ms),
+            epoch_end_ms: Some(leader_state.epoch_end_ms),
+            leader_pubkey: None,
+            term_id: None,
+            last_heartbeat_ms: uptime_ms,
+        }
+    } else {
+        LeaderInfo {
+            mode: state.settings.leader_mode.clone(),
+            is_leader: state.settings.is_leader,
+            elected_leader_pubkey: None,
+            epoch_ms: None,
+            epoch_idx: None,
+            epoch_start_ms: None,
+            epoch_end_ms: None,
+            leader_pubkey: Some(state.settings.leader_id.clone()),
+            term_id: Some(state.settings.leader_term),
+            last_heartbeat_ms: uptime_ms,
+        }
+    };
+
     let response = StatusResponse {
         service: ServiceInfo {
             name: "ippan-l2-node",
             version: env!("CARGO_PKG_VERSION"),
         },
         uptime_ms,
-        leader: LeaderInfo {
-            mode: state.settings.leader_mode.clone(),
-            is_leader: state.settings.is_leader,
-            leader_pubkey: state.settings.leader_id.clone(), // TODO: actual pubkey
-            term_id: state.settings.leader_term,
-            last_heartbeat_ms: uptime_ms, // For single-leader, heartbeat is now
-        },
+        leader: leader_info,
         queue: QueueInfo {
             depth: state.queue_depth(),
             capacity: state.settings.admission_cap,
@@ -569,6 +813,10 @@ async fn metrics_handler(state: axum::extract::State<AppState>) -> impl IntoResp
         state.metrics.update_posting_counts(&counts);
     }
 
+    // Update leader state metrics
+    let leader_state = state.get_leader_state().await;
+    state.metrics.update_leader_state(&leader_state);
+
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();
     let mut buffer = Vec::new();
@@ -584,14 +832,20 @@ async fn submit_tx(
     state: axum::extract::State<AppState>,
     Json(req): Json<SubmitTxRequest>,
 ) -> impl IntoResponse {
-    // Check if leader (only leader accepts writes)
-    if !state.settings.is_leader {
+    let is_leader = state.is_current_leader().await;
+
+    // If not leader, handle forwarding or rejection
+    if !is_leader {
+        if state.settings.forward_to_leader {
+            return forward_tx_to_leader(&state, &req).await;
+        }
         return (
             StatusCode::FORBIDDEN,
             Json(SubmitTxResponse {
                 tx_hash: String::new(),
                 accepted: false,
                 error: Some("not leader - reads only".to_string()),
+                forwarded: None,
             }),
         );
     }
@@ -606,6 +860,7 @@ async fn submit_tx(
                     tx_hash: String::new(),
                     accepted: false,
                     error: Some("batcher not enabled".to_string()),
+                    forwarded: None,
                 }),
             );
         }
@@ -623,6 +878,7 @@ async fn submit_tx(
                     "chain_id mismatch: expected {}, got {}",
                     state.settings.chain_id, req.chain_id
                 )),
+                forwarded: None,
             }),
         );
     }
@@ -638,6 +894,7 @@ async fn submit_tx(
                     tx_hash: String::new(),
                     accepted: false,
                     error: Some(format!("invalid payload hex: {e}")),
+                    forwarded: None,
                 }),
             );
         }
@@ -656,6 +913,7 @@ async fn submit_tx(
                     payload.len(),
                     state.settings.max_tx_size
                 )),
+                forwarded: None,
             }),
         );
     }
@@ -669,6 +927,7 @@ async fn submit_tx(
                 tx_hash: String::new(),
                 accepted: false,
                 error: Some("queue full".to_string()),
+                forwarded: None,
             }),
         );
     }
@@ -693,6 +952,7 @@ async fn submit_tx(
                     tx_hash: String::new(),
                     accepted: false,
                     error: Some(format!("hash error: {e}")),
+                    forwarded: None,
                 }),
             );
         }
@@ -708,6 +968,7 @@ async fn submit_tx(
                 tx_hash: String::new(),
                 accepted: false,
                 error: Some(format!("storage error: {e}")),
+                forwarded: None,
             }),
         );
     }
@@ -722,6 +983,7 @@ async fn submit_tx(
                 tx_hash: tx_hash.to_hex(),
                 accepted: false,
                 error: Some(format!("batcher error: {e}")),
+                forwarded: None,
             }),
         );
     }
@@ -735,6 +997,185 @@ async fn submit_tx(
             tx_hash: tx_hash.to_hex(),
             accepted: true,
             error: None,
+            forwarded: None,
+        }),
+    )
+}
+
+/// Forward a transaction to the current leader.
+async fn forward_tx_to_leader(
+    state: &AppState,
+    req: &SubmitTxRequest,
+) -> (StatusCode, Json<SubmitTxResponse>) {
+    let leader_url = match state.get_leader_url().await {
+        Some(url) => url,
+        None => {
+            debug!("no leader URL configured for forwarding");
+            // Fallback behavior
+            if state.settings.forward_fallback == "accept" {
+                // Accept locally (will be stored but not batched until we become leader)
+                return accept_tx_locally(state, req).await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTxResponse {
+                    tx_hash: String::new(),
+                    accepted: false,
+                    error: Some("no leader URL for forwarding".to_string()),
+                    forwarded: None,
+                }),
+            );
+        }
+    };
+
+    let forward_url = format!("{}/tx", leader_url.trim_end_matches('/'));
+    debug!(url = %forward_url, "forwarding tx to leader");
+
+    // Create signed forward headers (simplified for MVP - just include node pubkey)
+    let node_pubkey = state.leader_config.as_ref().map(|c| c.node_pubkey.to_hex()).unwrap_or_default();
+    let timestamp = now_ms();
+
+    let result = state
+        .http_client
+        .post(&forward_url)
+        .header("x-l2-forwarder-pubkey", &node_pubkey)
+        .header("x-l2-forwarder-ts", timestamp.to_string())
+        .json(req)
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                match resp.json::<SubmitTxResponse>().await {
+                    Ok(mut forward_resp) => {
+                        state.metrics.tx_forwarded.inc();
+                        forward_resp.forwarded = Some(true);
+                        (StatusCode::OK, Json(forward_resp))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to parse forwarded response");
+                        handle_forward_failure(state, req).await
+                    }
+                }
+            } else {
+                warn!(status = %status, "leader returned error on forward");
+                handle_forward_failure(state, req).await
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, url = %forward_url, "failed to forward tx to leader");
+            handle_forward_failure(state, req).await
+        }
+    }
+}
+
+/// Handle forwarding failure based on fallback config.
+async fn handle_forward_failure(
+    state: &AppState,
+    req: &SubmitTxRequest,
+) -> (StatusCode, Json<SubmitTxResponse>) {
+    if state.settings.forward_fallback == "accept" {
+        accept_tx_locally(state, req).await
+    } else {
+        state.metrics.tx_rejected.inc();
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SubmitTxResponse {
+                tx_hash: String::new(),
+                accepted: false,
+                error: Some("forwarding failed and fallback is reject".to_string()),
+                forwarded: Some(false),
+            }),
+        )
+    }
+}
+
+/// Accept a transaction locally (store in pool but don't batch).
+async fn accept_tx_locally(
+    state: &AppState,
+    req: &SubmitTxRequest,
+) -> (StatusCode, Json<SubmitTxResponse>) {
+    // Validate chain_id
+    if req.chain_id != state.settings.chain_id {
+        state.metrics.tx_rejected.inc();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SubmitTxResponse {
+                tx_hash: String::new(),
+                accepted: false,
+                error: Some(format!(
+                    "chain_id mismatch: expected {}, got {}",
+                    state.settings.chain_id, req.chain_id
+                )),
+                forwarded: None,
+            }),
+        );
+    }
+
+    let payload = match hex::decode(&req.payload) {
+        Ok(p) => p,
+        Err(e) => {
+            state.metrics.tx_rejected.inc();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SubmitTxResponse {
+                    tx_hash: String::new(),
+                    accepted: false,
+                    error: Some(format!("invalid payload hex: {e}")),
+                    forwarded: None,
+                }),
+            );
+        }
+    };
+
+    let tx = Tx {
+        chain_id: ChainId(req.chain_id),
+        nonce: req.nonce,
+        from: req.from.clone(),
+        payload,
+    };
+
+    let tx_hash = match canonical_hash(&tx) {
+        Ok(h) => h,
+        Err(e) => {
+            state.metrics.tx_rejected.inc();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SubmitTxResponse {
+                    tx_hash: String::new(),
+                    accepted: false,
+                    error: Some(format!("hash error: {e}")),
+                    forwarded: None,
+                }),
+            );
+        }
+    };
+
+    if let Err(e) = state.storage.put_tx(&tx) {
+        state.metrics.tx_rejected.inc();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SubmitTxResponse {
+                tx_hash: String::new(),
+                accepted: false,
+                error: Some(format!("storage error: {e}")),
+                forwarded: None,
+            }),
+        );
+    }
+
+    state.metrics.tx_submitted.inc();
+    info!(tx_hash = %tx_hash.to_hex(), "accepted tx locally (not leader)");
+
+    (
+        StatusCode::OK,
+        Json(SubmitTxResponse {
+            tx_hash: tx_hash.to_hex(),
+            accepted: true,
+            error: None,
+            forwarded: Some(false),
         }),
     )
 }
@@ -833,4 +1274,14 @@ async fn get_batch(
             })),
         ),
     }
+}
+
+// ============== Utility Functions ==============
+
+fn now_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
