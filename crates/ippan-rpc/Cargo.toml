@@ -1,0 +1,34 @@
+[package]
+name = "ippan-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Async RPC client for IPPAN CORE nodes with retries and timeouts"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["tx-payment-endpoint", "tx-generic-endpoint"]
+# Enable the /tx/payment endpoint binding.
+tx-payment-endpoint = []
+# Enable the generic /tx endpoint binding.
+tx-generic-endpoint = []
+
+[dependencies]
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "0.6"
+serde_json = "1"
