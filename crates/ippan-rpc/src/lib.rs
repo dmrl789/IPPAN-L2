@@ -310,9 +310,8 @@ impl IppanRpcClient {
         }
         serde_json::from_str(&body)
             .map_err(|e| IppanRpcError::Decode(format!("{e}")))
-            .map(|parsed| {
+            .inspect(|_parsed| {
                 debug!(operation = op, "response decoded");
-                parsed
             })
     }
 }
@@ -340,7 +339,7 @@ async fn backoff(op: &str, attempt: u32) {
 fn backoff_delay_ms(attempt: u32) -> u64 {
     // Exponential backoff capped at 2s, deterministic (no jitter).
     let exp = attempt.saturating_sub(1);
-    let base = 100u64.saturating_mul(1u64.saturating_shl(exp));
+    let base = 100u64.saturating_mul(2u64.saturating_pow(exp));
     base.min(2_000)
 }
 
@@ -399,6 +398,7 @@ mod tests {
             .and(path("/tx/payment"))
             .and(body_json(&request))
             .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
             .mount(&server)
             .await;
 
