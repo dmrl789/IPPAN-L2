@@ -76,6 +76,8 @@ If you discover a security vulnerability in IPPAN-L2, please report it responsib
    - Write tests for security-critical code
    - Include edge cases and error conditions
    - Consider fuzzing for parsing code
+4. **Design docs**
+   - Review `docs/SECURITY_MODEL.md` for the current threat model before changing consensus or batching paths.
 
 ## Security Measures
 

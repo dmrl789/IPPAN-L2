@@ -9,6 +9,45 @@
 
 ---
 
+## 0. L2 MVP Scope (2025 Q1 refresh)
+
+### Problem statement
+
+IPPAN CORE delivers deterministic settlement, but application and asset workloads need higher throughput, batching, and bridge-like UX. The MVP for IPPAN-L2 must therefore:
+
+* Batch user transactions deterministically and post them back to L1
+* Provide health/readiness/metrics endpoints for operability
+* Offer a minimal bridge/message surface so deposits/withdrawals can be tracked
+* Keep deterministic serialization and hashing so nodes cannot disagree
+
+### MVP scope (in / out)
+
+* **In:** batching skeleton, bridge/watch skeleton, REST API (`/healthz`, `/readyz`, `/status`, `/metrics`), canonical hashing, sled-backed persistence, OpenAPI contract, CI gates.
+* **Out (roadmap):** production L1 posting, proof verification, fraud/validity proofs, multi-leader rotation, GPU/TEE acceleration, on-chain enforcement of forced inclusion.
+
+### Functional requirements
+
+* Accept transactions into a mempool and cut batches deterministically based on byte/tx/time thresholds.
+* Persist txs, batches, receipts, and meta state with schema versioning.
+* Expose status showing leader mode, queue depth, batcher/bridge last activity.
+* Emit Prometheus metrics for operability.
+
+### Non-functional requirements
+
+* Deterministic serialization (no floats, canonical encoding for hashing).
+* Reproducible builds and pinned toolchains.
+
+### Interfaces
+
+* REST API for operators and SDKs (OpenAPI documented) with health/ready/status + stubs for tx/batch retrieval.
+* Internal traits for posting batches to L1 (`BatchPoster`) and watching L1 (`L1Watcher`).
+
+### Milestones
+
+1. **MVP (this repo):** runnable node with status/metrics, sled persistence, canonical hashing tests.
+2. **Beta:** real L1 posting path, bridge event ingestion, horizontal scaling playbook.
+3. **Production:** leader rotation, forced inclusion, multi-DC HA, DA integration.
+
 ## 1. Purpose of This Document
 
 This PRD defines **what IPPAN-L2 is expected to do**, **why it exists**, and **what constraints must never be violated**, from the perspective of contributors working on the codebase.

@@ -2,6 +2,22 @@
 
 This document describes the public API surface of IPPAN-L2 crates.
 
+## L2 Node HTTP surface (MVP)
+
+The `l2-node` service exposes a minimal operational API:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /healthz` | Liveness probe |
+| `GET /readyz` | Readiness probe (fails if storage cannot be opened) |
+| `GET /status` | Structured status with leader/queue/batcher/bridge fields |
+| `GET /metrics` | Prometheus metrics export |
+| `POST /tx` | Stub for transaction submission (documented for future wiring) |
+| `GET /tx/{hash}` | Stub for tx lookup |
+| `GET /batch/{hash}` | Stub for batch lookup |
+
+The full contract is defined in `openapi.yaml`; SDK generators should target that file to avoid drift.
+
 ## Stability Guarantees
 
 ### Stable APIs (v0.1.0+)

@@ -11,7 +11,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY integrations ./integrations
 COPY hub-data ./hub-data
 COPY hub-fin ./hub-fin
-COPY l2-core ./l2-core
+COPY crates/l2-core ./crates/l2-core
 
 RUN cargo build --release -p ippan_eth_oracle_daemon
 
