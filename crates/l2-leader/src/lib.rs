@@ -458,10 +458,10 @@ mod tests {
     #[test]
     fn leader_for_epoch_distribution() {
         // Test that leader selection distributes across leaders
-        let leaders: Vec<PubKey> = (0..5).map(|i| test_pubkey(i)).collect();
+        let leaders: Vec<PubKey> = (0..5).map(test_pubkey).collect();
         let set = LeaderSet::new(leaders.clone());
 
-        let mut counts = vec![0usize; 5];
+        let mut counts = [0usize; 5];
         for epoch in 0..1000 {
             if let Some(leader) = leader_for_epoch(epoch, &set) {
                 if let Some(idx) = set.index_of(leader) {

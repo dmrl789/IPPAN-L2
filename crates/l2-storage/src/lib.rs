@@ -954,10 +954,8 @@ mod tests {
         let storage = Storage::open(dir.path()).expect("open");
 
         // Add some withdrawals
-        for i in 0..5 {
-            storage
-                .put_withdrawal(&format!("wd_{i}"), &[i as u8])
-                .unwrap();
+        for i in 0u8..5 {
+            storage.put_withdrawal(&format!("wd_{i}"), &[i]).unwrap();
         }
 
         let ids = storage.list_withdrawal_ids(10).unwrap();
