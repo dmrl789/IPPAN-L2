@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use crate::audit_store::AuditStore;
 use crate::bootstrap_store::BootstrapStore;
 use crate::config::{LimitsConfig, RetentionConfig};
 use serde_json::Value;
@@ -134,6 +135,7 @@ pub fn execute_prune_with_bootstrap(
 #[derive(Debug, Clone)]
 pub struct PruningLoop {
     pub receipts_dir: PathBuf,
+    pub audit_db_dir: Option<PathBuf>,
     pub retention: RetentionConfig,
     pub limits: LimitsConfig,
     pub interval_secs: u64,
@@ -178,6 +180,29 @@ impl PruningLoop {
                     }
                     Err(e) => warn!(event = "pruning_failed", error = %e),
                 }
+
+                // Audit log retention (separate from receipts). Default is infinite.
+                if self.retention.audit_days > 0 {
+                    if let Some(db_dir) = self.audit_db_dir.as_ref() {
+                        let days = self.retention.audit_days as u64;
+                        let cutoff = now_secs.saturating_sub(days.saturating_mul(86_400));
+                        match AuditStore::open(db_dir) {
+                            Ok(store) => match store.prune_events_older_than(cutoff, 50_000) {
+                                Ok(deleted) => {
+                                    if deleted > 0 {
+                                        info!(event = "audit_pruned", deleted = deleted);
+                                        crate::metrics::PRUNING_DELETED_TOTAL
+                                            .with_label_values(&["audit_event"])
+                                            .inc_by(deleted as u64);
+                                    }
+                                }
+                                Err(e) => warn!(event = "audit_prune_failed", error = %e),
+                            },
+                            Err(e) => warn!(event = "audit_prune_failed", error = %e),
+                        }
+                    }
+                }
+
                 // Sleep in chunks for responsive shutdown.
                 let mut slept = std::time::Duration::from_secs(0);
                 while slept < interval && !stop.load(Ordering::Relaxed) {
@@ -274,6 +299,7 @@ mod tests {
         let retention = RetentionConfig {
             receipts_days: 1,
             recon_failed_days: 7,
+            audit_days: 0,
             min_receipts_keep: 2,
         };
         let limits = LimitsConfig {

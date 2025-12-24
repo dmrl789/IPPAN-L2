@@ -15,6 +15,7 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
+use crate::audit_store::{AuditStore, AuditSubjectsV1, EventRecordV1};
 use crate::bootstrap_store::BootstrapStore;
 use crate::metrics;
 use crate::policy_runtime::PolicyRuntime;
@@ -29,6 +30,7 @@ pub struct FinApi {
     recon: Option<ReconStore>,
     limits: hub_fin::validation::ValidationLimits,
     bootstrap: Option<BootstrapStore>,
+    audit: Option<AuditStore>,
 }
 
 impl FinApi {
@@ -46,6 +48,7 @@ impl FinApi {
             recon: None,
             limits: hub_fin::validation::ValidationLimits::default(),
             bootstrap: None,
+            audit: None,
         }
     }
 
@@ -92,11 +95,17 @@ impl FinApi {
             recon,
             limits,
             bootstrap: None,
+            audit: None,
         }
     }
 
     pub fn with_bootstrap(mut self, bootstrap: Option<BootstrapStore>) -> Self {
         self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_audit(mut self, audit: Option<AuditStore>) -> Self {
+        self.audit = audit;
         self
     }
 
@@ -106,6 +115,15 @@ impl FinApi {
     ) -> Result<SubmitActionResponseV1, ApiError> {
         let env = FinEnvelopeV1::new(action).map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let context_id = env.action_id.to_hex();
+
+        let env_bytes = env
+            .canonical_bytes()
+            .map_err(|e| ApiError::Internal(format!("canonical envelope failed: {e}")))?;
+        let env_hash_hex = hex::encode(blake3::hash(&env_bytes).as_bytes());
+
+        if let Some(a) = self.audit.as_ref() {
+            let _ = a.put_envelope_if_absent("fin", &context_id, &env_bytes);
+        }
 
         info!(
             event = "action_attempted",
@@ -149,6 +167,22 @@ impl FinApi {
             outcome = ?local.outcome
         );
 
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "fin".to_string(),
+            kind: "action_applied".to_string(),
+            action_id: Some(context_id.clone()),
+            purchase_id: None,
+            envelope_hash: Some(env_hash_hex.clone()),
+            receipt_ref: None,
+            submit_state: None,
+            signer_pubkey: None,
+            subjects: fin_subjects_from_action(&env.action),
+        });
+
         // 2) Wrap into L1 contract envelope (single-item batch)
         let payload: HubPayloadEnvelopeV1 = (&env).into();
         let batch_id = format!("fin-action-{}", env.action_id.to_hex());
@@ -179,10 +213,48 @@ impl FinApi {
             l1_tx_id = submit.l1_tx_id.as_ref().map(|x| x.0.as_str()).unwrap_or("")
         );
 
+        let submit_state = SubmitState::Submitted {
+            idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
+            l1_tx_id: submit.l1_tx_id.as_ref().map(|x| x.0.clone()),
+        };
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "fin".to_string(),
+            kind: "action_submitted".to_string(),
+            action_id: Some(context_id.clone()),
+            purchase_id: None,
+            envelope_hash: Some(env_hash_hex.clone()),
+            receipt_ref: None,
+            submit_state: Some(submit_state),
+            signer_pubkey: None,
+            subjects: fin_subjects_from_action(&env.action),
+        });
+
         // 4) Persist action receipt (includes L1 submission result)
         let receipt =
             FinActionReceiptV1::from_parts(&env.action_id, &local, &batch_id, &batch, &submit);
         let receipt_path = self.persist_action_receipt(&receipt)?;
+        let _ = receipt_path; // path is returned in API response; audit uses bundle-relative ref
+        let receipt_ref = format!("receipts/fin/actions/{context_id}.json");
+
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "fin".to_string(),
+            kind: "receipt_written".to_string(),
+            action_id: Some(context_id.clone()),
+            purchase_id: None,
+            envelope_hash: Some(env_hash_hex),
+            receipt_ref: Some(receipt_ref),
+            submit_state: Some(receipt.submit_state.clone()),
+            signer_pubkey: None,
+            subjects: fin_subjects_from_action(&env.action),
+        });
 
         // Also persist batch receipt (same format as CLI path) for operator parity.
         let _ = self.persist_batch_receipt(&batch, &submit);
@@ -444,6 +516,77 @@ impl FinApi {
                 policy_denied_from_str(&s, context_id)
             })
     }
+
+    pub fn audit_submit_state_update(
+        &self,
+        action_id_hex: &str,
+        kind: &str,
+        envelope_hash_hex: Option<String>,
+        submit_state: SubmitState,
+    ) {
+        let receipt_ref = format!("receipts/fin/actions/{action_id_hex}.json");
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "fin".to_string(),
+            kind: kind.to_string(),
+            action_id: Some(action_id_hex.to_string()),
+            purchase_id: None,
+            envelope_hash: envelope_hash_hex,
+            receipt_ref: Some(receipt_ref),
+            submit_state: Some(submit_state),
+            signer_pubkey: None,
+            subjects: AuditSubjectsV1::default(),
+        });
+    }
+
+    fn audit_append(&self, mut e: EventRecordV1) {
+        let Some(a) = self.audit.as_ref() else {
+            return;
+        };
+        e.schema_version = 1;
+        e.seq = 0;
+        e.occurred_at_unix_secs = unix_now_secs();
+        e.epoch = self
+            .bootstrap
+            .as_ref()
+            .and_then(|b| b.epoch().ok())
+            .unwrap_or(0);
+        e.hub = "fin".to_string();
+        e.signer_pubkey = None;
+        let _ = a.append_event(e);
+    }
+}
+
+fn fin_subjects_from_action(action: &FinActionV1) -> AuditSubjectsV1 {
+    let mut s = AuditSubjectsV1::default();
+    match action {
+        FinActionV1::CreateAssetV1(a) => {
+            s.asset_ids.push(a.asset_id.to_hex());
+            s.accounts.push(a.issuer.0.clone());
+            if let Some(actor) = a.actor.as_ref() {
+                s.accounts.push(actor.0.clone());
+            }
+        }
+        FinActionV1::MintUnitsV1(a) => {
+            s.asset_ids.push(a.asset_id.to_hex());
+            s.accounts.push(a.to_account.0.clone());
+            if let Some(actor) = a.actor.as_ref() {
+                s.accounts.push(actor.0.clone());
+            }
+        }
+        FinActionV1::TransferUnitsV1(a) => {
+            s.asset_ids.push(a.asset_id.to_hex());
+            s.accounts.push(a.from_account.0.clone());
+            s.accounts.push(a.to_account.0.clone());
+            if let Some(actor) = a.actor.as_ref() {
+                s.accounts.push(actor.0.clone());
+            }
+        }
+    }
+    s.normalize()
 }
 
 #[derive(Debug, thiserror::Error)]

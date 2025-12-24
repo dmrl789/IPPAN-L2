@@ -4,6 +4,7 @@ use crate::data_api::ApiError as DataApiError;
 use crate::fin_api::ApiError as FinApiError;
 use crate::{data_api::DataApi, fin_api::FinApi};
 use hub_fin::{AmountU128, FinActionV1, FinEnvelopeV1, TransferUnitsV1};
+use l2_core::finality::SubmitState;
 use l2_core::hub_linkage::{
     derive_purchase_id_v1, EntitlementPolicy, EntitlementRef, Hex32 as LinkHex32,
     LinkageOverallStatus, LinkageReceiptV1, LinkageStatus, PaymentRef,
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::audit_store::{AuditStore, AuditSubjectsV1, EventRecordV1};
 use crate::bootstrap_store::BootstrapStore;
 use crate::recon_store::{ReconKind, ReconMetadata, ReconStore};
 
@@ -24,6 +26,7 @@ pub struct LinkageApi {
     entitlement_policy: EntitlementPolicy,
     recon: Option<ReconStore>,
     bootstrap: Option<BootstrapStore>,
+    audit: Option<AuditStore>,
 }
 
 impl LinkageApi {
@@ -62,11 +65,17 @@ impl LinkageApi {
             entitlement_policy,
             recon,
             bootstrap: None,
+            audit: None,
         }
     }
 
     pub fn with_bootstrap(mut self, bootstrap: Option<BootstrapStore>) -> Self {
         self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_audit(mut self, audit: Option<AuditStore>) -> Self {
+        self.audit = audit;
         self
     }
 
@@ -229,6 +238,15 @@ impl LinkageApi {
 
     pub fn persist_purchase_receipt(&self, receipt: &LinkageReceiptV1) -> Result<(), ApiError> {
         self.persist_receipt(receipt)
+    }
+
+    pub fn audit_event_for_receipt(
+        &self,
+        kind: &str,
+        receipt: &LinkageReceiptV1,
+        submit_state: Option<SubmitState>,
+    ) {
+        self.audit_linkage_event(kind, receipt, submit_state);
     }
 
     /// Continue the workflow by submitting the DATA entitlement grant.
@@ -413,7 +431,48 @@ impl LinkageApi {
                 let _ = b.record_put("linkage", rel_s.as_bytes(), &bytes2);
             }
         }
+
+        self.audit_linkage_event("receipt_written", receipt, None);
+
         Ok(())
+    }
+
+    fn audit_linkage_event(
+        &self,
+        kind: &str,
+        receipt: &LinkageReceiptV1,
+        submit_state: Option<SubmitState>,
+    ) {
+        let Some(a) = self.audit.as_ref() else {
+            return;
+        };
+        let epoch = self
+            .bootstrap
+            .as_ref()
+            .and_then(|b| b.epoch().ok())
+            .unwrap_or(0);
+
+        let mut subjects = AuditSubjectsV1::default();
+        subjects.dataset_ids.push(receipt.dataset_id.to_hex());
+        subjects.asset_ids.push(receipt.currency_asset_id.to_hex());
+        subjects.accounts.push(receipt.licensee.0.clone());
+
+        let receipt_ref = format!("receipts/linkage/{}.json", receipt.purchase_id.to_hex());
+        let _ = a.append_event(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: unix_now_secs(),
+            epoch,
+            hub: "linkage".to_string(),
+            kind: kind.to_string(),
+            action_id: None,
+            purchase_id: Some(receipt.purchase_id.to_hex()),
+            envelope_hash: None,
+            receipt_ref: Some(receipt_ref),
+            submit_state,
+            signer_pubkey: None,
+            subjects: subjects.normalize(),
+        });
     }
 
     fn receipt_path(&self, purchase_id: LinkHex32) -> PathBuf {

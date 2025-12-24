@@ -37,6 +37,7 @@ fn setup(
     let fin_db = tmp.path().join("fin_db");
     let data_db = tmp.path().join("data_db");
     let recon_db = tmp.path().join("recon_db");
+    let audit_db = tmp.path().join("audit_db");
 
     let l1 = Arc::new(MockL1Client::default());
     let recon = ReconStore::open(&recon_db).expect("recon store");
@@ -44,6 +45,7 @@ fn setup(
     let fin_store = hub_fin::FinStore::open(&fin_db).expect("fin store");
     let data_store = hub_data::DataStore::open(&data_db).expect("data store");
     let pr = PolicyRuntime::default();
+    let audit = fin_node::audit_store::AuditStore::open(&audit_db).expect("audit store");
 
     let fin_api = FinApi::new_with_policy_and_recon(
         l1.clone(),
@@ -51,21 +53,24 @@ fn setup(
         receipts.clone(),
         pr.clone(),
         Some(recon.clone()),
-    );
+    )
+    .with_audit(Some(audit.clone()));
     let data_api = DataApi::new_with_policy_and_recon(
         l1.clone(),
         data_store.clone(),
         receipts.clone(),
         pr,
         Some(recon.clone()),
-    );
+    )
+    .with_audit(Some(audit.clone()));
     let linkage_api = LinkageApi::new_with_policy_and_recon(
         fin_api.clone(),
         data_api.clone(),
         receipts,
         policy,
         Some(recon.clone()),
-    );
+    )
+    .with_audit(Some(audit));
 
     (
         tmp,

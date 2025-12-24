@@ -231,6 +231,9 @@ pub struct RetentionConfig {
     pub receipts_days: u32,
     #[serde(default = "default_recon_failed_days")]
     pub recon_failed_days: u32,
+    /// Audit event log retention. `0` means infinite (do not prune audit log).
+    #[serde(default = "default_audit_days")]
+    pub audit_days: u32,
     #[serde(default = "default_min_receipts_keep")]
     pub min_receipts_keep: usize,
 }
@@ -241,6 +244,9 @@ fn default_receipts_days() -> u32 {
 fn default_recon_failed_days() -> u32 {
     7
 }
+fn default_audit_days() -> u32 {
+    0
+}
 fn default_min_receipts_keep() -> usize {
     1000
 }
@@ -250,6 +256,7 @@ impl Default for RetentionConfig {
         Self {
             receipts_days: default_receipts_days(),
             recon_failed_days: default_recon_failed_days(),
+            audit_days: default_audit_days(),
             min_receipts_keep: default_min_receipts_keep(),
         }
     }
@@ -302,6 +309,9 @@ pub struct StorageConfig {
     pub policy_db_dir: String,
     #[serde(default = "default_recon_db_dir")]
     pub recon_db_dir: String,
+    /// Sled DB for append-only audit log + canonical envelope archive.
+    #[serde(default = "default_audit_db_dir")]
+    pub audit_db_dir: String,
     /// Sled DB for bootstrap metadata + file changelog (incremental snapshots).
     #[serde(default = "default_bootstrap_db_dir")]
     pub bootstrap_db_dir: String,
@@ -327,6 +337,10 @@ fn default_recon_db_dir() -> String {
     "recon_db".to_string()
 }
 
+fn default_audit_db_dir() -> String {
+    "audit_db".to_string()
+}
+
 fn default_bootstrap_db_dir() -> String {
     "bootstrap_db".to_string()
 }
@@ -339,6 +353,7 @@ impl Default for StorageConfig {
             data_db_dir: default_data_db_dir(),
             policy_db_dir: default_policy_db_dir(),
             recon_db_dir: default_recon_db_dir(),
+            audit_db_dir: default_audit_db_dir(),
             bootstrap_db_dir: default_bootstrap_db_dir(),
         }
     }

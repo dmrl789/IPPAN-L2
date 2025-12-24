@@ -125,6 +125,12 @@ impl Reconciler {
                     self.reschedule_error(item, now_secs, &format!("persist_receipt:{e}"));
                     return;
                 }
+                self.fin.audit_submit_state_update(
+                    &action_id,
+                    "inclusion_observed",
+                    None,
+                    receipt.submit_state.clone(),
+                );
                 metrics::RECON_CHECKS_TOTAL
                     .with_label_values(&[item.kind.as_str(), "included"])
                     .inc();
@@ -142,6 +148,12 @@ impl Reconciler {
                     self.reschedule_error(item, now_secs, &format!("persist_receipt:{e}"));
                     return;
                 }
+                self.fin.audit_submit_state_update(
+                    &action_id,
+                    "finality_observed",
+                    None,
+                    receipt.submit_state.clone(),
+                );
                 metrics::RECON_CHECKS_TOTAL
                     .with_label_values(&[item.kind.as_str(), "finalized"])
                     .inc();
@@ -159,6 +171,12 @@ impl Reconciler {
                     .inc();
                 receipt.submit_state = SubmitState::Failed { error_code: code };
                 let _ = self.fin.persist_receipt_typed(&receipt);
+                self.fin.audit_submit_state_update(
+                    &action_id,
+                    "finality_failed",
+                    None,
+                    receipt.submit_state.clone(),
+                );
                 let _ = self.recon.dequeue(item.kind, &action_id);
                 warn!(event = "recon_permanent_error", kind = item.kind.as_str(), id = %action_id, error = %message);
             }
@@ -200,6 +218,12 @@ impl Reconciler {
                     self.reschedule_error(item, now_secs, &format!("persist_receipt:{e}"));
                     return;
                 }
+                self.data.audit_submit_state_update(
+                    &action_id,
+                    "inclusion_observed",
+                    None,
+                    receipt.submit_state.clone(),
+                );
                 metrics::RECON_CHECKS_TOTAL
                     .with_label_values(&[item.kind.as_str(), "included"])
                     .inc();
@@ -217,6 +241,12 @@ impl Reconciler {
                     self.reschedule_error(item, now_secs, &format!("persist_receipt:{e}"));
                     return;
                 }
+                self.data.audit_submit_state_update(
+                    &action_id,
+                    "finality_observed",
+                    None,
+                    receipt.submit_state.clone(),
+                );
                 metrics::RECON_CHECKS_TOTAL
                     .with_label_values(&[item.kind.as_str(), "finalized"])
                     .inc();
@@ -234,6 +264,12 @@ impl Reconciler {
                     .inc();
                 receipt.submit_state = SubmitState::Failed { error_code: code };
                 let _ = self.data.persist_receipt_typed(&receipt);
+                self.data.audit_submit_state_update(
+                    &action_id,
+                    "finality_failed",
+                    None,
+                    receipt.submit_state.clone(),
+                );
                 let _ = self.recon.dequeue(item.kind, &action_id);
                 warn!(event = "recon_permanent_error", kind = item.kind.as_str(), id = %action_id, error = %message);
             }
@@ -291,6 +327,11 @@ impl Reconciler {
                     };
                     receipt.last_error = None;
                     let _ = self.linkage.persist_purchase_receipt(&receipt);
+                    self.linkage.audit_event_for_receipt(
+                        "payment_inclusion_observed",
+                        &receipt,
+                        Some(receipt.payment_submit_state.clone()),
+                    );
                     metrics::RECON_CHECKS_TOTAL
                         .with_label_values(&[item.kind.as_str(), "included"])
                         .inc();
@@ -312,6 +353,11 @@ impl Reconciler {
                         self.reschedule_error(item, now_secs, &format!("persist_receipt:{e}"));
                         return;
                     }
+                    self.linkage.audit_event_for_receipt(
+                        "payment_finality_observed",
+                        &receipt,
+                        Some(receipt.payment_submit_state.clone()),
+                    );
                     metrics::RECON_CHECKS_TOTAL
                         .with_label_values(&[item.kind.as_str(), "finalized"])
                         .inc();
@@ -358,6 +404,11 @@ impl Reconciler {
                     receipt.payment_submit_state = SubmitState::Failed { error_code: code };
                     receipt.last_error = Some(sanitize_error(&message));
                     let _ = self.linkage.persist_purchase_receipt(&receipt);
+                    self.linkage.audit_event_for_receipt(
+                        "payment_finality_failed",
+                        &receipt,
+                        Some(receipt.payment_submit_state.clone()),
+                    );
                     let _ = self.recon.dequeue(item.kind, &purchase_id_hex);
                     warn!(event = "recon_permanent_error", kind = item.kind.as_str(), id = %purchase_id_hex, error = %message);
                     return;
@@ -407,6 +458,11 @@ impl Reconciler {
                     };
                     receipt.last_error = None;
                     let _ = self.linkage.persist_purchase_receipt(&receipt);
+                    self.linkage.audit_event_for_receipt(
+                        "entitlement_inclusion_observed",
+                        &receipt,
+                        Some(receipt.entitlement_submit_state.clone()),
+                    );
                     metrics::RECON_CHECKS_TOTAL
                         .with_label_values(&[item.kind.as_str(), "included"])
                         .inc();
@@ -424,6 +480,11 @@ impl Reconciler {
                     receipt.status = LinkageStatus::Entitled;
                     receipt.last_error = None;
                     let _ = self.linkage.persist_purchase_receipt(&receipt);
+                    self.linkage.audit_event_for_receipt(
+                        "entitlement_finality_observed",
+                        &receipt,
+                        Some(receipt.entitlement_submit_state.clone()),
+                    );
                     metrics::RECON_CHECKS_TOTAL
                         .with_label_values(&[item.kind.as_str(), "finalized"])
                         .inc();
@@ -448,6 +509,11 @@ impl Reconciler {
                     receipt.entitlement_submit_state = SubmitState::Failed { error_code: code };
                     receipt.last_error = Some(sanitize_error(&message));
                     let _ = self.linkage.persist_purchase_receipt(&receipt);
+                    self.linkage.audit_event_for_receipt(
+                        "entitlement_finality_failed",
+                        &receipt,
+                        Some(receipt.entitlement_submit_state.clone()),
+                    );
                     let _ = self.recon.dequeue(item.kind, &purchase_id_hex);
                     warn!(event = "recon_permanent_error", kind = item.kind.as_str(), id = %purchase_id_hex, error = %message);
                 }
@@ -468,6 +534,12 @@ impl Reconciler {
         receipt.overall_status = LinkageOverallStatus::EntitlementPendingFinality;
         receipt.status = LinkageStatus::Paid;
         receipt.last_error = None;
+
+        self.linkage.audit_event_for_receipt(
+            "entitlement_submitted",
+            receipt,
+            Some(receipt.entitlement_submit_state.clone()),
+        );
 
         Ok(())
     }

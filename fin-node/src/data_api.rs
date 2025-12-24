@@ -20,6 +20,7 @@ use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
+use crate::audit_store::{AuditStore, AuditSubjectsV1, EventRecordV1};
 use crate::bootstrap_store::BootstrapStore;
 use crate::metrics;
 use crate::policy_runtime::{ComplianceStrategy, PolicyRuntime};
@@ -34,6 +35,7 @@ pub struct DataApi {
     recon: Option<ReconStore>,
     limits: hub_data::validation::ValidationLimits,
     bootstrap: Option<BootstrapStore>,
+    audit: Option<AuditStore>,
 }
 
 impl DataApi {
@@ -51,6 +53,7 @@ impl DataApi {
             recon: None,
             limits: hub_data::validation::ValidationLimits::default(),
             bootstrap: None,
+            audit: None,
         }
     }
 
@@ -97,11 +100,17 @@ impl DataApi {
             recon,
             limits,
             bootstrap: None,
+            audit: None,
         }
     }
 
     pub fn with_bootstrap(mut self, bootstrap: Option<BootstrapStore>) -> Self {
         self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_audit(mut self, audit: Option<AuditStore>) -> Self {
+        self.audit = audit;
         self
     }
 
@@ -156,6 +165,15 @@ impl DataApi {
         let env = DataEnvelopeV1::new(action).map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let context_id = env.action_id.to_hex();
 
+        let env_bytes = env
+            .canonical_bytes()
+            .map_err(|e| ApiError::Internal(format!("canonical envelope failed: {e}")))?;
+        let env_hash_hex = hex::encode(blake3::hash(&env_bytes).as_bytes());
+
+        if let Some(a) = self.audit.as_ref() {
+            let _ = a.put_envelope_if_absent("data", &context_id, &env_bytes);
+        }
+
         info!(
             event = "action_attempted",
             hub = "data",
@@ -198,6 +216,22 @@ impl DataApi {
             outcome = ?local.outcome
         );
 
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "data".to_string(),
+            kind: "action_applied".to_string(),
+            action_id: Some(context_id.clone()),
+            purchase_id: None,
+            envelope_hash: Some(env_hash_hex.clone()),
+            receipt_ref: None,
+            submit_state: None,
+            signer_pubkey: None,
+            subjects: data_subjects_from_action(&env.action),
+        });
+
         // 2) Wrap into L1 contract envelope (single-item batch)
         let payload: HubPayloadEnvelopeV1 = (&env).into();
         let batch_id = format!("data-action-{}", env.action_id.to_hex());
@@ -228,10 +262,48 @@ impl DataApi {
             l1_tx_id = submit.l1_tx_id.as_ref().map(|x| x.0.as_str()).unwrap_or("")
         );
 
+        let submit_state = SubmitState::Submitted {
+            idempotency_key: b64url32(batch.idempotency_key.as_bytes()),
+            l1_tx_id: submit.l1_tx_id.as_ref().map(|x| x.0.clone()),
+        };
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "data".to_string(),
+            kind: "action_submitted".to_string(),
+            action_id: Some(context_id.clone()),
+            purchase_id: None,
+            envelope_hash: Some(env_hash_hex.clone()),
+            receipt_ref: None,
+            submit_state: Some(submit_state),
+            signer_pubkey: None,
+            subjects: data_subjects_from_action(&env.action),
+        });
+
         // 4) Persist action receipt
         let receipt =
             DataActionReceiptV1::from_parts(&env.action_id, &local, &batch_id, &batch, &submit);
         let receipt_path = self.persist_action_receipt(&receipt)?;
+        let _ = receipt_path;
+        let receipt_ref = format!("receipts/data/{context_id}.json");
+
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "data".to_string(),
+            kind: "receipt_written".to_string(),
+            action_id: Some(context_id.clone()),
+            purchase_id: None,
+            envelope_hash: Some(env_hash_hex),
+            receipt_ref: Some(receipt_ref),
+            submit_state: Some(receipt.submit_state.clone()),
+            signer_pubkey: None,
+            subjects: data_subjects_from_action(&env.action),
+        });
 
         // Enqueue for reconciliation (restart-safe).
         if let Some(recon) = self.recon.as_ref() {
@@ -573,6 +645,48 @@ impl DataApi {
         &self.store
     }
 
+    pub fn audit_submit_state_update(
+        &self,
+        action_id_hex: &str,
+        kind: &str,
+        envelope_hash_hex: Option<String>,
+        submit_state: SubmitState,
+    ) {
+        let receipt_ref = format!("receipts/data/{action_id_hex}.json");
+        self.audit_append(EventRecordV1 {
+            schema_version: 1,
+            seq: 0,
+            occurred_at_unix_secs: 0,
+            epoch: 0,
+            hub: "data".to_string(),
+            kind: kind.to_string(),
+            action_id: Some(action_id_hex.to_string()),
+            purchase_id: None,
+            envelope_hash: envelope_hash_hex,
+            receipt_ref: Some(receipt_ref),
+            submit_state: Some(submit_state),
+            signer_pubkey: None,
+            subjects: AuditSubjectsV1::default(),
+        });
+    }
+
+    fn audit_append(&self, mut e: EventRecordV1) {
+        let Some(a) = self.audit.as_ref() else {
+            return;
+        };
+        e.schema_version = 1;
+        e.seq = 0;
+        e.occurred_at_unix_secs = unix_now_secs();
+        e.epoch = self
+            .bootstrap
+            .as_ref()
+            .and_then(|b| b.epoch().ok())
+            .unwrap_or(0);
+        e.hub = "data".to_string();
+        e.signer_pubkey = None;
+        let _ = a.append_event(e);
+    }
+
     fn action_receipt_path(&self, action_id_hex: &str) -> PathBuf {
         self.receipts_dir
             .join("data")
@@ -608,6 +722,47 @@ impl DataApi {
 
         Ok(out)
     }
+}
+
+fn data_subjects_from_action(action: &DataActionV1) -> AuditSubjectsV1 {
+    let mut s = AuditSubjectsV1::default();
+    match action {
+        DataActionV1::RegisterDatasetV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            s.accounts.push(a.owner.0.clone());
+        }
+        DataActionV1::IssueLicenseV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            s.accounts.push(a.licensor.0.clone());
+            s.accounts.push(a.licensee.0.clone());
+        }
+        DataActionV1::AppendAttestationV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            s.accounts.push(a.attestor.0.clone());
+        }
+        DataActionV1::CreateListingV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            s.accounts.push(a.licensor.0.clone());
+        }
+        DataActionV1::GrantEntitlementV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            if let Some(actor) = a.actor.as_ref() {
+                s.accounts.push(actor.0.clone());
+            }
+            s.accounts.push(a.licensee.0.clone());
+        }
+        DataActionV1::AddLicensorV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            s.accounts.push(a.actor.0.clone());
+            s.accounts.push(a.licensor.0.clone());
+        }
+        DataActionV1::AddAttestorV1(a) => {
+            s.dataset_ids.push(a.dataset_id.to_hex());
+            s.accounts.push(a.actor.0.clone());
+            s.accounts.push(a.attestor.0.clone());
+        }
+    }
+    s.normalize()
 }
 
 #[derive(Debug, thiserror::Error)]
