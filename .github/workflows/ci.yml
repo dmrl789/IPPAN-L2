@@ -44,6 +44,35 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
+  test-features:
+    name: Test Features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""  # default features
+          - "contract-posting"
+          - "contract-posting,signed-envelopes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with features
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test -p l2-batcher -p l2-node
+          else
+            cargo test -p l2-batcher -p l2-node --features "${{ matrix.features }}"
+          fi
+      - name: Check build with features
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo build -p l2-node --release
+          else
+            cargo build -p l2-node --release --features "${{ matrix.features }}"
+          fi
+
   openapi-drift:
     name: OpenAPI Drift Check
     runs-on: ubuntu-latest
@@ -102,7 +131,7 @@ jobs:
   # Summary job that depends on all checks
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, test, openapi-drift, build, audit, deny, solidity]
+    needs: [fmt, clippy, test, test-features, openapi-drift, build, audit, deny, solidity]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -111,6 +140,7 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.test-features.result }}" != "success" ]] || \
              [[ "${{ needs.openapi-drift.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]] || \
              [[ "${{ needs.audit.result }}" != "success" ]] || \

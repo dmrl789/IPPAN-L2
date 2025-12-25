@@ -10,6 +10,13 @@ description = "Axum-based IPPAN L2 node with status/metrics endpoints"
 [lints]
 workspace = true
 
+[features]
+default = []
+## Enable contract-based batch posting with L1 envelope submission.
+contract-posting = ["l2-batcher/contract-posting"]
+## Enable signed batch envelopes.
+signed-envelopes = ["l2-core/signed-envelopes", "l2-batcher/signed-envelopes"]
+
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
