@@ -1125,10 +1125,10 @@ async fn run_loop(
                                 now_ms(),
                             ) {
                                 Ok(refund) => {
-                                    batch_total_fee_scaled = batch_total_fee_scaled
-                                        .saturating_add(final_fee);
-                                    batch_total_refunds_scaled = batch_total_refunds_scaled
-                                        .saturating_add(refund);
+                                    batch_total_fee_scaled =
+                                        batch_total_fee_scaled.saturating_add(final_fee);
+                                    batch_total_refunds_scaled =
+                                        batch_total_refunds_scaled.saturating_add(refund);
                                     debug!(
                                         tx_hash = %tx_hash.to_hex(),
                                         machine_id = %reservation.machine_id,

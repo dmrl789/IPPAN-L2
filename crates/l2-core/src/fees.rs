@@ -792,9 +792,18 @@ mod tests {
         let policy = M2mFeePolicy::default_policy();
         let schedule = policy.to_schedule(1000, 100_000_000);
 
-        assert_eq!(schedule.rate_exec_unit_scaled, policy.cost_per_exec_unit.scaled());
-        assert_eq!(schedule.rate_per_byte_scaled, policy.cost_per_data_byte.scaled());
-        assert_eq!(schedule.rate_per_write_scaled, policy.cost_per_storage_write.scaled());
+        assert_eq!(
+            schedule.rate_exec_unit_scaled,
+            policy.cost_per_exec_unit.scaled()
+        );
+        assert_eq!(
+            schedule.rate_per_byte_scaled,
+            policy.cost_per_data_byte.scaled()
+        );
+        assert_eq!(
+            schedule.rate_per_write_scaled,
+            policy.cost_per_storage_write.scaled()
+        );
         assert_eq!(schedule.base_fee_scaled, policy.base_fee.scaled());
         assert_eq!(schedule.min_fee_scaled, 1000);
         assert_eq!(schedule.max_fee_scaled, 100_000_000);

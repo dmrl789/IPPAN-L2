@@ -76,19 +76,14 @@ impl MachineAccount {
 }
 
 /// Forced inclusion class for a machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForcedClass {
     /// Standard machine - subject to normal rate limits.
+    #[default]
     Standard,
     /// Safety-critical device - can bypass normal queue limits.
     ForcedInclusion,
-}
-
-impl Default for ForcedClass {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 /// Quota window for rate limiting.
@@ -379,11 +374,11 @@ impl M2mStorage {
         Self::validate_machine_id(machine_id)?;
 
         // Get account
-        let mut account = self.get_account(machine_id)?.ok_or_else(|| {
-            M2mStorageError::MachineNotFound {
-                machine_id: machine_id.to_string(),
-            }
-        })?;
+        let mut account =
+            self.get_account(machine_id)?
+                .ok_or_else(|| M2mStorageError::MachineNotFound {
+                    machine_id: machine_id.to_string(),
+                })?;
 
         // Check available balance
         let available = account.available_balance();
@@ -416,7 +411,7 @@ impl M2mStorage {
         let reservation_data = canonical_encode(&reservation)?;
 
         self.accounts.insert(machine_id.as_bytes(), account_data)?;
-        self.reservations.insert(&tx_hash, reservation_data)?;
+        self.reservations.insert(tx_hash, reservation_data)?;
 
         debug!(
             machine_id = %machine_id,
@@ -442,11 +437,12 @@ impl M2mStorage {
         Self::validate_machine_id(machine_id)?;
 
         // Get reservation
-        let reservation_data = self.reservations.get(&tx_hash)?.ok_or_else(|| {
-            M2mStorageError::MachineNotFound {
-                machine_id: format!("reservation:{}", hex::encode(tx_hash)),
-            }
-        })?;
+        let reservation_data =
+            self.reservations
+                .get(tx_hash)?
+                .ok_or_else(|| M2mStorageError::MachineNotFound {
+                    machine_id: format!("reservation:{}", hex::encode(tx_hash)),
+                })?;
         let reservation: PendingReservation = canonical_decode(&reservation_data)?;
 
         // Verify machine ID matches
@@ -468,14 +464,16 @@ impl M2mStorage {
         }
 
         // Get account
-        let mut account = self.get_account(machine_id)?.ok_or_else(|| {
-            M2mStorageError::MachineNotFound {
-                machine_id: machine_id.to_string(),
-            }
-        })?;
+        let mut account =
+            self.get_account(machine_id)?
+                .ok_or_else(|| M2mStorageError::MachineNotFound {
+                    machine_id: machine_id.to_string(),
+                })?;
 
         // Calculate refund
-        let refund = reservation.reserved_scaled.saturating_sub(final_amount_scaled);
+        let refund = reservation
+            .reserved_scaled
+            .saturating_sub(final_amount_scaled);
 
         // Update account:
         // - Deduct final fee from balance
@@ -493,7 +491,7 @@ impl M2mStorage {
         // Persist
         let account_data = canonical_encode(&account)?;
         self.accounts.insert(machine_id.as_bytes(), account_data)?;
-        self.reservations.remove(&tx_hash)?;
+        self.reservations.remove(tx_hash)?;
 
         debug!(
             machine_id = %machine_id,
@@ -516,7 +514,7 @@ impl M2mStorage {
         Self::validate_machine_id(machine_id)?;
 
         // Get reservation
-        let reservation_data = match self.reservations.get(&tx_hash)? {
+        let reservation_data = match self.reservations.get(tx_hash)? {
             Some(data) => data,
             None => return Ok(0), // No reservation to release
         };
@@ -537,7 +535,7 @@ impl M2mStorage {
         // Persist
         let account_data = canonical_encode(&account)?;
         self.accounts.insert(machine_id.as_bytes(), account_data)?;
-        self.reservations.remove(&tx_hash)?;
+        self.reservations.remove(tx_hash)?;
 
         debug!(
             machine_id = %machine_id,
@@ -589,9 +587,9 @@ impl M2mStorage {
     ) -> Result<(), M2mStorageError> {
         Self::validate_machine_id(machine_id)?;
 
-        let mut window = self
-            .get_quota_window(machine_id)?
-            .unwrap_or_else(|| QuotaWindow::new(machine_id.to_string(), max_units, window_duration_ms));
+        let mut window = self.get_quota_window(machine_id)?.unwrap_or_else(|| {
+            QuotaWindow::new(machine_id.to_string(), max_units, window_duration_ms)
+        });
 
         // Reset window if expired
         if window.should_reset(now_ms) {
@@ -609,7 +607,9 @@ impl M2mStorage {
                     window.used_units,
                     cost_units,
                     window.max_units,
-                    window.window_start_ms.saturating_add(window.window_duration_ms)
+                    window
+                        .window_start_ms
+                        .saturating_add(window.window_duration_ms)
                 ),
             });
         }
@@ -627,11 +627,7 @@ impl M2mStorage {
     /// Check and apply forced inclusion usage.
     ///
     /// For ForcedInclusion class machines, this tracks daily usage limits.
-    pub fn apply_forced_usage(
-        &self,
-        machine_id: &str,
-        now_ms: u64,
-    ) -> Result<(), M2mStorageError> {
+    pub fn apply_forced_usage(&self, machine_id: &str, now_ms: u64) -> Result<(), M2mStorageError> {
         Self::validate_machine_id(machine_id)?;
 
         // Check machine class
@@ -706,7 +702,7 @@ impl M2mStorage {
     /// Record batch fee totals.
     pub fn record_batch_fees(&self, totals: &BatchFeeTotals) -> Result<(), M2mStorageError> {
         let data = canonical_encode(totals)?;
-        self.batch_fees.insert(&totals.batch_hash, data)?;
+        self.batch_fees.insert(totals.batch_hash, data)?;
         Ok(())
     }
 
@@ -745,8 +741,7 @@ impl M2mStorage {
             }
         }
 
-        stats.pending_reservations =
-            u64::try_from(self.reservations.len()).unwrap_or(u64::MAX);
+        stats.pending_reservations = u64::try_from(self.reservations.len()).unwrap_or(u64::MAX);
 
         Ok(stats)
     }
@@ -832,7 +827,9 @@ mod tests {
         assert!(storage.get_reservation(&tx_hash).unwrap().is_some());
 
         // Finalise with lower actual fee
-        let refund = storage.finalise_fee(machine_id, tx_hash, 30_000, 3000).unwrap();
+        let refund = storage
+            .finalise_fee(machine_id, tx_hash, 30_000, 3000)
+            .unwrap();
         assert_eq!(refund, 20_000);
 
         // Check final state
@@ -853,7 +850,10 @@ mod tests {
         // Try to reserve more than available
         let breakdown = M2mFeeBreakdown::new(100, 50, 1, FeeAmount::from_scaled(100_000));
         let result = storage.reserve_fee(machine_id, tx_hash, 100_000, breakdown, false, 2000);
-        assert!(matches!(result, Err(M2mStorageError::InsufficientBalance { .. })));
+        assert!(matches!(
+            result,
+            Err(M2mStorageError::InsufficientBalance { .. })
+        ));
     }
 
     #[test]
@@ -870,7 +870,9 @@ mod tests {
             .unwrap();
 
         // Release without finalising
-        let released = storage.release_reservation(machine_id, tx_hash, 3000).unwrap();
+        let released = storage
+            .release_reservation(machine_id, tx_hash, 3000)
+            .unwrap();
         assert_eq!(released, 50_000);
         assert_eq!(storage.reserved(machine_id).unwrap().scaled(), 0);
         assert_eq!(storage.balance(machine_id).unwrap().scaled(), 1_000_000);

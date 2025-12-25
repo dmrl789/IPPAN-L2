@@ -20,8 +20,8 @@ use axum::{Json, Router};
 use clap::Parser;
 use ippan_rpc::IppanRpcConfig;
 use l2_batcher::{
-    get_in_flight_summary, get_settlement_counts, spawn_with_m2m as spawn_batcher,
-    spawn_settlement_reconciler, BatchPoster, BatcherConfig, BatcherHandle, BatcherSnapshot,
+    get_in_flight_summary, get_settlement_counts, spawn_settlement_reconciler,
+    spawn_with_m2m as spawn_batcher, BatchPoster, BatcherConfig, BatcherHandle, BatcherSnapshot,
     IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, SettlementReconcilerConfig,
     SettlementReconcilerHandle,
 };
@@ -38,8 +38,8 @@ use l2_core::forced_inclusion::{
     InclusionTicket,
 };
 use l2_core::{canonical_hash, ChainId, Hash32, Tx};
-use l2_storage::m2m::{ForcedClass, M2mStorage};
 use l2_leader::{LeaderConfig, LeaderSet, LeaderState, PubKey};
+use l2_storage::m2m::{ForcedClass, M2mStorage};
 use l2_storage::{PostingStateCounts, Storage};
 use prometheus::{Encoder, IntCounter, IntGauge, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
@@ -997,16 +997,17 @@ async fn run() -> Result<(), NodeError> {
 
     // Initialize M2M fee schedule and storage (before batcher so it can use it)
     let fee_schedule = FeeSchedule::default();
-    let m2m_storage: Option<Arc<M2mStorage>> = match M2mStorage::open(storage.db(), fee_schedule.clone()) {
-        Ok(m2m) => {
-            info!("M2M fee storage initialized");
-            Some(Arc::new(m2m))
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to initialize M2M storage, fee features disabled");
-            None
-        }
-    };
+    let m2m_storage: Option<Arc<M2mStorage>> =
+        match M2mStorage::open(storage.db(), fee_schedule.clone()) {
+            Ok(m2m) => {
+                info!("M2M fee storage initialized");
+                Some(Arc::new(m2m))
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to initialize M2M storage, fee features disabled");
+                None
+            }
+        };
 
     // Determine if we should start batcher (leader-only in single mode, always in rotating mode)
     let should_start_batcher =
@@ -1621,7 +1622,9 @@ async fn submit_tx(
                 let fee_amount = breakdown.total_fee.scaled();
 
                 // Check if machine has forced inclusion privileges
-                let forced_class = m2m.forced_class(&machine_id).unwrap_or(ForcedClass::Standard);
+                let forced_class = m2m
+                    .forced_class(&machine_id)
+                    .unwrap_or(ForcedClass::Standard);
                 is_forced_tx = forced_class == ForcedClass::ForcedInclusion;
 
                 // Apply quota or forced usage limit based on class
@@ -1699,7 +1702,10 @@ async fn submit_tx(
                             "reserved fee for tx"
                         );
                     }
-                    Err(l2_storage::m2m::M2mStorageError::InsufficientBalance { required, available }) => {
+                    Err(l2_storage::m2m::M2mStorageError::InsufficientBalance {
+                        required,
+                        available,
+                    }) => {
                         state.dequeue();
                         state.metrics.tx_rejected.inc();
                         state.metrics.m2m_insufficient_balance_reject_total.inc();
@@ -2710,13 +2716,21 @@ async fn m2m_fee_estimate(
     Json(req): Json<FeeEstimateRequest>,
 ) -> impl IntoResponse {
     // Compute fee using the schedule
-    match compute_m2m_fee(&state.fee_schedule, req.exec_units, req.data_bytes, req.writes) {
+    match compute_m2m_fee(
+        &state.fee_schedule,
+        req.exec_units,
+        req.data_bytes,
+        req.writes,
+    ) {
         Ok(breakdown) => {
             let response = FeeEstimateResponse {
                 breakdown,
                 schedule: state.fee_schedule.summary(),
             };
-            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -2763,7 +2777,10 @@ async fn m2m_get_balance(
                 reserved_scaled: account.reserved_scaled,
                 forced_class: account.forced_class,
             };
-            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
         }
         Ok(None) => {
             // Return zero balance for unknown machines
@@ -2773,7 +2790,10 @@ async fn m2m_get_balance(
                 reserved_scaled: 0,
                 forced_class: ForcedClass::Standard,
             };
-            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap()),
+            )
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2853,9 +2873,7 @@ async fn m2m_topup(
 }
 
 /// Get fee schedule.
-async fn m2m_get_schedule(
-    state: axum::extract::State<AppState>,
-) -> impl IntoResponse {
+async fn m2m_get_schedule(state: axum::extract::State<AppState>) -> impl IntoResponse {
     let summary = state.fee_schedule.summary();
     Json(serde_json::to_value(summary).unwrap())
 }
