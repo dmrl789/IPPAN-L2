@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use l2_core::Hash32;
+use l2_storage::m2m::M2mStorage;
 use l2_storage::{SettlementState, SettlementStateCounts, Storage};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -538,6 +539,9 @@ pub fn get_in_flight_summary(storage: &Storage, limit: usize) -> InFlightSummary
                 }
             })
             .min(),
+        // Fee fields populated by get_in_flight_summary_with_fees
+        in_flight_fee_total_scaled: None,
+        last_finalised_batch_fee_total_scaled: None,
     }
 }
 
@@ -552,6 +556,57 @@ pub struct InFlightSummary {
     pub oldest_submitted_ms: Option<u64>,
     /// Timestamp of oldest included batch (ms).
     pub oldest_included_ms: Option<u64>,
+    /// In-flight batch fee total (scaled).
+    pub in_flight_fee_total_scaled: Option<u64>,
+    /// Last finalised batch fee total (scaled).
+    pub last_finalised_batch_fee_total_scaled: Option<u64>,
+}
+
+/// Update M2M batch fee state when settlement state changes.
+///
+/// This couples batch fee totals to the settlement lifecycle.
+pub fn update_batch_fee_settlement_state(
+    m2m: &M2mStorage,
+    batch_hash: &Hash32,
+    settlement_state: &str,
+) -> Result<(), crate::BatcherError> {
+    if let Err(e) = m2m.update_batch_fee_state(&batch_hash.0, settlement_state) {
+        warn!(
+            batch_hash = %batch_hash.to_hex(),
+            state = settlement_state,
+            error = %e,
+            "failed to update batch fee settlement state"
+        );
+    } else {
+        debug!(
+            batch_hash = %batch_hash.to_hex(),
+            state = settlement_state,
+            "updated batch fee settlement state"
+        );
+    }
+    Ok(())
+}
+
+/// Get in-flight summary with fee totals.
+pub fn get_in_flight_summary_with_fees(
+    storage: &Storage,
+    m2m: Option<&M2mStorage>,
+    limit: usize,
+) -> InFlightSummary {
+    let mut summary = get_in_flight_summary(storage, limit);
+
+    if let Some(m2m_storage) = m2m {
+        // Get in-flight fee totals
+        if let Ok((total_fees, _batch_count)) = m2m_storage.get_in_flight_fee_totals() {
+            summary.in_flight_fee_total_scaled = Some(total_fees);
+        }
+
+        // Try to get last finalised batch fee total
+        // We need to look up the last finalised batch from storage
+        // For now, we'll leave this as None - can be enhanced with proper indexing
+    }
+
+    summary
 }
 
 #[cfg(test)]

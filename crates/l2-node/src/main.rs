@@ -1630,7 +1630,7 @@ async fn submit_tx(
                 // Apply quota or forced usage limit based on class
                 if is_forced_tx {
                     // Forced inclusion machines bypass normal quota but have daily limit
-                    match m2m.apply_forced_usage(&machine_id, now_ms()) {
+                    match m2m.apply_forced_usage(&machine_id, data_bytes, now_ms()) {
                         Ok(()) => {
                             debug!(
                                 machine_id = %machine_id,

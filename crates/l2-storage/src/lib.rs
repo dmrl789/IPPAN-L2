@@ -13,6 +13,7 @@
 //! settlement state. All operations are crash-safe and atomic.
 
 pub mod m2m;
+pub mod m2m_ops;
 pub mod settlement;
 
 use std::path::Path;
