@@ -128,10 +128,36 @@ jobs:
       - name: Run tests
         run: forge test -vvv
 
+  settlement-lifecycle:
+    name: Settlement Lifecycle Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run settlement state machine tests
+        run: cargo test -p l2-storage settlement --all-features
+      - name: Run reconciler tests
+        run: cargo test -p l2-batcher reconciler --all-features
+      - name: Run fee model tests
+        run: cargo test -p l2-core fees --all-features
+      - name: Verify crash-safe storage operations
+        run: |
+          # Test that storage operations are atomic and survive simulated crashes
+          cargo test -p l2-storage --all-features -- --test-threads=1 settlement_state
+      - name: Test feature combinations
+        run: |
+          # Ensure settlement works with contract-posting
+          cargo test -p l2-batcher --features contract-posting reconciler
+          # Ensure settlement works with signed-envelopes
+          cargo test -p l2-batcher --features signed-envelopes reconciler
+          # Ensure settlement works with all features
+          cargo test -p l2-batcher --features "contract-posting,signed-envelopes" reconciler
+
   # Summary job that depends on all checks
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, test, test-features, openapi-drift, build, audit, deny, solidity]
+    needs: [fmt, clippy, test, test-features, openapi-drift, build, audit, deny, solidity, settlement-lifecycle]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -145,7 +171,8 @@ jobs:
              [[ "${{ needs.build.result }}" != "success" ]] || \
              [[ "${{ needs.audit.result }}" != "success" ]] || \
              [[ "${{ needs.deny.result }}" != "success" ]] || \
-             [[ "${{ needs.solidity.result }}" != "success" ]]; then
+             [[ "${{ needs.solidity.result }}" != "success" ]] || \
+             [[ "${{ needs.settlement-lifecycle.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi

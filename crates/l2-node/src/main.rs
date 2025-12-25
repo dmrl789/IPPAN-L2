@@ -20,9 +20,10 @@ use axum::{Json, Router};
 use clap::Parser;
 use ippan_rpc::IppanRpcConfig;
 use l2_batcher::{
-    spawn as spawn_batcher, spawn_reconciler, BatchPoster, BatcherConfig, BatcherHandle,
-    BatcherSnapshot, IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, ReconcilerConfig,
-    ReconcilerHandle,
+    get_in_flight_summary, get_settlement_counts, spawn as spawn_batcher,
+    spawn_settlement_reconciler, BatchPoster, BatcherConfig, BatcherHandle, BatcherSnapshot,
+    IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, SettlementReconcilerConfig,
+    SettlementReconcilerHandle,
 };
 #[cfg(feature = "contract-posting")]
 use l2_batcher::{BlockingL1ClientAdapter, ContractBatchPoster, ContractPosterConfig};
@@ -274,6 +275,16 @@ struct Metrics {
     contract_already_known_total: IntCounter,
     #[allow(dead_code)] // Exposed via /metrics endpoint
     contract_failed_total: IntCounter,
+    // Settlement lifecycle metrics
+    settlement_created: IntGauge,
+    settlement_submitted: IntGauge,
+    settlement_included: IntGauge,
+    settlement_finalised: IntGauge,
+    settlement_failed: IntGauge,
+    #[allow(dead_code)] // Will be used when reconciler tracking is complete
+    settlement_recovered_total: IntCounter,
+    #[allow(dead_code)] // Will be used when reconciler tracking is complete
+    last_reconcile_ms: IntGauge,
 }
 
 impl Metrics {
@@ -399,6 +410,49 @@ impl Metrics {
         ))
         .expect("contract failed counter");
 
+        // Settlement lifecycle metrics
+        let settlement_created = IntGauge::with_opts(Opts::new(
+            "l2_settlement_created",
+            "Number of batches in Created state",
+        ))
+        .expect("settlement created gauge");
+
+        let settlement_submitted = IntGauge::with_opts(Opts::new(
+            "l2_settlement_submitted",
+            "Number of batches in Submitted state",
+        ))
+        .expect("settlement submitted gauge");
+
+        let settlement_included = IntGauge::with_opts(Opts::new(
+            "l2_settlement_included",
+            "Number of batches in Included state",
+        ))
+        .expect("settlement included gauge");
+
+        let settlement_finalised = IntGauge::with_opts(Opts::new(
+            "l2_settlement_finalised",
+            "Number of batches in Finalised state",
+        ))
+        .expect("settlement finalised gauge");
+
+        let settlement_failed = IntGauge::with_opts(Opts::new(
+            "l2_settlement_failed",
+            "Number of batches in Failed state",
+        ))
+        .expect("settlement failed gauge");
+
+        let settlement_recovered_total = IntCounter::with_opts(Opts::new(
+            "l2_settlement_recovered_total",
+            "Total batches recovered by reconciler",
+        ))
+        .expect("settlement recovered counter");
+
+        let last_reconcile_ms = IntGauge::with_opts(Opts::new(
+            "l2_last_reconcile_ms",
+            "Timestamp of last reconciliation cycle (ms since epoch)",
+        ))
+        .expect("last reconcile gauge");
+
         // Register all metrics
         for metric in [
             Box::new(uptime_ms.clone()) as Box<dyn prometheus::core::Collector>,
@@ -421,6 +475,13 @@ impl Metrics {
             Box::new(contract_submit_retries_total.clone()),
             Box::new(contract_already_known_total.clone()),
             Box::new(contract_failed_total.clone()),
+            Box::new(settlement_created.clone()),
+            Box::new(settlement_submitted.clone()),
+            Box::new(settlement_included.clone()),
+            Box::new(settlement_finalised.clone()),
+            Box::new(settlement_failed.clone()),
+            Box::new(settlement_recovered_total.clone()),
+            Box::new(last_reconcile_ms.clone()),
         ] {
             registry.register(metric).expect("register metric");
         }
@@ -447,6 +508,13 @@ impl Metrics {
             contract_submit_retries_total,
             contract_already_known_total,
             contract_failed_total,
+            settlement_created,
+            settlement_submitted,
+            settlement_included,
+            settlement_finalised,
+            settlement_failed,
+            settlement_recovered_total,
+            last_reconcile_ms,
         }
     }
 
@@ -459,6 +527,25 @@ impl Metrics {
             .set(i64::try_from(counts.confirmed).unwrap_or(i64::MAX));
         self.batches_failed
             .set(i64::try_from(counts.failed).unwrap_or(i64::MAX));
+    }
+
+    fn update_settlement_counts(&self, counts: &l2_storage::SettlementStateCounts) {
+        self.settlement_created
+            .set(i64::try_from(counts.created).unwrap_or(i64::MAX));
+        self.settlement_submitted
+            .set(i64::try_from(counts.submitted).unwrap_or(i64::MAX));
+        self.settlement_included
+            .set(i64::try_from(counts.included).unwrap_or(i64::MAX));
+        self.settlement_finalised
+            .set(i64::try_from(counts.finalised).unwrap_or(i64::MAX));
+        self.settlement_failed
+            .set(i64::try_from(counts.failed).unwrap_or(i64::MAX));
+    }
+
+    #[allow(dead_code)] // Will be used when reconciler tracking is complete
+    fn set_last_reconcile_ms(&self, ts: u64) {
+        self.last_reconcile_ms
+            .set(i64::try_from(ts).unwrap_or(i64::MAX));
     }
 
     fn update_leader_state(&self, state: &LeaderState) {
@@ -479,7 +566,7 @@ struct AppState {
     batcher: Option<BatcherHandle>,
     bridge: Option<BridgeHandle>,
     #[allow(dead_code)] // Held to keep background task alive
-    reconciler: Option<ReconcilerHandle>,
+    reconciler: Option<SettlementReconcilerHandle>,
     metrics: Metrics,
     queue_depth: Arc<AtomicUsize>,
     // Leader rotation state
@@ -622,6 +709,54 @@ struct SettlementInfo {
     pending_submissions: u64,
     /// Number of confirmed submissions
     confirmed_submissions: u64,
+    /// Settlement lifecycle state counts
+    lifecycle: SettlementLifecycleInfo,
+    /// In-flight batches summary
+    in_flight: InFlightInfo,
+    /// Last finalised batch info
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_finalised: Option<LastFinalisedInfo>,
+    /// Last reconciliation timestamp (ms since epoch)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reconcile_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SettlementLifecycleInfo {
+    /// Batches created but not yet submitted
+    created: u64,
+    /// Batches submitted to L1, awaiting inclusion
+    submitted: u64,
+    /// Batches included in L1 block, awaiting finality
+    included: u64,
+    /// Batches finalised on L1
+    finalised: u64,
+    /// Batches that failed settlement
+    failed: u64,
+    /// Total in-flight batches (created + submitted + included)
+    in_flight_total: u64,
+}
+
+#[derive(Serialize)]
+struct InFlightInfo {
+    /// Number of submitted batches awaiting inclusion
+    submitted_count: usize,
+    /// Number of included batches awaiting finality
+    included_count: usize,
+    /// Age of oldest submitted batch (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_submitted_age_ms: Option<u64>,
+    /// Age of oldest included batch (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_included_age_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct LastFinalisedInfo {
+    /// Batch hash (hex)
+    batch_hash: String,
+    /// Timestamp when finalised (ms since epoch)
+    finalised_at_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -775,7 +910,8 @@ async fn run() -> Result<(), NodeError> {
     let mut reconciler_handle = None;
 
     // Create RPC client for use by poster and reconciler
-    let rpc_client = if !settings.ippan_rpc_url.is_empty() {
+    // RPC client for legacy poster mode (kept for backwards compatibility)
+    let _rpc_client = if !settings.ippan_rpc_url.is_empty() {
         let rpc_config = IppanRpcConfig {
             base_url: settings.ippan_rpc_url.clone(),
             timeout_ms: IppanRpcConfig::DEFAULT_TIMEOUT_MS,
@@ -855,17 +991,44 @@ async fn run() -> Result<(), NodeError> {
         let handle = spawn_batcher(config, Arc::clone(&storage), poster);
         batcher_handle = Some(handle);
 
-        // Spawn reconciler (leader-only in production)
-        let reconciler_config = ReconcilerConfig::from_env();
+        // Run crash recovery check before starting reconciler
+        let recovery_info = run_startup_recovery(&storage);
+        if recovery_info.in_flight_count > 0 {
+            info!(
+                submitted = recovery_info.submitted_count,
+                included = recovery_info.included_count,
+                "startup recovery: found in-flight batches, reconciler will resume"
+            );
+        }
+
+        // Spawn settlement reconciler (leader-only in production)
+        let reconciler_config = SettlementReconcilerConfig {
+            hub: "fin".to_string(),
+            chain_id: settings.chain_id,
+            ..SettlementReconcilerConfig::from_env()
+        };
         info!(
             interval_ms = reconciler_config.interval_ms,
             batch_limit = reconciler_config.batch_limit,
-            "starting reconciler"
+            finality_confirmations = reconciler_config.finality_confirmations,
+            "starting settlement reconciler"
         );
-        reconciler_handle = Some(spawn_reconciler(
+
+        // Create L1 client adapter for reconciler
+        #[cfg(feature = "contract-posting")]
+        let l1_client_for_reconciler = {
+            let mock_client = l2_core::l1_contract::mock_client::MockL1Client::new("mainnet");
+            Some(BlockingL1ClientAdapter::new(mock_client))
+        };
+        #[cfg(not(feature = "contract-posting"))]
+        let l1_client_for_reconciler: Option<
+            l2_batcher::BlockingL1ClientAdapter<l2_core::l1_contract::mock_client::MockL1Client>,
+        > = None;
+
+        reconciler_handle = Some(spawn_settlement_reconciler(
             reconciler_config,
             Arc::clone(&storage),
-            rpc_client.clone(),
+            l1_client_for_reconciler,
         ));
     }
 
@@ -1054,6 +1217,32 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
         .as_ref()
         .and_then(|e| e.state.l1_tx().map(String::from));
 
+    // Get settlement lifecycle counts
+    let settlement_counts = state.storage.count_settlement_states().unwrap_or_default();
+
+    // Get in-flight summary
+    let in_flight_summary = get_in_flight_summary(&state.storage, 10);
+    let current_ms = now_ms();
+
+    // Calculate ages for in-flight batches
+    let oldest_submitted_age_ms = in_flight_summary
+        .oldest_submitted_ms
+        .map(|ts| current_ms.saturating_sub(ts));
+    let oldest_included_age_ms = in_flight_summary
+        .oldest_included_ms
+        .map(|ts| current_ms.saturating_sub(ts));
+
+    // Get last finalised batch
+    let last_finalised = state
+        .storage
+        .get_last_finalised_batch("fin", state.settings.chain_id)
+        .ok()
+        .flatten()
+        .map(|(hash, ts)| LastFinalisedInfo {
+            batch_hash: hash.to_hex(),
+            finalised_at_ms: ts,
+        });
+
     let response = StatusResponse {
         service: ServiceInfo {
             name: "ippan-l2-node",
@@ -1089,6 +1278,22 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
             last_l1_tx_id,
             pending_submissions: posting_counts.pending,
             confirmed_submissions: posting_counts.confirmed,
+            lifecycle: SettlementLifecycleInfo {
+                created: settlement_counts.created,
+                submitted: settlement_counts.submitted,
+                included: settlement_counts.included,
+                finalised: settlement_counts.finalised,
+                failed: settlement_counts.failed,
+                in_flight_total: settlement_counts.in_flight(),
+            },
+            in_flight: InFlightInfo {
+                submitted_count: in_flight_summary.submitted_count,
+                included_count: in_flight_summary.included_count,
+                oldest_submitted_age_ms,
+                oldest_included_age_ms,
+            },
+            last_finalised,
+            last_reconcile_ms: None, // TODO: track this in reconciler state
         },
         forced_inclusion: ForcedInclusionInfo {
             enabled: true,
@@ -1117,6 +1322,11 @@ async fn metrics_handler(state: axum::extract::State<AppState>) -> impl IntoResp
     // Update posting counts
     if let Ok(counts) = state.storage.count_posting_states() {
         state.metrics.update_posting_counts(&counts);
+    }
+
+    // Update settlement lifecycle counts
+    if let Ok(counts) = state.storage.count_settlement_states() {
+        state.metrics.update_settlement_counts(&counts);
     }
 
     // Update leader state metrics
@@ -2125,6 +2335,72 @@ async fn get_withdraw(
             })),
         ),
     }
+}
+
+// ============== Startup Recovery ==============
+
+/// Information about in-flight batches found during startup recovery.
+#[derive(Debug, Clone, Default)]
+struct StartupRecoveryInfo {
+    /// Number of batches in Submitted state.
+    submitted_count: usize,
+    /// Number of batches in Included state.
+    included_count: usize,
+    /// Total in-flight batches.
+    in_flight_count: usize,
+}
+
+/// Run startup recovery check to detect in-flight batches from previous session.
+///
+/// This function:
+/// 1. Queries storage for batches in non-terminal states
+/// 2. Logs recovery information
+/// 3. Returns counts for metrics
+///
+/// The actual reconciliation is handled by the settlement reconciler,
+/// which runs immediately on startup.
+fn run_startup_recovery(storage: &Storage) -> StartupRecoveryInfo {
+    let summary = get_in_flight_summary(storage, 100);
+    let counts = get_settlement_counts(storage);
+
+    let info = StartupRecoveryInfo {
+        submitted_count: summary.submitted_count,
+        included_count: summary.included_count,
+        in_flight_count: summary.submitted_count + summary.included_count,
+    };
+
+    if info.in_flight_count > 0 {
+        info!(
+            submitted = info.submitted_count,
+            included = info.included_count,
+            created = counts.created,
+            finalised = counts.finalised,
+            failed = counts.failed,
+            "crash recovery: detected batches from previous session"
+        );
+
+        // Log oldest in-flight batches for debugging
+        if let Some(oldest_submitted) = summary.oldest_submitted_ms {
+            let age_ms = now_ms().saturating_sub(oldest_submitted);
+            debug!(
+                oldest_submitted_ms = oldest_submitted,
+                age_ms = age_ms,
+                "oldest submitted batch"
+            );
+        }
+        if let Some(oldest_included) = summary.oldest_included_ms {
+            let age_ms = now_ms().saturating_sub(oldest_included);
+            debug!(
+                oldest_included_ms = oldest_included,
+                age_ms = age_ms,
+                "oldest included batch"
+            );
+        }
+    } else {
+        debug!("startup recovery: no in-flight batches found (clean state)");
+    }
+
+    info
 }
 
 // ============== Utility Functions ==============
