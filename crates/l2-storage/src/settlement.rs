@@ -549,12 +549,13 @@ mod tests {
 
     #[test]
     fn settlement_counts() {
-        let mut counts = SettlementStateCounts::default();
-        counts.created = 5;
-        counts.submitted = 3;
-        counts.included = 2;
-        counts.finalised = 10;
-        counts.failed = 1;
+        let counts = SettlementStateCounts {
+            created: 5,
+            submitted: 3,
+            included: 2,
+            finalised: 10,
+            failed: 1,
+        };
 
         assert_eq!(counts.total(), 21);
         assert_eq!(counts.in_flight(), 10);
