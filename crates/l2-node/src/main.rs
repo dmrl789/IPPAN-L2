@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use ippan_rpc::IppanRpcConfig;
 use l2_batcher::{
-    get_in_flight_summary, get_settlement_counts, spawn as spawn_batcher,
+    get_in_flight_summary, get_settlement_counts, spawn_with_m2m as spawn_batcher,
     spawn_settlement_reconciler, BatchPoster, BatcherConfig, BatcherHandle, BatcherSnapshot,
     IppanBatchPoster, IppanPosterConfig, LoggingBatchPoster, SettlementReconcilerConfig,
     SettlementReconcilerHandle,
@@ -32,11 +32,13 @@ use l2_bridge::{
     DepositClaimResponse, DepositEvent, DepositStatus, LoggingWatcher, WithdrawRequest,
     WithdrawStatus,
 };
+use l2_core::fees::{compute_m2m_fee, FeeSchedule, M2mFeeBreakdown};
 use l2_core::forced_inclusion::{
     ForceIncludeRequest, ForceIncludeResponse, ForceIncludeStatus, ForcedInclusionConfig,
     InclusionTicket,
 };
 use l2_core::{canonical_hash, ChainId, Hash32, Tx};
+use l2_storage::m2m::{ForcedClass, M2mStorage};
 use l2_leader::{LeaderConfig, LeaderSet, LeaderState, PubKey};
 use l2_storage::{PostingStateCounts, Storage};
 use prometheus::{Encoder, IntCounter, IntGauge, Opts, Registry, TextEncoder};
@@ -285,6 +287,13 @@ struct Metrics {
     settlement_recovered_total: IntCounter,
     #[allow(dead_code)] // Will be used when reconciler tracking is complete
     last_reconcile_ms: IntGauge,
+    // M2M fee metrics
+    m2m_fee_reserved_total: IntCounter,
+    #[allow(dead_code)] // Incremented by batcher (separate crate)
+    m2m_fee_finalised_total: IntCounter,
+    m2m_quota_reject_total: IntCounter,
+    m2m_insufficient_balance_reject_total: IntCounter,
+    m2m_forced_included_total: IntCounter,
 }
 
 impl Metrics {
@@ -453,6 +462,37 @@ impl Metrics {
         ))
         .expect("last reconcile gauge");
 
+        // M2M fee metrics
+        let m2m_fee_reserved_total = IntCounter::with_opts(Opts::new(
+            "l2_m2m_fee_reserved_total",
+            "Total M2M fees reserved",
+        ))
+        .expect("m2m fee reserved counter");
+
+        let m2m_fee_finalised_total = IntCounter::with_opts(Opts::new(
+            "l2_m2m_fee_finalised_total",
+            "Total M2M fees finalised",
+        ))
+        .expect("m2m fee finalised counter");
+
+        let m2m_quota_reject_total = IntCounter::with_opts(Opts::new(
+            "l2_m2m_quota_reject_total",
+            "Total M2M quota rejections",
+        ))
+        .expect("m2m quota reject counter");
+
+        let m2m_insufficient_balance_reject_total = IntCounter::with_opts(Opts::new(
+            "l2_m2m_insufficient_balance_reject_total",
+            "Total M2M insufficient balance rejections",
+        ))
+        .expect("m2m insufficient balance counter");
+
+        let m2m_forced_included_total = IntCounter::with_opts(Opts::new(
+            "l2_m2m_forced_included_total",
+            "Total M2M forced inclusion transactions",
+        ))
+        .expect("m2m forced included counter");
+
         // Register all metrics
         for metric in [
             Box::new(uptime_ms.clone()) as Box<dyn prometheus::core::Collector>,
@@ -482,6 +522,11 @@ impl Metrics {
             Box::new(settlement_failed.clone()),
             Box::new(settlement_recovered_total.clone()),
             Box::new(last_reconcile_ms.clone()),
+            Box::new(m2m_fee_reserved_total.clone()),
+            Box::new(m2m_fee_finalised_total.clone()),
+            Box::new(m2m_quota_reject_total.clone()),
+            Box::new(m2m_insufficient_balance_reject_total.clone()),
+            Box::new(m2m_forced_included_total.clone()),
         ] {
             registry.register(metric).expect("register metric");
         }
@@ -515,6 +560,11 @@ impl Metrics {
             settlement_failed,
             settlement_recovered_total,
             last_reconcile_ms,
+            m2m_fee_reserved_total,
+            m2m_fee_finalised_total,
+            m2m_quota_reject_total,
+            m2m_insufficient_balance_reject_total,
+            m2m_forced_included_total,
         }
     }
 
@@ -576,6 +626,10 @@ struct AppState {
     http_client: reqwest::Client,
     // Forced inclusion config
     forced_config: ForcedInclusionConfig,
+    // M2M fee storage
+    m2m_storage: Option<Arc<M2mStorage>>,
+    // M2M fee schedule
+    fee_schedule: FeeSchedule,
 }
 
 impl AppState {
@@ -690,6 +744,25 @@ struct StatusResponse {
     posting: PostingInfo,
     settlement: SettlementInfo,
     forced_inclusion: ForcedInclusionInfo,
+    m2m_fees: M2mFeesInfo,
+}
+
+#[derive(Serialize)]
+struct M2mFeesInfo {
+    /// Whether M2M fee storage is enabled.
+    enabled: bool,
+    /// Fee schedule summary.
+    schedule: Option<l2_core::fees::FeeScheduleSummary>,
+    /// Total machines registered.
+    total_machines: u64,
+    /// Machines with forced inclusion privileges.
+    forced_machines: u64,
+    /// Total fees reserved (lifetime, scaled).
+    total_reserved_scaled: u64,
+    /// Total fees finalized (lifetime, scaled).
+    total_finalised_scaled: u64,
+    /// Pending reservations count.
+    pending_reservations: u64,
 }
 
 #[derive(Serialize)]
@@ -922,6 +995,19 @@ async fn run() -> Result<(), NodeError> {
         None
     };
 
+    // Initialize M2M fee schedule and storage (before batcher so it can use it)
+    let fee_schedule = FeeSchedule::default();
+    let m2m_storage: Option<Arc<M2mStorage>> = match M2mStorage::open(storage.db(), fee_schedule.clone()) {
+        Ok(m2m) => {
+            info!("M2M fee storage initialized");
+            Some(Arc::new(m2m))
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to initialize M2M storage, fee features disabled");
+            None
+        }
+    };
+
     // Determine if we should start batcher (leader-only in single mode, always in rotating mode)
     let should_start_batcher =
         settings.batcher_enabled && (settings.leader_mode == "rotating" || settings.is_leader);
@@ -988,7 +1074,13 @@ async fn run() -> Result<(), NodeError> {
             }
         };
 
-        let handle = spawn_batcher(config, Arc::clone(&storage), poster);
+        let handle = spawn_batcher(
+            config,
+            Arc::clone(&storage),
+            poster,
+            m2m_storage.clone(),
+            Some(fee_schedule.clone()),
+        );
         batcher_handle = Some(handle);
 
         // Run crash recovery check before starting reconciler
@@ -1061,6 +1153,8 @@ async fn run() -> Result<(), NodeError> {
         leader_endpoints,
         http_client,
         forced_config,
+        m2m_storage,
+        fee_schedule,
     };
 
     // Spawn background task for leader state updates (rotating mode)
@@ -1095,6 +1189,11 @@ async fn run() -> Result<(), NodeError> {
         .route("/bridge/withdraw/{id}", get(get_withdraw))
         // Batch endpoints
         .route("/batch/{hash}", get(get_batch))
+        // M2M fee endpoints
+        .route("/m2m/fee/estimate", post(m2m_fee_estimate))
+        .route("/m2m/balance/{machine_id}", get(m2m_get_balance))
+        .route("/m2m/topup", post(m2m_topup))
+        .route("/m2m/schedule", get(m2m_get_schedule))
         .with_state(state.clone());
 
     let addr: SocketAddr = settings.listen_addr.parse().expect("invalid listen addr");
@@ -1301,6 +1400,30 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
             max_epochs: state.forced_config.max_epochs,
             max_per_account_per_epoch: state.forced_config.max_per_account_per_epoch,
         },
+        m2m_fees: {
+            if let Some(m2m) = &state.m2m_storage {
+                let stats = m2m.get_stats().unwrap_or_default();
+                M2mFeesInfo {
+                    enabled: true,
+                    schedule: Some(state.fee_schedule.summary()),
+                    total_machines: stats.total_machines,
+                    forced_machines: stats.forced_machines,
+                    total_reserved_scaled: stats.total_reserved_scaled,
+                    total_finalised_scaled: stats.total_fees_paid_scaled,
+                    pending_reservations: stats.pending_reservations,
+                }
+            } else {
+                M2mFeesInfo {
+                    enabled: false,
+                    schedule: None,
+                    total_machines: 0,
+                    forced_machines: 0,
+                    total_reserved_scaled: 0,
+                    total_finalised_scaled: 0,
+                    pending_reservations: 0,
+                }
+            }
+        },
     };
 
     Json(response)
@@ -1456,12 +1579,13 @@ async fn submit_tx(
         );
     }
 
-    // Create transaction
+    // Create transaction (preserve from for hash computation before move)
+    let machine_id = req.from.clone();
     let tx = Tx {
         chain_id: ChainId(req.chain_id),
         nonce: req.nonce,
         from: req.from,
-        payload,
+        payload: payload.clone(),
     };
 
     // Compute hash
@@ -1482,8 +1606,152 @@ async fn submit_tx(
         }
     };
 
+    // M2M Fee reservation (if M2M storage is enabled)
+    let mut fee_reserved_scaled: Option<u64> = None;
+    let mut is_forced_tx = false;
+    if let Some(m2m) = &state.m2m_storage {
+        // Compute fee based on payload size
+        // Using conservative estimates: 1 exec unit per byte, 1 write
+        let data_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let exec_units = data_bytes; // 1:1 ratio for simplicity
+        let writes = 1u32;
+
+        match compute_m2m_fee(&state.fee_schedule, exec_units, data_bytes, writes) {
+            Ok(breakdown) => {
+                let fee_amount = breakdown.total_fee.scaled();
+
+                // Check if machine has forced inclusion privileges
+                let forced_class = m2m.forced_class(&machine_id).unwrap_or(ForcedClass::Standard);
+                is_forced_tx = forced_class == ForcedClass::ForcedInclusion;
+
+                // Apply quota or forced usage limit based on class
+                if is_forced_tx {
+                    // Forced inclusion machines bypass normal quota but have daily limit
+                    match m2m.apply_forced_usage(&machine_id, now_ms()) {
+                        Ok(()) => {
+                            debug!(
+                                machine_id = %machine_id,
+                                "forced inclusion applied"
+                            );
+                        }
+                        Err(e) => {
+                            // Daily forced limit exceeded
+                            state.dequeue();
+                            state.metrics.tx_rejected.inc();
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(SubmitTxResponse {
+                                    tx_hash: tx_hash.to_hex(),
+                                    accepted: false,
+                                    error: Some(format!("forced inclusion limit exceeded: {e}")),
+                                    forwarded: None,
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    // Standard machines subject to normal quota
+                    let quota_result = m2m.apply_quota(
+                        &machine_id,
+                        fee_amount,
+                        now_ms(),
+                        100_000_000, // 100 IPN max per window (configurable)
+                        60_000,      // 1 minute window
+                    );
+
+                    if let Err(e) = quota_result {
+                        state.dequeue();
+                        state.metrics.tx_rejected.inc();
+                        state.metrics.m2m_quota_reject_total.inc();
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(SubmitTxResponse {
+                                tx_hash: tx_hash.to_hex(),
+                                accepted: false,
+                                error: Some(format!("quota exceeded: {e}")),
+                                forwarded: None,
+                            }),
+                        );
+                    }
+                }
+
+                // Try to reserve fee (both forced and standard pay fees)
+                let reserve_result = m2m.reserve_fee(
+                    &machine_id,
+                    tx_hash.0,
+                    fee_amount,
+                    breakdown,
+                    is_forced_tx,
+                    now_ms(),
+                );
+
+                match reserve_result {
+                    Ok(()) => {
+                        fee_reserved_scaled = Some(fee_amount);
+                        state.metrics.m2m_fee_reserved_total.inc();
+                        if is_forced_tx {
+                            state.metrics.m2m_forced_included_total.inc();
+                        }
+                        debug!(
+                            machine_id = %machine_id,
+                            tx_hash = %tx_hash.to_hex(),
+                            fee_amount = fee_amount,
+                            "reserved fee for tx"
+                        );
+                    }
+                    Err(l2_storage::m2m::M2mStorageError::InsufficientBalance { required, available }) => {
+                        state.dequeue();
+                        state.metrics.tx_rejected.inc();
+                        state.metrics.m2m_insufficient_balance_reject_total.inc();
+                        return (
+                            StatusCode::PAYMENT_REQUIRED,
+                            Json(SubmitTxResponse {
+                                tx_hash: tx_hash.to_hex(),
+                                accepted: false,
+                                error: Some(format!(
+                                    "insufficient balance: required {}, available {}",
+                                    required, available
+                                )),
+                                forwarded: None,
+                            }),
+                        );
+                    }
+                    Err(l2_storage::m2m::M2mStorageError::MachineNotFound { .. }) => {
+                        // Machine not registered - allow tx through without fee (MVP behavior)
+                        // In production, this would reject
+                        debug!(
+                            machine_id = %machine_id,
+                            "machine not found, allowing tx without fee reservation"
+                        );
+                    }
+                    Err(e) => {
+                        // Other errors - allow tx through with warning
+                        warn!(
+                            machine_id = %machine_id,
+                            error = %e,
+                            "fee reservation error, allowing tx through"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    machine_id = %machine_id,
+                    error = %e,
+                    "fee computation error, allowing tx through"
+                );
+            }
+        }
+    }
+    // Track reserved fee (used in batcher finalization)
+    let _ = fee_reserved_scaled;
+
     // Store transaction
     if let Err(e) = state.storage.put_tx(&tx) {
+        // Release reservation if store fails
+        if let Some(m2m) = &state.m2m_storage {
+            let _ = m2m.release_reservation(&machine_id, tx_hash.0, now_ms());
+        }
         state.dequeue();
         state.metrics.tx_rejected.inc();
         return (
@@ -1497,8 +1765,52 @@ async fn submit_tx(
         );
     }
 
+    // If forced inclusion tx, create forced queue entry for priority processing
+    if is_forced_tx {
+        // Get current epoch info
+        let current_ms = now_ms();
+        let current_epoch = state
+            .leader_config
+            .as_ref()
+            .map(|c| c.epoch_at(current_ms))
+            .unwrap_or(0);
+        let epoch_ms = state
+            .leader_config
+            .as_ref()
+            .map(|c| c.epoch_ms)
+            .unwrap_or(10_000);
+
+        let ticket = InclusionTicket::new(
+            tx_hash,
+            machine_id.clone(),
+            current_ms,
+            epoch_ms,
+            state.forced_config.max_epochs,
+            current_epoch,
+        );
+
+        if let Err(e) = state.storage.put_forced_ticket(&ticket) {
+            warn!(
+                error = %e,
+                tx_hash = %tx_hash.to_hex(),
+                "failed to create forced inclusion ticket (tx will still be processed)"
+            );
+        } else {
+            info!(
+                tx_hash = %tx_hash.to_hex(),
+                machine_id = %machine_id,
+                expires_at = ticket.expires_at_ms,
+                "created forced inclusion ticket"
+            );
+        }
+    }
+
     // Submit to batcher
     if let Err(e) = batcher.submit_tx(tx).await {
+        // Release reservation if batcher submission fails
+        if let Some(m2m) = &state.m2m_storage {
+            let _ = m2m.release_reservation(&machine_id, tx_hash.0, now_ms());
+        }
         state.dequeue();
         state.metrics.tx_rejected.inc();
         return (
@@ -2335,6 +2647,217 @@ async fn get_withdraw(
             })),
         ),
     }
+}
+
+// ============== M2M Fee Endpoints ==============
+
+/// Request for fee estimation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeeEstimateRequest {
+    /// Number of execution units.
+    exec_units: u64,
+    /// Number of data bytes.
+    data_bytes: u64,
+    /// Number of storage writes.
+    writes: u32,
+}
+
+/// Response for fee estimation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeeEstimateResponse {
+    /// Fee breakdown.
+    breakdown: M2mFeeBreakdown,
+    /// Schedule summary.
+    schedule: l2_core::fees::FeeScheduleSummary,
+}
+
+/// Response for balance query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BalanceResponse {
+    /// Machine ID.
+    machine_id: String,
+    /// Available balance (scaled).
+    balance_scaled: u64,
+    /// Reserved balance (scaled).
+    reserved_scaled: u64,
+    /// Forced inclusion class.
+    forced_class: ForcedClass,
+}
+
+/// Request for devnet top-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TopupRequest {
+    /// Machine ID to top up.
+    machine_id: String,
+    /// Amount to add (scaled).
+    amount_scaled: u64,
+}
+
+/// Response for top-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TopupResponse {
+    /// Whether the top-up succeeded.
+    success: bool,
+    /// New balance after top-up (scaled).
+    new_balance_scaled: Option<u64>,
+    /// Error message if failed.
+    error: Option<String>,
+}
+
+/// Estimate fee for a transaction.
+async fn m2m_fee_estimate(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<FeeEstimateRequest>,
+) -> impl IntoResponse {
+    // Compute fee using the schedule
+    match compute_m2m_fee(&state.fee_schedule, req.exec_units, req.data_bytes, req.writes) {
+        Ok(breakdown) => {
+            let response = FeeEstimateResponse {
+                breakdown,
+                schedule: state.fee_schedule.summary(),
+            };
+            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("fee computation error: {e}")
+            })),
+        ),
+    }
+}
+
+/// Get balance for a machine.
+async fn m2m_get_balance(
+    state: axum::extract::State<AppState>,
+    Path(machine_id): Path<String>,
+) -> impl IntoResponse {
+    let m2m = match &state.m2m_storage {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "M2M storage not available"
+                })),
+            )
+        }
+    };
+
+    // Validate machine ID
+    if let Err(e) = M2mStorage::validate_machine_id(&machine_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("invalid machine_id: {e}")
+            })),
+        );
+    }
+
+    // Get account info
+    match m2m.get_account(&machine_id) {
+        Ok(Some(account)) => {
+            let response = BalanceResponse {
+                machine_id: account.machine_id,
+                balance_scaled: account.balance_scaled,
+                reserved_scaled: account.reserved_scaled,
+                forced_class: account.forced_class,
+            };
+            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+        }
+        Ok(None) => {
+            // Return zero balance for unknown machines
+            let response = BalanceResponse {
+                machine_id,
+                balance_scaled: 0,
+                reserved_scaled: 0,
+                forced_class: ForcedClass::Standard,
+            };
+            (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("storage error: {e}")
+            })),
+        ),
+    }
+}
+
+/// Top up balance (devnet only).
+async fn m2m_topup(
+    state: axum::extract::State<AppState>,
+    Json(req): Json<TopupRequest>,
+) -> impl IntoResponse {
+    // Check if devnet mode
+    let devnet = std::env::var("DEVNET")
+        .map(|s| s == "1" || s.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if !devnet {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(TopupResponse {
+                success: false,
+                new_balance_scaled: None,
+                error: Some("top-up only available in devnet mode (DEVNET=1)".to_string()),
+            }),
+        );
+    }
+
+    let m2m = match &state.m2m_storage {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(TopupResponse {
+                    success: false,
+                    new_balance_scaled: None,
+                    error: Some("M2M storage not available".to_string()),
+                }),
+            )
+        }
+    };
+
+    // Validate machine ID
+    if let Err(e) = M2mStorage::validate_machine_id(&req.machine_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(TopupResponse {
+                success: false,
+                new_balance_scaled: None,
+                error: Some(format!("invalid machine_id: {e}")),
+            }),
+        );
+    }
+
+    // Top up
+    match m2m.topup(&req.machine_id, req.amount_scaled, now_ms()) {
+        Ok(new_balance) => (
+            StatusCode::OK,
+            Json(TopupResponse {
+                success: true,
+                new_balance_scaled: Some(new_balance.scaled()),
+                error: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TopupResponse {
+                success: false,
+                new_balance_scaled: None,
+                error: Some(format!("top-up error: {e}")),
+            }),
+        ),
+    }
+}
+
+/// Get fee schedule.
+async fn m2m_get_schedule(
+    state: axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    let summary = state.fee_schedule.summary();
+    Json(serde_json::to_value(summary).unwrap())
 }
 
 // ============== Startup Recovery ==============

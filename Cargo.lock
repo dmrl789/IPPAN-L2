@@ -2513,6 +2513,7 @@ dependencies = [
 name = "l2-storage"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "l2-core",
  "serde",
  "sled",

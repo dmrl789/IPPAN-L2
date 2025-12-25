@@ -9,6 +9,7 @@
 //! 2. **Predictability**: Machines can calculate exact costs in advance
 //! 3. **Transparency**: Clear breakdown of what costs what
 //! 4. **No speculation**: Fees are policy-based, not market-based
+//! 5. **Overflow Safety**: All arithmetic uses checked operations
 //!
 //! ## Fee Flow
 //!
@@ -17,7 +18,12 @@
 //!         │
 //!         ▼
 //! ┌───────────────────┐
-//! │ Reserve Fee       │ ← Pre-calculate max fee for tx
+//! │ Estimate Fee      │ ← Machine queries fee endpoint
+//! └───────────────────┘
+//!         │
+//!         ▼
+//! ┌───────────────────┐
+//! │ Reserve Fee       │ ← Pre-calculate and reserve from balance
 //! └───────────────────┘
 //!         │
 //!         ▼
@@ -38,6 +44,30 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Errors that can occur during fee calculations.
+#[derive(Debug, Clone, Error)]
+pub enum FeeError {
+    /// Arithmetic overflow occurred during fee calculation.
+    #[error("arithmetic overflow during fee calculation")]
+    Overflow,
+    /// Fee would be below minimum allowed.
+    #[error("computed fee {computed} is below minimum {min}")]
+    BelowMinimum { computed: u64, min: u64 },
+    /// Fee would exceed maximum allowed.
+    #[error("computed fee {computed} exceeds maximum {max}")]
+    ExceedsMaximum { computed: u64, max: u64 },
+    /// Invalid schedule configuration.
+    #[error("invalid fee schedule: {reason}")]
+    InvalidSchedule { reason: String },
+    /// Insufficient balance for fee.
+    #[error("insufficient balance: required {required}, available {available}")]
+    InsufficientBalance { required: u64, available: u64 },
+    /// Quota exceeded.
+    #[error("quota exceeded: {reason}")]
+    QuotaExceeded { reason: String },
+}
 
 /// Scale factor for fixed-point fee amounts (6 decimals).
 pub const FEE_SCALE: u64 = 1_000_000;
@@ -175,6 +205,145 @@ impl Default for M2mFeeBreakdown {
     }
 }
 
+/// Deterministic fee schedule for M2M transactions.
+///
+/// All fields use scaled integers (6 decimal places) for deterministic
+/// cross-platform behavior. No floats, no dynamic pricing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeSchedule {
+    /// Cost per execution unit (scaled by FEE_SCALE).
+    pub rate_exec_unit_scaled: u64,
+    /// Cost per byte of transaction data (scaled by FEE_SCALE).
+    pub rate_per_byte_scaled: u64,
+    /// Cost per storage write operation (scaled by FEE_SCALE).
+    pub rate_per_write_scaled: u64,
+    /// Minimum fee allowed (scaled by FEE_SCALE).
+    pub min_fee_scaled: u64,
+    /// Maximum fee allowed - hard cap (scaled by FEE_SCALE).
+    pub max_fee_scaled: u64,
+    /// Base fee per transaction (scaled by FEE_SCALE).
+    pub base_fee_scaled: u64,
+}
+
+impl FeeSchedule {
+    /// Default schedule with conservative rates.
+    pub const fn default_schedule() -> Self {
+        Self {
+            // 0.000001 IPN per exec unit (1 scaled unit)
+            rate_exec_unit_scaled: 1,
+            // 0.00001 IPN per byte (10 scaled units)
+            rate_per_byte_scaled: 10,
+            // 0.001 IPN per storage write (1000 scaled units)
+            rate_per_write_scaled: 1000,
+            // Minimum fee: 0.001 IPN (1000 scaled units)
+            min_fee_scaled: 1000,
+            // Maximum fee: 100 IPN (100_000_000 scaled units)
+            max_fee_scaled: 100_000_000,
+            // Base fee: 0.01 IPN (10000 scaled units)
+            base_fee_scaled: 10_000,
+        }
+    }
+
+    /// Validate the schedule configuration.
+    pub fn validate(&self) -> Result<(), FeeError> {
+        if self.min_fee_scaled > self.max_fee_scaled {
+            return Err(FeeError::InvalidSchedule {
+                reason: format!(
+                    "min_fee_scaled ({}) > max_fee_scaled ({})",
+                    self.min_fee_scaled, self.max_fee_scaled
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Get a summary of the schedule for status endpoints.
+    pub fn summary(&self) -> FeeScheduleSummary {
+        FeeScheduleSummary {
+            min_fee: FeeAmount::from_scaled(self.min_fee_scaled),
+            max_fee: FeeAmount::from_scaled(self.max_fee_scaled),
+            base_fee: FeeAmount::from_scaled(self.base_fee_scaled),
+            rate_per_exec_unit: FeeAmount::from_scaled(self.rate_exec_unit_scaled),
+            rate_per_byte: FeeAmount::from_scaled(self.rate_per_byte_scaled),
+            rate_per_write: FeeAmount::from_scaled(self.rate_per_write_scaled),
+        }
+    }
+}
+
+impl Default for FeeSchedule {
+    fn default() -> Self {
+        Self::default_schedule()
+    }
+}
+
+/// Summary of fee schedule for status/info endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeScheduleSummary {
+    pub min_fee: FeeAmount,
+    pub max_fee: FeeAmount,
+    pub base_fee: FeeAmount,
+    pub rate_per_exec_unit: FeeAmount,
+    pub rate_per_byte: FeeAmount,
+    pub rate_per_write: FeeAmount,
+}
+
+/// Compute the M2M fee for given resource usage.
+///
+/// This function uses checked arithmetic throughout to prevent overflow,
+/// and clamps the result to the schedule's min/max bounds.
+///
+/// # Arguments
+/// * `schedule` - The fee schedule to use
+/// * `exec_units` - Number of execution units consumed
+/// * `data_bytes` - Number of bytes in the transaction payload
+/// * `writes` - Number of storage write operations
+///
+/// # Returns
+/// A breakdown of the fee calculation, or an error if overflow would occur.
+pub fn compute_m2m_fee(
+    schedule: &FeeSchedule,
+    exec_units: u64,
+    data_bytes: u64,
+    writes: u32,
+) -> Result<M2mFeeBreakdown, FeeError> {
+    // Validate schedule
+    schedule.validate()?;
+
+    // Calculate exec fee with overflow check
+    let exec_fee = schedule
+        .rate_exec_unit_scaled
+        .checked_mul(exec_units)
+        .ok_or(FeeError::Overflow)?;
+
+    // Calculate data fee with overflow check
+    let data_fee = schedule
+        .rate_per_byte_scaled
+        .checked_mul(data_bytes)
+        .ok_or(FeeError::Overflow)?;
+
+    // Calculate write fee with overflow check
+    let write_fee = schedule
+        .rate_per_write_scaled
+        .checked_mul(u64::from(writes))
+        .ok_or(FeeError::Overflow)?;
+
+    // Sum all components with overflow checks
+    let mut total = schedule.base_fee_scaled;
+    total = total.checked_add(exec_fee).ok_or(FeeError::Overflow)?;
+    total = total.checked_add(data_fee).ok_or(FeeError::Overflow)?;
+    total = total.checked_add(write_fee).ok_or(FeeError::Overflow)?;
+
+    // Clamp to min/max bounds
+    let clamped = total.clamp(schedule.min_fee_scaled, schedule.max_fee_scaled);
+
+    Ok(M2mFeeBreakdown {
+        exec_units,
+        data_bytes,
+        storage_writes: writes,
+        total_fee: FeeAmount::from_scaled(clamped),
+    })
+}
+
 /// Fee policy for deterministic fee calculation.
 ///
 /// This defines the per-unit costs for each resource type.
@@ -206,6 +375,18 @@ impl M2mFeePolicy {
             cost_per_storage_write: FeeAmount::from_scaled(1000),
             // 0.01 IPN base fee (10000 scaled units)
             base_fee: FeeAmount::from_scaled(10_000),
+        }
+    }
+
+    /// Convert to a FeeSchedule.
+    pub fn to_schedule(&self, min_fee_scaled: u64, max_fee_scaled: u64) -> FeeSchedule {
+        FeeSchedule {
+            rate_exec_unit_scaled: self.cost_per_exec_unit.scaled(),
+            rate_per_byte_scaled: self.cost_per_data_byte.scaled(),
+            rate_per_write_scaled: self.cost_per_storage_write.scaled(),
+            min_fee_scaled,
+            max_fee_scaled,
+            base_fee_scaled: self.base_fee.scaled(),
         }
     }
 
@@ -473,5 +654,169 @@ mod tests {
         let json = serde_json::to_string(&breakdown).unwrap();
         let parsed: M2mFeeBreakdown = serde_json::from_str(&json).unwrap();
         assert_eq!(breakdown, parsed);
+    }
+
+    // ========== FeeSchedule and compute_m2m_fee tests ==========
+
+    #[test]
+    fn fee_schedule_default() {
+        let schedule = FeeSchedule::default_schedule();
+        assert_eq!(schedule.rate_exec_unit_scaled, 1);
+        assert_eq!(schedule.rate_per_byte_scaled, 10);
+        assert_eq!(schedule.rate_per_write_scaled, 1000);
+        assert_eq!(schedule.min_fee_scaled, 1000);
+        assert_eq!(schedule.max_fee_scaled, 100_000_000);
+        assert_eq!(schedule.base_fee_scaled, 10_000);
+        assert!(schedule.validate().is_ok());
+    }
+
+    #[test]
+    fn fee_schedule_validation() {
+        // Valid schedule
+        let valid = FeeSchedule {
+            min_fee_scaled: 100,
+            max_fee_scaled: 1000,
+            ..FeeSchedule::default()
+        };
+        assert!(valid.validate().is_ok());
+
+        // Invalid: min > max
+        let invalid = FeeSchedule {
+            min_fee_scaled: 2000,
+            max_fee_scaled: 1000,
+            ..FeeSchedule::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn compute_m2m_fee_golden_computation() {
+        // Golden test with fixed inputs
+        let schedule = FeeSchedule {
+            rate_exec_unit_scaled: 1,
+            rate_per_byte_scaled: 10,
+            rate_per_write_scaled: 1000,
+            min_fee_scaled: 100,
+            max_fee_scaled: 1_000_000_000,
+            base_fee_scaled: 10_000,
+        };
+
+        // Test case: 1000 exec units, 500 bytes, 3 writes
+        // Expected:
+        //   base:   10_000
+        //   exec:    1_000 (1000 * 1)
+        //   bytes:   5_000 (500 * 10)
+        //   writes:  3_000 (3 * 1000)
+        //   total:  19_000
+        let breakdown = compute_m2m_fee(&schedule, 1000, 500, 3).unwrap();
+        assert_eq!(breakdown.exec_units, 1000);
+        assert_eq!(breakdown.data_bytes, 500);
+        assert_eq!(breakdown.storage_writes, 3);
+        assert_eq!(breakdown.total_fee.scaled(), 19_000);
+    }
+
+    #[test]
+    fn compute_m2m_fee_clamp_to_minimum() {
+        let schedule = FeeSchedule {
+            rate_exec_unit_scaled: 1,
+            rate_per_byte_scaled: 1,
+            rate_per_write_scaled: 1,
+            min_fee_scaled: 50_000, // High minimum
+            max_fee_scaled: 1_000_000,
+            base_fee_scaled: 100,
+        };
+
+        // Small tx that would compute below minimum
+        let breakdown = compute_m2m_fee(&schedule, 10, 10, 1).unwrap();
+        // computed: 100 + 10 + 10 + 1 = 121, clamped to min_fee_scaled
+        assert_eq!(breakdown.total_fee.scaled(), 50_000);
+    }
+
+    #[test]
+    fn compute_m2m_fee_clamp_to_maximum() {
+        let schedule = FeeSchedule {
+            rate_exec_unit_scaled: 1_000_000, // Very high rate
+            rate_per_byte_scaled: 1,
+            rate_per_write_scaled: 1,
+            min_fee_scaled: 100,
+            max_fee_scaled: 500_000, // Low maximum cap
+            base_fee_scaled: 0,
+        };
+
+        // Large exec units that would exceed maximum
+        let breakdown = compute_m2m_fee(&schedule, 1000, 10, 1).unwrap();
+        // computed: 0 + 1_000_000_000 + 10 + 1 (overflow-safe path)
+        // clamped to max_fee_scaled
+        assert_eq!(breakdown.total_fee.scaled(), 500_000);
+    }
+
+    #[test]
+    fn compute_m2m_fee_overflow_protection() {
+        let schedule = FeeSchedule {
+            rate_exec_unit_scaled: u64::MAX,
+            rate_per_byte_scaled: 1,
+            rate_per_write_scaled: 1,
+            min_fee_scaled: 100,
+            max_fee_scaled: u64::MAX,
+            base_fee_scaled: 0,
+        };
+
+        // This should overflow and return an error
+        let result = compute_m2m_fee(&schedule, u64::MAX, 0, 0);
+        assert!(matches!(result, Err(FeeError::Overflow)));
+    }
+
+    #[test]
+    fn compute_m2m_fee_zero_inputs() {
+        let schedule = FeeSchedule::default();
+
+        // Zero resource usage should just pay base fee (or min)
+        let breakdown = compute_m2m_fee(&schedule, 0, 0, 0).unwrap();
+        // base_fee_scaled = 10_000, but min_fee_scaled = 1000
+        // 10_000 > 1000, so no clamping needed
+        assert_eq!(breakdown.total_fee.scaled(), 10_000);
+    }
+
+    #[test]
+    fn fee_schedule_summary() {
+        let schedule = FeeSchedule::default();
+        let summary = schedule.summary();
+
+        assert_eq!(summary.min_fee.scaled(), schedule.min_fee_scaled);
+        assert_eq!(summary.max_fee.scaled(), schedule.max_fee_scaled);
+        assert_eq!(summary.base_fee.scaled(), schedule.base_fee_scaled);
+    }
+
+    #[test]
+    fn fee_policy_to_schedule_conversion() {
+        let policy = M2mFeePolicy::default_policy();
+        let schedule = policy.to_schedule(1000, 100_000_000);
+
+        assert_eq!(schedule.rate_exec_unit_scaled, policy.cost_per_exec_unit.scaled());
+        assert_eq!(schedule.rate_per_byte_scaled, policy.cost_per_data_byte.scaled());
+        assert_eq!(schedule.rate_per_write_scaled, policy.cost_per_storage_write.scaled());
+        assert_eq!(schedule.base_fee_scaled, policy.base_fee.scaled());
+        assert_eq!(schedule.min_fee_scaled, 1000);
+        assert_eq!(schedule.max_fee_scaled, 100_000_000);
+    }
+
+    #[test]
+    fn fee_schedule_serialization() {
+        let schedule = FeeSchedule::default();
+        let json = serde_json::to_string(&schedule).unwrap();
+        let parsed: FeeSchedule = serde_json::from_str(&json).unwrap();
+        assert_eq!(schedule, parsed);
+    }
+
+    #[test]
+    fn fee_error_display() {
+        let err = FeeError::Overflow;
+        assert!(err.to_string().contains("overflow"));
+
+        let err = FeeError::InsufficientBalance {
+            required: 100,
+            available: 50,
+        };
+        assert!(err.to_string().contains("insufficient"));
     }
 }

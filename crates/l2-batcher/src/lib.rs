@@ -38,7 +38,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ippan_rpc::{DataTxRequest, IppanRpcClient, IppanRpcConfig, IppanRpcError};
+use l2_core::fees::FeeSchedule;
 use l2_core::{Batch, ChainId, Hash32, Tx};
+use l2_storage::m2m::{BatchFeeTotals, M2mStorage};
 use l2_storage::{PostingState, SettlementState, Storage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -966,13 +968,32 @@ pub fn spawn(
     storage: Arc<Storage>,
     poster: Arc<dyn BatchPoster>,
 ) -> BatcherHandle {
+    spawn_with_m2m(config, storage, poster, None, None)
+}
+
+/// Spawn batcher with optional M2M fee storage for fee finalization.
+pub fn spawn_with_m2m(
+    config: BatcherConfig,
+    storage: Arc<Storage>,
+    poster: Arc<dyn BatchPoster>,
+    m2m_storage: Option<Arc<M2mStorage>>,
+    fee_schedule: Option<FeeSchedule>,
+) -> BatcherHandle {
     let (tx, rx) = mpsc::channel(1024);
     let state = Arc::new(Mutex::new(BatcherState {
         queue_depth: 0,
         last_batch_hash: None,
         last_post_time_ms: None,
     }));
-    tokio::spawn(run_loop(config, storage, poster, rx, Arc::clone(&state)));
+    tokio::spawn(run_loop(
+        config,
+        storage,
+        poster,
+        rx,
+        Arc::clone(&state),
+        m2m_storage,
+        fee_schedule.unwrap_or_default(),
+    ));
     BatcherHandle { tx, state }
 }
 
@@ -982,6 +1003,8 @@ async fn run_loop(
     poster: Arc<dyn BatchPoster>,
     mut rx: mpsc::Receiver<Tx>,
     state: Arc<Mutex<BatcherState>>,
+    m2m_storage: Option<Arc<M2mStorage>>,
+    _fee_schedule: FeeSchedule,
 ) {
     loop {
         let deadline = Instant::now() + Duration::from_millis(config.max_wait_ms);
@@ -1079,6 +1102,78 @@ async fn run_loop(
                     }
                 }
 
+                // Finalize fees for all transactions in the batch
+                let mut batch_total_fee_scaled: u64 = 0;
+                let mut batch_total_refunds_scaled: u64 = 0;
+                if let Some(m2m) = &m2m_storage {
+                    for tx in &batch.txs {
+                        let tx_hash = match l2_core::canonical_hash(tx) {
+                            Ok(h) => h,
+                            Err(_) => continue,
+                        };
+
+                        // Get reservation if exists
+                        if let Ok(Some(reservation)) = m2m.get_reservation(&tx_hash.0) {
+                            // For MVP, actual fee = reserved fee (no execution metering yet)
+                            let final_fee = reservation.breakdown.total_fee.scaled();
+
+                            // Finalize the fee
+                            match m2m.finalise_fee(
+                                &reservation.machine_id,
+                                tx_hash.0,
+                                final_fee,
+                                now_ms(),
+                            ) {
+                                Ok(refund) => {
+                                    batch_total_fee_scaled = batch_total_fee_scaled
+                                        .saturating_add(final_fee);
+                                    batch_total_refunds_scaled = batch_total_refunds_scaled
+                                        .saturating_add(refund);
+                                    debug!(
+                                        tx_hash = %tx_hash.to_hex(),
+                                        machine_id = %reservation.machine_id,
+                                        final_fee = final_fee,
+                                        refund = refund,
+                                        "finalized fee for tx"
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        tx_hash = %tx_hash.to_hex(),
+                                        "failed to finalize fee"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Record batch fee totals
+                    let totals = BatchFeeTotals {
+                        batch_hash: hash.0,
+                        total_fees_scaled: batch_total_fee_scaled,
+                        tx_count: u64::try_from(batch.txs.len()).unwrap_or(u64::MAX),
+                        total_refunds_scaled: batch_total_refunds_scaled,
+                        created_at_ms: batch.created_ms,
+                    };
+
+                    if let Err(err) = m2m.record_batch_fees(&totals) {
+                        warn!(
+                            error = %err,
+                            batch_hash = %hash.to_hex(),
+                            "failed to record batch fee totals"
+                        );
+                    } else {
+                        info!(
+                            batch_hash = %hash.to_hex(),
+                            total_fees = batch_total_fee_scaled,
+                            total_refunds = batch_total_refunds_scaled,
+                            tx_count = batch.txs.len(),
+                            "recorded batch fee totals"
+                        );
+                    }
+                }
+
                 if let Err(err) = poster.post_batch(&batch, &hash).await {
                     warn!(error = %err, "poster failed for batch");
                 }
@@ -1089,6 +1184,7 @@ async fn run_loop(
                     batch_number,
                     hash = %hash.to_hex(),
                     forced_count = forced_tx_hashes.len(),
+                    batch_fee_total = batch_total_fee_scaled,
                     "stored batch"
                 );
             }
