@@ -12,6 +12,7 @@
 //! This crate provides persistent storage for batches, transactions, and
 //! settlement state. All operations are crash-safe and atomic.
 
+pub mod m2m;
 pub mod settlement;
 
 use std::path::Path;
@@ -306,6 +307,13 @@ impl Storage {
         };
         storage.init_schema()?;
         Ok(storage)
+    }
+
+    /// Get a reference to the underlying sled database.
+    ///
+    /// This is used for creating additional tree handles (e.g., M2M storage).
+    pub fn db(&self) -> &sled::Db {
+        &self.db
     }
 
     pub fn put_tx(&self, tx: &Tx) -> Result<Hash32, StorageError> {
