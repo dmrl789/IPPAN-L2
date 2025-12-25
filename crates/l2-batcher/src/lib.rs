@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use ippan_rpc::{DataTxRequest, IppanRpcClient, IppanRpcConfig, IppanRpcError};
 use l2_core::{Batch, ChainId, Hash32, Tx};
-use l2_storage::{PostingState, Storage};
+use l2_storage::{PostingState, SettlementState, Storage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
@@ -524,7 +524,13 @@ where
     }
 
     /// Post batch using contract envelope format.
-    async fn do_post(&self, batch: &Batch, hash: &Hash32) -> Result<String, BatcherError> {
+    ///
+    /// Returns the L1 tx ID and idempotency key on success.
+    async fn do_post(
+        &self,
+        batch: &Batch,
+        hash: &Hash32,
+    ) -> Result<ContractPostResult, BatcherError> {
         use l2_core::l1_contract::L1ClientError;
 
         let hub_key = self.hub_key();
@@ -541,9 +547,11 @@ where
         let bridge_result = batch_to_l1_envelope(batch, hash, &prev_hash, &self.config.bridge)
             .map_err(|e| BatcherError::Poster(format!("bridge error: {e}")))?;
 
+        let idempotency_key = bridge_result.idempotency_key_hex.clone();
+
         debug!(
             batch_hash = %hash.to_hex(),
-            idempotency_key = %bridge_result.idempotency_key_hex,
+            idempotency_key = %idempotency_key,
             prev_batch_hash = %prev_hash.to_hex(),
             hub = %hub_key,
             chain_id = chain_id,
@@ -575,20 +583,38 @@ where
         // This is updated on successful submit_batch response (MVP policy)
         self.storage.set_last_batch_hash(&hub_key, chain_id, hash)?;
 
+        // Determine the L1 tx ID
+        let l1_tx_id = result
+            .l1_tx_id
+            .map(|id| id.0)
+            .unwrap_or_else(|| idempotency_key.clone());
+
         info!(
             batch_hash = %hash.to_hex(),
+            l1_tx_id = %l1_tx_id,
             hub = %hub_key,
             chain_id = chain_id,
             already_known = result.already_known,
             "batch chaining updated (prev_batch_hash set)"
         );
 
-        // Return the L1 tx ID if available
-        Ok(result
-            .l1_tx_id
-            .map(|id| id.0)
-            .unwrap_or_else(|| bridge_result.idempotency_key_hex))
+        Ok(ContractPostResult {
+            l1_tx_id,
+            idempotency_key,
+            already_known: result.already_known,
+        })
     }
+}
+
+/// Result of a successful contract batch post.
+#[derive(Debug, Clone)]
+struct ContractPostResult {
+    /// L1 transaction ID.
+    l1_tx_id: String,
+    /// Idempotency key (hex).
+    idempotency_key: String,
+    /// Whether L1 responded with AlreadyKnown.
+    already_known: bool,
 }
 
 #[async_trait]
@@ -597,15 +623,35 @@ where
     C: AsyncL1Client + Send + Sync,
 {
     async fn post_batch(&self, batch: &Batch, hash: &Hash32) -> Result<(), BatcherError> {
-        // Idempotency check
+        // Idempotency check using posting state
         if !self.should_post(hash)? {
             info!(hash = %hash.to_hex(), "batch already posted (contract), skipping");
             return Ok(());
         }
 
-        // Mark as pending
+        // Also check settlement state - if already Submitted or later, don't re-submit
+        // This ensures crash recovery doesn't cause duplicate submissions
+        if let Some(settlement_state) = self.storage.get_settlement_state(hash)? {
+            if !settlement_state.is_created() {
+                info!(
+                    hash = %hash.to_hex(),
+                    state = %settlement_state,
+                    "batch already in settlement lifecycle, skipping submission"
+                );
+                return Ok(());
+            }
+        }
+
+        let ts_now = now_ms();
+
+        // Mark as pending (legacy posting state)
         self.storage
-            .set_posting_state(hash, &PostingState::pending(now_ms()))?;
+            .set_posting_state(hash, &PostingState::pending(ts_now))?;
+
+        // Set settlement state to Created (start of lifecycle)
+        // Use unchecked to allow starting fresh if no state exists
+        self.storage
+            .set_settlement_state_unchecked(hash, &SettlementState::created(ts_now))?;
 
         // Attempt posting with bounded retries
         let mut last_error: Option<String> = None;
@@ -613,14 +659,34 @@ where
 
         while retry_count <= self.config.max_retries {
             match self.do_post(batch, hash).await {
-                Ok(l1_tx) => {
+                Ok(post_result) => {
+                    let ts_submitted = now_ms();
+
                     info!(
                         hash = %hash.to_hex(),
-                        l1_tx = %l1_tx,
+                        l1_tx_id = %post_result.l1_tx_id,
+                        idempotency_key = %post_result.idempotency_key,
+                        already_known = post_result.already_known,
                         "batch posted successfully via contract envelope"
                     );
-                    self.storage
-                        .set_posting_state(hash, &PostingState::posted(l1_tx, now_ms()))?;
+
+                    // Update legacy posting state
+                    self.storage.set_posting_state(
+                        hash,
+                        &PostingState::posted(post_result.l1_tx_id.clone(), ts_submitted),
+                    )?;
+
+                    // Update settlement state to Submitted
+                    // This transition is valid: Created -> Submitted
+                    self.storage.set_settlement_state(
+                        hash,
+                        &SettlementState::submitted(
+                            post_result.l1_tx_id,
+                            ts_submitted,
+                            post_result.idempotency_key,
+                        ),
+                    )?;
+
                     return Ok(());
                 }
                 Err(err) => {
@@ -645,18 +711,31 @@ where
             }
         }
 
-        // All retries exhausted
+        // All retries exhausted - mark as failed
         let reason = last_error.unwrap_or_else(|| "unknown error".to_string());
+        let ts_failed = now_ms();
+
         error!(
             hash = %hash.to_hex(),
             retries = retry_count,
             reason = %reason,
             "contract batch posting failed after all retries"
         );
+
+        // Update legacy posting state
         self.storage.set_posting_state(
             hash,
-            &PostingState::failed(reason.clone(), now_ms(), retry_count),
+            &PostingState::failed(reason.clone(), ts_failed, retry_count),
         )?;
+
+        // Update settlement state to Failed
+        // Get current state for the last_state field
+        let current_state = self.storage.get_settlement_state(hash)?;
+        self.storage.set_settlement_state(
+            hash,
+            &SettlementState::failed(reason.clone(), ts_failed, retry_count, current_state),
+        )?;
+
         Err(BatcherError::Poster(reason))
     }
 }

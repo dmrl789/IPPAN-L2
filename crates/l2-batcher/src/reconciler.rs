@@ -733,4 +733,235 @@ mod tests {
         assert_eq!(summary.oldest_submitted_ms, Some(now - 1000));
         assert_eq!(summary.oldest_included_ms, Some(now - 200));
     }
+
+    // ========== Restart Safety Tests ==========
+
+    /// Test: Restart with Submitted state progresses to Included/Finalised without re-submitting.
+    ///
+    /// This test simulates a crash recovery scenario where:
+    /// 1. A batch was submitted before crash
+    /// 2. On restart, the reconciler picks it up from storage
+    /// 3. The reconciler queries L1 and advances the state
+    /// 4. No duplicate submission occurs
+    #[tokio::test]
+    async fn restart_safety_no_resubmit() {
+        let storage = test_storage();
+        let config = SettlementReconcilerConfig::default();
+        let l1_client: Option<TestL1Client> = None;
+
+        // Simulate state from previous session - batch was submitted before crash
+        let hash = Hash32([0xDD; 32]);
+        let old_time = now_ms().saturating_sub(5000); // Submitted 5 seconds ago
+        let submitted =
+            SettlementState::submitted("l1tx_old".to_string(), old_time, "key_old".to_string());
+        storage
+            .set_settlement_state_unchecked(&hash, &submitted)
+            .unwrap();
+
+        // Verify initial state
+        let initial_state = storage.get_settlement_state(&hash).unwrap().unwrap();
+        assert!(initial_state.is_submitted());
+        assert_eq!(initial_state.l1_tx_id(), Some("l1tx_old"));
+
+        // Run reconciliation (simulates startup recovery)
+        // In best-effort mode (no L1 client), it will advance the state
+        let result = run_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        // Should have progressed the batch (included + finalised in best-effort mode)
+        assert!(result.included >= 1 || result.finalised >= 1);
+
+        // Verify state advanced to Finalised
+        let final_state = storage.get_settlement_state(&hash).unwrap().unwrap();
+        assert!(
+            final_state.is_finalised(),
+            "expected Finalised, got {}",
+            final_state
+        );
+
+        // Verify the original L1 tx ID is preserved (no re-submission)
+        assert_eq!(final_state.l1_tx_id(), Some("l1tx_old"));
+    }
+
+    /// Test: Multiple batches in different states are all handled correctly on restart.
+    #[tokio::test]
+    async fn restart_safety_multiple_batches() {
+        let storage = test_storage();
+        let config = SettlementReconcilerConfig::default();
+        let l1_client: Option<TestL1Client> = None;
+
+        let now = now_ms();
+
+        // Batch 1: Submitted state
+        let hash1 = Hash32([0xE1; 32]);
+        storage
+            .set_settlement_state_unchecked(
+                &hash1,
+                &SettlementState::submitted("tx1".to_string(), now - 3000, "key1".to_string()),
+            )
+            .unwrap();
+
+        // Batch 2: Included state
+        let hash2 = Hash32([0xE2; 32]);
+        storage
+            .set_settlement_state_unchecked(
+                &hash2,
+                &SettlementState::included("tx2".to_string(), 100, now - 1000, now - 2000),
+            )
+            .unwrap();
+
+        // Batch 3: Already Finalised (should not be touched)
+        let hash3 = Hash32([0xE3; 32]);
+        storage
+            .set_settlement_state_unchecked(
+                &hash3,
+                &SettlementState::finalised("tx3".to_string(), 50, now - 5000, now - 4000),
+            )
+            .unwrap();
+
+        // Run reconciliation
+        let result = run_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        // In best-effort mode: batch1 goes submitted->included->finalised, batch2 goes included->finalised
+        assert_eq!(result.included, 1); // batch1
+        assert_eq!(result.finalised, 2); // batch1 + batch2
+
+        // Verify all in-flight batches reached Finalised
+        assert!(storage
+            .get_settlement_state(&hash1)
+            .unwrap()
+            .unwrap()
+            .is_finalised());
+        assert!(storage
+            .get_settlement_state(&hash2)
+            .unwrap()
+            .unwrap()
+            .is_finalised());
+        assert!(storage
+            .get_settlement_state(&hash3)
+            .unwrap()
+            .unwrap()
+            .is_finalised());
+    }
+
+    /// Test: L1 client errors do not crash the reconciler; state remains unchanged.
+    #[tokio::test]
+    async fn reconciler_handles_l1_errors_gracefully() {
+        let storage = test_storage();
+        let config = SettlementReconcilerConfig::default();
+
+        // Use a mock client that returns inclusion status
+        let mock = MockL1Client::new("testnet");
+        let adapter = BlockingL1ClientAdapter::new(mock);
+        let l1_client = Some(adapter);
+
+        let now = now_ms();
+
+        // Add a submitted batch
+        let hash = Hash32([0xF1; 32]);
+        storage
+            .set_settlement_state_unchecked(
+                &hash,
+                &SettlementState::submitted(
+                    "tx_pending".to_string(),
+                    now - 1000,
+                    // Use a key that won't be found in mock (simulates not-yet-included)
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                ),
+            )
+            .unwrap();
+
+        // Run reconciliation - the mock won't have this batch, so it stays Submitted
+        let result = run_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        // Should not crash, batch stays in-flight
+        assert_eq!(result.included, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.in_flight, 1);
+
+        // State should remain Submitted
+        let state = storage.get_settlement_state(&hash).unwrap().unwrap();
+        assert!(state.is_submitted());
+    }
+
+    /// Test: Scenario A - Full lifecycle Submitted → Included → Finalised
+    ///
+    /// This test verifies the full reconciliation flow using best-effort mode
+    /// (no L1 client), which advances states immediately. This tests the
+    /// state machine transitions work correctly in a single cycle.
+    #[tokio::test]
+    async fn scenario_full_lifecycle_submitted_to_finalised() {
+        let storage = test_storage();
+        let config = SettlementReconcilerConfig::default();
+        let l1_client: Option<TestL1Client> = None;
+
+        // Add a batch in Submitted state
+        let hash = Hash32([0xF2; 32]);
+        let now = now_ms();
+        storage
+            .set_settlement_state_unchecked(
+                &hash,
+                &SettlementState::submitted(
+                    "l1tx_test".to_string(),
+                    now - 1000,
+                    "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_string(),
+                ),
+            )
+            .unwrap();
+
+        // Run reconciliation - in best-effort mode (no L1 client):
+        // 1. Submitted -> Included in phase 1
+        // 2. Included -> Finalised in phase 2 (same cycle)
+        let result = run_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        // Should have included AND finalised in one cycle (best-effort mode)
+        assert_eq!(result.included, 1);
+        assert_eq!(result.finalised, 1);
+
+        // Verify final state is Finalised
+        let state = storage.get_settlement_state(&hash).unwrap().unwrap();
+        assert!(
+            state.is_finalised(),
+            "expected Finalised, got {}",
+            state.name()
+        );
+
+        // Verify original L1 tx ID is preserved
+        assert_eq!(state.l1_tx_id(), Some("l1tx_test"));
+    }
+
+    /// Test: Created batches are NOT processed by reconciler (poster owns them)
+    #[tokio::test]
+    async fn reconciler_ignores_created_batches() {
+        let storage = test_storage();
+        let config = SettlementReconcilerConfig::default();
+        let l1_client: Option<TestL1Client> = None;
+
+        // Add a batch in Created state (not yet submitted)
+        let hash = Hash32([0xF3; 32]);
+        storage
+            .set_settlement_state_unchecked(&hash, &SettlementState::created(now_ms() - 1000))
+            .unwrap();
+
+        // Run reconciliation
+        let result = run_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        // Created batches are not in the reconciler's scope
+        assert_eq!(result.included, 0);
+        assert_eq!(result.finalised, 0);
+        assert_eq!(result.in_flight, 0);
+
+        // State should remain Created (poster will handle it)
+        let state = storage.get_settlement_state(&hash).unwrap().unwrap();
+        assert!(state.is_created());
+    }
 }
