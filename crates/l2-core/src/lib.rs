@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod batch_envelope;
 pub mod canonical;
+pub mod fees;
 pub mod finality;
 pub mod forced_inclusion;
 pub mod hub_linkage;

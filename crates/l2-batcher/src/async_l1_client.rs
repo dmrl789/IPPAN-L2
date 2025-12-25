@@ -12,6 +12,28 @@ use l2_core::l1_contract::{
 };
 use std::sync::Arc;
 
+/// Status of a batch submission for reconciliation.
+#[derive(Debug, Clone, Default)]
+pub struct BatchStatus {
+    /// Whether the batch is included in an L1 block.
+    pub included: bool,
+    /// L1 transaction ID if known.
+    pub l1_tx_id: Option<String>,
+    /// L1 block number where included.
+    pub l1_block: Option<u64>,
+    /// IPPAN network timestamp.
+    pub ippan_time: Option<u64>,
+}
+
+/// Finality status for an L1 block.
+#[derive(Debug, Clone, Default)]
+pub struct FinalityStatus {
+    /// Number of confirmations (blocks since inclusion).
+    pub confirmations: u64,
+    /// Whether finality has been reached.
+    pub finalized: bool,
+}
+
 /// Async L1 client trait for contract-based batch submission.
 #[async_trait]
 pub trait AsyncL1Client: Send + Sync {
@@ -35,6 +57,57 @@ pub trait AsyncL1Client: Send + Sync {
         &self,
         l1_tx_id: &L1TxId,
     ) -> Result<Option<L1InclusionProof>, L1ClientError>;
+
+    /// Get batch status for reconciliation (higher-level API).
+    ///
+    /// This method queries L1 by idempotency key and returns a simplified
+    /// status for the reconciler.
+    async fn get_batch_status(&self, idempotency_key: &str) -> Result<BatchStatus, L1ClientError> {
+        // Parse idempotency key
+        let key_bytes = hex::decode(idempotency_key)
+            .map_err(|e| L1ClientError::DecodeError(format!("invalid idempotency key: {e}")))?;
+
+        if key_bytes.len() != 32 {
+            return Err(L1ClientError::DecodeError(
+                "idempotency key must be 32 bytes".to_string(),
+            ));
+        }
+
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(&key_bytes);
+        let key = IdempotencyKey(key_array);
+
+        match self.get_inclusion(&key).await? {
+            Some(proof) => Ok(BatchStatus {
+                included: true,
+                l1_tx_id: Some(proof.l1_tx_id.0),
+                l1_block: Some(proof.height.0),
+                ippan_time: None, // L1InclusionProof doesn't have ippan_time in v1
+            }),
+            None => Ok(BatchStatus::default()),
+        }
+    }
+
+    /// Get finality status for a given L1 block.
+    ///
+    /// This method queries the chain status and computes confirmations.
+    async fn get_finality_status(&self, l1_block: u64) -> Result<FinalityStatus, L1ClientError> {
+        let chain_status = self.chain_status().await?;
+        let current_height = chain_status.height.0;
+
+        if l1_block > current_height {
+            return Ok(FinalityStatus::default());
+        }
+
+        let confirmations = current_height.saturating_sub(l1_block);
+
+        Ok(FinalityStatus {
+            confirmations,
+            finalized: chain_status
+                .finalized_height
+                .is_some_and(|fh| l1_block <= fh.0),
+        })
+    }
 }
 
 /// Blocking-to-async adapter for L1Client implementations.

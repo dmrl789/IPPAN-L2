@@ -7,6 +7,13 @@
 #![deny(clippy::cast_sign_loss)]
 #![deny(clippy::disallowed_types)]
 
+//! Sled-backed storage for IPPAN L2 node.
+//!
+//! This crate provides persistent storage for batches, transactions, and
+//! settlement state. All operations are crash-safe and atomic.
+
+pub mod settlement;
+
 use std::path::Path;
 
 use l2_core::forced_inclusion::{ForcedInclusionStatus, InclusionTicket};
@@ -16,7 +23,12 @@ use sled::Tree;
 use thiserror::Error;
 use tracing::info;
 
-pub const SCHEMA_VERSION: &str = "2";
+pub use settlement::{
+    validate_transition, SettlementState, SettlementStateCounts, SettlementStateEntry,
+    SettlementTransitionError,
+};
+
+pub const SCHEMA_VERSION: &str = "3";
 const META_SCHEMA_KEY: &[u8] = b"schema_version";
 
 #[derive(Debug, Error)]
@@ -254,6 +266,8 @@ pub struct Storage {
     receipts: Tree,
     meta: Tree,
     posting_state: Tree,
+    /// Settlement state machine (batch_hash -> SettlementState).
+    settlement_state: Tree,
     /// Forced inclusion queue (tx_hash -> InclusionTicket).
     forced_queue: Tree,
     /// Bridge deposits (deposit_id -> DepositEvent).
@@ -272,6 +286,7 @@ impl Storage {
         let receipts = db.open_tree("receipts")?;
         let meta = db.open_tree("meta")?;
         let posting_state = db.open_tree("posting_state")?;
+        let settlement_state = db.open_tree("settlement_state")?;
         let forced_queue = db.open_tree("forced_queue")?;
         let bridge_deposits = db.open_tree("bridge_deposits")?;
         let bridge_withdrawals = db.open_tree("bridge_withdrawals")?;
@@ -283,6 +298,7 @@ impl Storage {
             receipts,
             meta,
             posting_state,
+            settlement_state,
             forced_queue,
             bridge_deposits,
             bridge_withdrawals,
@@ -663,6 +679,189 @@ impl Storage {
     pub fn clear_last_batch_hash(&self, hub: &str, chain_id: u64) -> Result<bool, StorageError> {
         let key = format!("last_batch_hash:{}:{}", hub, chain_id);
         Ok(self.meta.remove(key.as_bytes())?.is_some())
+    }
+
+    // ========== Settlement State APIs ==========
+
+    /// Set the settlement state for a batch.
+    ///
+    /// This validates the transition from the current state (if any) and persists
+    /// the new state atomically.
+    pub fn set_settlement_state(
+        &self,
+        batch_hash: &Hash32,
+        state: &SettlementState,
+    ) -> Result<(), StorageError> {
+        // Check for valid transition if state already exists
+        if let Some(current) = self.get_settlement_state(batch_hash)? {
+            validate_transition(&current, state).map_err(|e| {
+                StorageError::Canonical(l2_core::CanonicalError::FromHex(e.to_string()))
+            })?;
+        }
+
+        let bytes = canonical_encode(state)?;
+        self.settlement_state.insert(batch_hash.0, bytes)?;
+        Ok(())
+    }
+
+    /// Set the settlement state without validation.
+    ///
+    /// Use only for crash recovery or tests. Normal code should use `set_settlement_state`.
+    pub fn set_settlement_state_unchecked(
+        &self,
+        batch_hash: &Hash32,
+        state: &SettlementState,
+    ) -> Result<(), StorageError> {
+        let bytes = canonical_encode(state)?;
+        self.settlement_state.insert(batch_hash.0, bytes)?;
+        Ok(())
+    }
+
+    /// Get the settlement state for a batch.
+    pub fn get_settlement_state(
+        &self,
+        batch_hash: &Hash32,
+    ) -> Result<Option<SettlementState>, StorageError> {
+        self.settlement_state
+            .get(batch_hash.0)
+            .map(|opt| opt.map(|ivec| canonical_decode(&ivec)))?
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Delete settlement state for a batch (used in cleanup).
+    pub fn delete_settlement_state(&self, batch_hash: &Hash32) -> Result<bool, StorageError> {
+        let existed = self.settlement_state.remove(batch_hash.0)?.is_some();
+        Ok(existed)
+    }
+
+    /// List batches in Created state.
+    ///
+    /// Returns up to `limit` entries.
+    pub fn list_settlement_created(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SettlementStateEntry>, StorageError> {
+        self.list_settlement_by_predicate(limit, |s| s.is_created())
+    }
+
+    /// List batches in Submitted state (awaiting inclusion).
+    ///
+    /// Returns up to `limit` entries.
+    pub fn list_settlement_submitted(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SettlementStateEntry>, StorageError> {
+        self.list_settlement_by_predicate(limit, |s| s.is_submitted())
+    }
+
+    /// List batches in Included state (awaiting finality).
+    ///
+    /// Returns up to `limit` entries.
+    pub fn list_settlement_included(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SettlementStateEntry>, StorageError> {
+        self.list_settlement_by_predicate(limit, |s| s.is_included())
+    }
+
+    /// List batches needing reconciliation (Submitted or Included).
+    ///
+    /// Returns up to `limit` entries.
+    pub fn list_settlement_needs_reconciliation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SettlementStateEntry>, StorageError> {
+        self.list_settlement_by_predicate(limit, |s| s.needs_reconciliation())
+    }
+
+    /// Count batches by settlement state.
+    pub fn count_settlement_states(&self) -> Result<SettlementStateCounts, StorageError> {
+        let mut counts = SettlementStateCounts::default();
+        for result in self.settlement_state.iter() {
+            let (_key, value) = result?;
+            let state: SettlementState = canonical_decode(&value)?;
+            match state {
+                SettlementState::Created { .. } => counts.created += 1,
+                SettlementState::Submitted { .. } => counts.submitted += 1,
+                SettlementState::Included { .. } => counts.included += 1,
+                SettlementState::Finalised { .. } => counts.finalised += 1,
+                SettlementState::Failed { .. } => counts.failed += 1,
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Get the last finalised batch hash and timestamp for a given hub and chain.
+    ///
+    /// Returns (batch_hash, finalised_at_ms) or None if no finalised batches exist.
+    pub fn get_last_finalised_batch(
+        &self,
+        hub: &str,
+        chain_id: u64,
+    ) -> Result<Option<(Hash32, u64)>, StorageError> {
+        let key = format!("last_finalised_batch:{}:{}", hub, chain_id);
+        match self.meta.get(key.as_bytes())? {
+            Some(ivec) => {
+                // Format: 32 bytes hash + 8 bytes timestamp
+                if ivec.len() != 40 {
+                    return Err(StorageError::Canonical(l2_core::CanonicalError::FromHex(
+                        "invalid last_finalised_batch format".to_string(),
+                    )));
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&ivec[0..32]);
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&ivec[32..40]);
+                let timestamp = u64::from_le_bytes(ts_bytes);
+                Ok(Some((Hash32(hash), timestamp)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set the last finalised batch for a given hub and chain.
+    pub fn set_last_finalised_batch(
+        &self,
+        hub: &str,
+        chain_id: u64,
+        batch_hash: &Hash32,
+        finalised_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let key = format!("last_finalised_batch:{}:{}", hub, chain_id);
+        let mut value = Vec::with_capacity(40);
+        value.extend_from_slice(&batch_hash.0);
+        value.extend_from_slice(&finalised_at_ms.to_le_bytes());
+        self.meta.insert(key.as_bytes(), value)?;
+        Ok(())
+    }
+
+    /// Internal helper: list settlement entries by predicate.
+    fn list_settlement_by_predicate<F>(
+        &self,
+        limit: usize,
+        predicate: F,
+    ) -> Result<Vec<SettlementStateEntry>, StorageError>
+    where
+        F: Fn(&SettlementState) -> bool,
+    {
+        let mut entries = Vec::new();
+        for result in self.settlement_state.iter() {
+            if entries.len() >= limit {
+                break;
+            }
+            let (key, value) = result?;
+            let batch_hash = Hash32(key.as_ref().try_into().map_err(|_| {
+                StorageError::Canonical(l2_core::CanonicalError::FromHex(
+                    "invalid batch hash length".to_string(),
+                ))
+            })?);
+            let state: SettlementState = canonical_decode(&value)?;
+            if predicate(&state) {
+                entries.push(SettlementStateEntry { batch_hash, state });
+            }
+        }
+        Ok(entries)
     }
 
     // ========== Audit Log APIs ==========
@@ -1118,5 +1317,310 @@ mod tests {
         // Test list_audit returns all entries
         let entries = storage.list_audit(10).unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    // ========== Settlement State Tests ==========
+
+    #[test]
+    fn settlement_state_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let batch_hash = Hash32([0xAA; 32]);
+        let state = SettlementState::created(1_700_000_000_000);
+
+        storage
+            .set_settlement_state_unchecked(&batch_hash, &state)
+            .expect("set");
+        let loaded = storage
+            .get_settlement_state(&batch_hash)
+            .expect("get")
+            .expect("present");
+
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn settlement_state_valid_transitions() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let batch_hash = Hash32([0xBB; 32]);
+
+        // Start as Created
+        let created = SettlementState::created(1_700_000_000_000);
+        storage
+            .set_settlement_state_unchecked(&batch_hash, &created)
+            .expect("set created");
+        assert!(storage
+            .get_settlement_state(&batch_hash)
+            .unwrap()
+            .unwrap()
+            .is_created());
+
+        // Transition to Submitted
+        let submitted = SettlementState::submitted(
+            "l1tx123".to_string(),
+            1_700_000_001_000,
+            "key1".to_string(),
+        );
+        storage
+            .set_settlement_state(&batch_hash, &submitted)
+            .expect("set submitted");
+        let loaded = storage.get_settlement_state(&batch_hash).unwrap().unwrap();
+        assert!(loaded.is_submitted());
+        assert_eq!(loaded.l1_tx_id(), Some("l1tx123"));
+
+        // Transition to Included
+        let included = SettlementState::included(
+            "l1tx123".to_string(),
+            100,
+            1_700_000_002_000,
+            1_700_000_002_500,
+        );
+        storage
+            .set_settlement_state(&batch_hash, &included)
+            .expect("set included");
+        let loaded = storage.get_settlement_state(&batch_hash).unwrap().unwrap();
+        assert!(loaded.is_included());
+        assert_eq!(loaded.l1_block(), Some(100));
+
+        // Transition to Finalised
+        let finalised = SettlementState::finalised(
+            "l1tx123".to_string(),
+            100,
+            1_700_000_002_000,
+            1_700_000_003_000,
+        );
+        storage
+            .set_settlement_state(&batch_hash, &finalised)
+            .expect("set finalised");
+        let loaded = storage.get_settlement_state(&batch_hash).unwrap().unwrap();
+        assert!(loaded.is_finalised());
+        assert!(loaded.is_terminal());
+    }
+
+    #[test]
+    fn settlement_state_invalid_transition_rejected() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let batch_hash = Hash32([0xCC; 32]);
+
+        // Start as Submitted
+        let submitted =
+            SettlementState::submitted("l1tx".to_string(), 1_700_000_001_000, "key".to_string());
+        storage
+            .set_settlement_state_unchecked(&batch_hash, &submitted)
+            .expect("set");
+
+        // Try to go back to Created - should fail
+        let created = SettlementState::created(1_700_000_000_000);
+        let result = storage.set_settlement_state(&batch_hash, &created);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn settlement_state_cannot_transition_from_terminal() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let batch_hash = Hash32([0xDD; 32]);
+
+        // Start as Finalised (terminal)
+        let finalised = SettlementState::finalised(
+            "l1tx".to_string(),
+            100,
+            1_700_000_002_000,
+            1_700_000_003_000,
+        );
+        storage
+            .set_settlement_state_unchecked(&batch_hash, &finalised)
+            .expect("set");
+
+        // Try any transition - should fail
+        let created = SettlementState::created(1_700_000_000_000);
+        let result = storage.set_settlement_state(&batch_hash, &created);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn settlement_state_can_fail_from_any_state() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let batch_hash = Hash32([0xEE; 32]);
+
+        // Start as Submitted
+        let submitted =
+            SettlementState::submitted("l1tx".to_string(), 1_700_000_001_000, "key".to_string());
+        storage
+            .set_settlement_state_unchecked(&batch_hash, &submitted)
+            .expect("set");
+
+        // Transition to Failed - should succeed
+        let failed =
+            SettlementState::failed("network timeout".to_string(), 1_700_000_002_000, 3, None);
+        storage
+            .set_settlement_state(&batch_hash, &failed)
+            .expect("set failed");
+
+        let loaded = storage.get_settlement_state(&batch_hash).unwrap().unwrap();
+        assert!(loaded.is_failed());
+        assert!(loaded.is_terminal());
+    }
+
+    #[test]
+    fn list_settlement_by_state() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Add batches in different states
+        let hash1 = Hash32([0x01; 32]);
+        let hash2 = Hash32([0x02; 32]);
+        let hash3 = Hash32([0x03; 32]);
+        let hash4 = Hash32([0x04; 32]);
+
+        storage
+            .set_settlement_state_unchecked(&hash1, &SettlementState::created(1000))
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &hash2,
+                &SettlementState::submitted("tx2".to_string(), 2000, "key2".to_string()),
+            )
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &hash3,
+                &SettlementState::included("tx3".to_string(), 100, 3000, 3001),
+            )
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &hash4,
+                &SettlementState::finalised("tx4".to_string(), 200, 4000, 4001),
+            )
+            .unwrap();
+
+        // Test list methods
+        let created = storage.list_settlement_created(10).unwrap();
+        assert_eq!(created.len(), 1);
+
+        let submitted = storage.list_settlement_submitted(10).unwrap();
+        assert_eq!(submitted.len(), 1);
+
+        let included = storage.list_settlement_included(10).unwrap();
+        assert_eq!(included.len(), 1);
+
+        let needs_reconciliation = storage.list_settlement_needs_reconciliation(10).unwrap();
+        assert_eq!(needs_reconciliation.len(), 2); // Submitted + Included
+    }
+
+    #[test]
+    fn count_settlement_states() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        storage
+            .set_settlement_state_unchecked(&Hash32([0x01; 32]), &SettlementState::created(1000))
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(&Hash32([0x02; 32]), &SettlementState::created(1000))
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &Hash32([0x03; 32]),
+                &SettlementState::submitted("tx".to_string(), 2000, "key".to_string()),
+            )
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &Hash32([0x04; 32]),
+                &SettlementState::included("tx".to_string(), 100, 3000, 3001),
+            )
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &Hash32([0x05; 32]),
+                &SettlementState::finalised("tx".to_string(), 200, 4000, 4001),
+            )
+            .unwrap();
+        storage
+            .set_settlement_state_unchecked(
+                &Hash32([0x06; 32]),
+                &SettlementState::failed("err".to_string(), 5000, 3, None),
+            )
+            .unwrap();
+
+        let counts = storage.count_settlement_states().unwrap();
+        assert_eq!(counts.created, 2);
+        assert_eq!(counts.submitted, 1);
+        assert_eq!(counts.included, 1);
+        assert_eq!(counts.finalised, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.total(), 6);
+        assert_eq!(counts.in_flight(), 4);
+    }
+
+    #[test]
+    fn delete_settlement_state() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let hash = Hash32([0xFF; 32]);
+        storage
+            .set_settlement_state_unchecked(&hash, &SettlementState::created(1000))
+            .unwrap();
+
+        assert!(storage.get_settlement_state(&hash).unwrap().is_some());
+        let deleted = storage.delete_settlement_state(&hash).unwrap();
+        assert!(deleted);
+        assert!(storage.get_settlement_state(&hash).unwrap().is_none());
+
+        // Deleting again returns false
+        let deleted_again = storage.delete_settlement_state(&hash).unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[test]
+    fn last_finalised_batch_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let hub = "fin";
+        let chain_id = 1337u64;
+        let hash = Hash32([0xAB; 32]);
+        let timestamp = 1_700_000_000_000u64;
+
+        // Initially none
+        assert!(storage
+            .get_last_finalised_batch(hub, chain_id)
+            .unwrap()
+            .is_none());
+
+        // Set and retrieve
+        storage
+            .set_last_finalised_batch(hub, chain_id, &hash, timestamp)
+            .unwrap();
+        let (loaded_hash, loaded_ts) = storage
+            .get_last_finalised_batch(hub, chain_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_hash, hash);
+        assert_eq!(loaded_ts, timestamp);
+
+        // Update to new hash
+        let hash2 = Hash32([0xCD; 32]);
+        let timestamp2 = 1_700_000_001_000u64;
+        storage
+            .set_last_finalised_batch(hub, chain_id, &hash2, timestamp2)
+            .unwrap();
+        let (loaded_hash, loaded_ts) = storage
+            .get_last_finalised_batch(hub, chain_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_hash, hash2);
+        assert_eq!(loaded_ts, timestamp2);
     }
 }

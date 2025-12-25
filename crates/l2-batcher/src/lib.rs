@@ -31,6 +31,7 @@
 
 pub mod async_l1_client;
 pub mod contract_bridge;
+pub mod reconciler;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,12 +47,17 @@ use tokio::time::{timeout, Instant};
 use tracing::{debug, error, info, warn};
 
 // Re-exports for convenience
-pub use async_l1_client::{AsyncL1Client, BlockingL1ClientAdapter};
+pub use async_l1_client::{AsyncL1Client, BatchStatus, BlockingL1ClientAdapter, FinalityStatus};
 pub use contract_bridge::{
     batch_envelope_payload_bytes, batch_envelope_to_l1_envelope, batch_to_l1_envelope,
     get_prev_batch_hash, BridgeConfig, BridgeError, BridgeResult, ContentType,
     BATCH_ENVELOPE_CONTENT_TYPE_BINARY, BATCH_ENVELOPE_CONTENT_TYPE_JSON,
     BATCH_ENVELOPE_SCHEMA_VERSION, MAX_PAYLOAD_SIZE,
+};
+pub use reconciler::{
+    get_in_flight_summary, get_settlement_counts, spawn_settlement_reconciler, InFlightSummary,
+    ReconcileCycleResult, ReconcilerMetrics, SettlementReconcilerConfig,
+    SettlementReconcilerHandle,
 };
 
 #[derive(Debug, Clone)]
