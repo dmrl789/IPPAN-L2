@@ -114,10 +114,12 @@ mod implementation {
             // We need to skip to field 5 (receiptsRoot)
 
             for i in 0..6 {
-                let field_header = RlpHeader::decode(&mut buf)
-                    .map_err(|e| EthMerkleVerifyError::HeaderDecodeFailed(
-                        format!("failed to decode field {}: {}", i, e)
-                    ))?;
+                let field_header = RlpHeader::decode(&mut buf).map_err(|e| {
+                    EthMerkleVerifyError::HeaderDecodeFailed(format!(
+                        "failed to decode field {}: {}",
+                        i, e
+                    ))
+                })?;
 
                 if i == 5 {
                     // This is receiptsRoot
@@ -128,9 +130,10 @@ mod implementation {
                     }
                     let payload_len = field_header.payload_length;
                     if payload_len != 32 {
-                        return Err(EthMerkleVerifyError::HeaderDecodeFailed(
-                            format!("receiptsRoot should be 32 bytes, got {}", payload_len),
-                        ));
+                        return Err(EthMerkleVerifyError::HeaderDecodeFailed(format!(
+                            "receiptsRoot should be 32 bytes, got {}",
+                            payload_len
+                        )));
                     }
                     if buf.len() < 32 {
                         return Err(EthMerkleVerifyError::HeaderDecodeFailed(
@@ -194,31 +197,36 @@ mod implementation {
             }
 
             // Skip status (field 0)
-            let field0 = RlpHeader::decode(&mut buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode status: {}", e)
-                ))?;
+            let field0 = RlpHeader::decode(&mut buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!("failed to decode status: {}", e))
+            })?;
             buf.advance(field0.payload_length);
 
             // Skip cumulativeGasUsed (field 1)
-            let field1 = RlpHeader::decode(&mut buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode cumulativeGasUsed: {}", e)
-                ))?;
+            let field1 = RlpHeader::decode(&mut buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "failed to decode cumulativeGasUsed: {}",
+                    e
+                ))
+            })?;
             buf.advance(field1.payload_length);
 
             // Skip logsBloom (field 2)
-            let field2 = RlpHeader::decode(&mut buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode logsBloom: {}", e)
-                ))?;
+            let field2 = RlpHeader::decode(&mut buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "failed to decode logsBloom: {}",
+                    e
+                ))
+            })?;
             buf.advance(field2.payload_length);
 
             // Decode logs (field 3)
-            let logs_header = RlpHeader::decode(&mut buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode logs list: {}", e)
-                ))?;
+            let logs_header = RlpHeader::decode(&mut buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "failed to decode logs list: {}",
+                    e
+                ))
+            })?;
 
             if !logs_header.list {
                 return Err(EthMerkleVerifyError::ReceiptDecodeFailed(
@@ -239,10 +247,12 @@ mod implementation {
 
         fn decode_log(buf: &mut &[u8]) -> Result<Log, EthMerkleVerifyError> {
             // Log: [address, topics, data]
-            let header = RlpHeader::decode(buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode log list: {}", e)
-                ))?;
+            let header = RlpHeader::decode(buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "failed to decode log list: {}",
+                    e
+                ))
+            })?;
 
             if !header.list {
                 return Err(EthMerkleVerifyError::ReceiptDecodeFailed(
@@ -251,15 +261,18 @@ mod implementation {
             }
 
             // Decode address (field 0)
-            let addr_header = RlpHeader::decode(buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode address: {}", e)
-                ))?;
+            let addr_header = RlpHeader::decode(buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "failed to decode address: {}",
+                    e
+                ))
+            })?;
 
             if addr_header.payload_length != 20 {
-                return Err(EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("address should be 20 bytes, got {}", addr_header.payload_length),
-                ));
+                return Err(EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "address should be 20 bytes, got {}",
+                    addr_header.payload_length
+                )));
             }
 
             let mut address = [0u8; 20];
@@ -267,10 +280,12 @@ mod implementation {
             buf.advance(20);
 
             // Decode topics (field 1)
-            let topics_header = RlpHeader::decode(buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode topics list: {}", e)
-                ))?;
+            let topics_header = RlpHeader::decode(buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                    "failed to decode topics list: {}",
+                    e
+                ))
+            })?;
 
             if !topics_header.list {
                 return Err(EthMerkleVerifyError::ReceiptDecodeFailed(
@@ -281,15 +296,18 @@ mod implementation {
             let mut topics = Vec::new();
             let topics_end = buf.len() - topics_header.payload_length;
             while buf.len() > topics_end {
-                let topic_header = RlpHeader::decode(buf)
-                    .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                        format!("failed to decode topic: {}", e)
-                    ))?;
+                let topic_header = RlpHeader::decode(buf).map_err(|e| {
+                    EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                        "failed to decode topic: {}",
+                        e
+                    ))
+                })?;
 
                 if topic_header.payload_length != 32 {
-                    return Err(EthMerkleVerifyError::ReceiptDecodeFailed(
-                        format!("topic should be 32 bytes, got {}", topic_header.payload_length),
-                    ));
+                    return Err(EthMerkleVerifyError::ReceiptDecodeFailed(format!(
+                        "topic should be 32 bytes, got {}",
+                        topic_header.payload_length
+                    )));
                 }
 
                 let mut topic = [0u8; 32];
@@ -299,10 +317,9 @@ mod implementation {
             }
 
             // Decode data (field 2)
-            let data_header = RlpHeader::decode(buf)
-                .map_err(|e| EthMerkleVerifyError::ReceiptDecodeFailed(
-                    format!("failed to decode data: {}", e)
-                ))?;
+            let data_header = RlpHeader::decode(buf).map_err(|e| {
+                EthMerkleVerifyError::ReceiptDecodeFailed(format!("failed to decode data: {}", e))
+            })?;
 
             let data = buf[..data_header.payload_length].to_vec();
             buf.advance(data_header.payload_length);
@@ -391,15 +408,18 @@ mod implementation {
 
             // Decode the node
             let mut buf = node.as_slice();
-            let header = RlpHeader::decode(&mut buf)
-                .map_err(|e| EthMerkleVerifyError::MptProofFailed(
-                    format!("failed to decode node {}: {}", node_idx, e)
-                ))?;
+            let header = RlpHeader::decode(&mut buf).map_err(|e| {
+                EthMerkleVerifyError::MptProofFailed(format!(
+                    "failed to decode node {}: {}",
+                    node_idx, e
+                ))
+            })?;
 
             if !header.list {
-                return Err(EthMerkleVerifyError::MptProofFailed(
-                    format!("node {} is not a list", node_idx)
-                ));
+                return Err(EthMerkleVerifyError::MptProofFailed(format!(
+                    "node {} is not a list",
+                    node_idx
+                )));
             }
 
             // Count elements to determine node type
@@ -407,10 +427,12 @@ mod implementation {
             let mut element_count = 0;
             let end_pos = buf.len() - header.payload_length;
             while temp_buf.len() > end_pos {
-                let elem_header = RlpHeader::decode(&mut temp_buf)
-                    .map_err(|e| EthMerkleVerifyError::MptProofFailed(
-                        format!("failed to count elements in node {}: {}", node_idx, e)
-                    ))?;
+                let elem_header = RlpHeader::decode(&mut temp_buf).map_err(|e| {
+                    EthMerkleVerifyError::MptProofFailed(format!(
+                        "failed to count elements in node {}: {}",
+                        node_idx, e
+                    ))
+                })?;
                 temp_buf.advance(elem_header.payload_length);
                 element_count += 1;
             }
@@ -421,10 +443,12 @@ mod implementation {
                 let mut value_field = Vec::new();
 
                 for i in 0..17 {
-                    let child_header = RlpHeader::decode(&mut buf)
-                        .map_err(|e| EthMerkleVerifyError::MptProofFailed(
-                            format!("failed to decode branch child {}: {}", i, e)
-                        ))?;
+                    let child_header = RlpHeader::decode(&mut buf).map_err(|e| {
+                        EthMerkleVerifyError::MptProofFailed(format!(
+                            "failed to decode branch child {}: {}",
+                            i, e
+                        ))
+                    })?;
 
                     let child_data = &buf[..child_header.payload_length];
                     if i < 16 {
@@ -442,7 +466,7 @@ mod implementation {
                         return Ok(());
                     } else {
                         return Err(EthMerkleVerifyError::MptProofFailed(
-                            "value mismatch at branch node".to_string()
+                            "value mismatch at branch node".to_string(),
                         ));
                     }
                 }
@@ -454,7 +478,7 @@ mod implementation {
                 let child = &children[nibble];
                 if child.is_empty() {
                     return Err(EthMerkleVerifyError::MptProofFailed(
-                        "empty child in branch node".to_string()
+                        "empty child in branch node".to_string(),
                     ));
                 }
 
@@ -469,18 +493,16 @@ mod implementation {
                 }
             } else if element_count == 2 {
                 // Extension or leaf node
-                let path_header = RlpHeader::decode(&mut buf)
-                    .map_err(|e| EthMerkleVerifyError::MptProofFailed(
-                        format!("failed to decode path: {}", e)
-                    ))?;
+                let path_header = RlpHeader::decode(&mut buf).map_err(|e| {
+                    EthMerkleVerifyError::MptProofFailed(format!("failed to decode path: {}", e))
+                })?;
 
                 let path_bytes = &buf[..path_header.payload_length];
                 buf.advance(path_header.payload_length);
 
-                let value_header = RlpHeader::decode(&mut buf)
-                    .map_err(|e| EthMerkleVerifyError::MptProofFailed(
-                        format!("failed to decode value: {}", e)
-                    ))?;
+                let value_header = RlpHeader::decode(&mut buf).map_err(|e| {
+                    EthMerkleVerifyError::MptProofFailed(format!("failed to decode value: {}", e))
+                })?;
 
                 let value_data = &buf[..value_header.payload_length];
                 buf.advance(value_header.payload_length);
@@ -493,12 +515,10 @@ mod implementation {
                 if is_leaf {
                     // Leaf node - path should match remaining key exactly
                     if path_nibbles != remaining_key {
-                        return Err(EthMerkleVerifyError::MptProofFailed(
-                            format!(
-                                "leaf path mismatch: expected {:?}, got {:?}",
-                                remaining_key, path_nibbles
-                            )
-                        ));
+                        return Err(EthMerkleVerifyError::MptProofFailed(format!(
+                            "leaf path mismatch: expected {:?}, got {:?}",
+                            remaining_key, path_nibbles
+                        )));
                     }
 
                     // Value should match
@@ -506,24 +526,23 @@ mod implementation {
                         return Ok(());
                     } else {
                         return Err(EthMerkleVerifyError::MptProofFailed(
-                            "value mismatch at leaf node".to_string()
+                            "value mismatch at leaf node".to_string(),
                         ));
                     }
                 } else {
                     // Extension node - path is a prefix of remaining key
                     if remaining_key.len() < path_nibbles.len() {
                         return Err(EthMerkleVerifyError::MptProofFailed(
-                            "extension path longer than remaining key".to_string()
+                            "extension path longer than remaining key".to_string(),
                         ));
                     }
 
                     if &remaining_key[..path_nibbles.len()] != path_nibbles.as_slice() {
-                        return Err(EthMerkleVerifyError::MptProofFailed(
-                            format!(
-                                "extension path mismatch: expected prefix {:?}, got {:?}",
-                                &remaining_key[..path_nibbles.len()], path_nibbles
-                            )
-                        ));
+                        return Err(EthMerkleVerifyError::MptProofFailed(format!(
+                            "extension path mismatch: expected prefix {:?}, got {:?}",
+                            &remaining_key[..path_nibbles.len()],
+                            path_nibbles
+                        )));
                     }
 
                     key_idx += path_nibbles.len();
@@ -537,14 +556,15 @@ mod implementation {
                     }
                 }
             } else {
-                return Err(EthMerkleVerifyError::MptProofFailed(
-                    format!("invalid node element count: {}", element_count)
-                ));
+                return Err(EthMerkleVerifyError::MptProofFailed(format!(
+                    "invalid node element count: {}",
+                    element_count
+                )));
             }
         }
 
         Err(EthMerkleVerifyError::MptProofFailed(
-            "proof ended before reaching value".to_string()
+            "proof ended before reaching value".to_string(),
         ))
     }
 
@@ -721,7 +741,10 @@ mod tests {
     fn test_bytes_to_nibbles() {
         use implementation::bytes_to_nibbles;
 
-        assert_eq!(bytes_to_nibbles(&[0xab, 0xcd]), vec![0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(
+            bytes_to_nibbles(&[0xab, 0xcd]),
+            vec![0x0a, 0x0b, 0x0c, 0x0d]
+        );
         assert_eq!(bytes_to_nibbles(&[0x00]), vec![0x00, 0x00]);
         assert_eq!(bytes_to_nibbles(&[0xff]), vec![0x0f, 0x0f]);
     }

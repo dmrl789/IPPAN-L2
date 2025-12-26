@@ -288,7 +288,6 @@ pub struct SubmitProofRequest {
     pub signature: Option<String>,
 
     // ========== Merkle proof fields ==========
-
     /// Transaction index in block (merkle proof only).
     #[serde(default)]
     pub tx_index: Option<u32>,
@@ -645,9 +644,8 @@ fn parse_hex_64(s: &str, field: &str) -> Result<[u8; 64], ExternalProofApiError>
 
 fn parse_hex_vec(s: &str, field: &str) -> Result<Vec<u8>, ExternalProofApiError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(s).map_err(|e| {
-        ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e))
-    })
+    hex::decode(s)
+        .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e)))
 }
 
 #[cfg(test)]

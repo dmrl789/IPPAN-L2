@@ -1329,13 +1329,19 @@ mod tests {
     #[test]
     fn attestation_verification_mode() {
         let attestation = test_attestation();
-        assert_eq!(attestation.verification_mode(), VerificationMode::Attestation);
+        assert_eq!(
+            attestation.verification_mode(),
+            VerificationMode::Attestation
+        );
     }
 
     #[test]
     fn merkle_proof_verification_mode() {
         let proof = test_merkle_proof();
-        assert_eq!(proof.verification_mode(), VerificationMode::EthMerkleReceiptProof);
+        assert_eq!(
+            proof.verification_mode(),
+            VerificationMode::EthMerkleReceiptProof
+        );
     }
 
     #[test]
@@ -1346,7 +1352,10 @@ mod tests {
 
         let merkle_proof = test_merkle_proof();
         let proof = ExternalEventProofV1::EthReceiptMerkleProofV1(merkle_proof);
-        assert_eq!(proof.verification_mode(), VerificationMode::EthMerkleReceiptProof);
+        assert_eq!(
+            proof.verification_mode(),
+            VerificationMode::EthMerkleReceiptProof
+        );
     }
 
     // ========== Additional Accessor Tests ==========
