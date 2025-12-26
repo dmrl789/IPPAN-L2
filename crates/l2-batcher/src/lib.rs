@@ -32,6 +32,7 @@
 pub mod async_l1_client;
 pub mod contract_bridge;
 pub mod gbdt_organiser;
+pub mod gbdt_organiser_v2;
 pub mod reconciler;
 
 use std::sync::Arc;
@@ -58,6 +59,9 @@ pub use contract_bridge::{
     BATCH_ENVELOPE_SCHEMA_VERSION, MAX_PAYLOAD_SIZE,
 };
 pub use gbdt_organiser::{GbdtOrganiserConfig, GbdtOrganiserV1};
+pub use gbdt_organiser_v2::{
+    GbdtOrganiserV2, GbdtOrganiserV2Config, NoopOrganiserV2, OrganiserV2, OrganiserVersionV2,
+};
 // Re-export organiser types from l2-core for convenience
 pub use l2_core::{
     NoopOrganiser, Organiser, OrganiserDecision, OrganiserInputs, OrganiserPolicyBounds,
@@ -68,8 +72,6 @@ pub use reconciler::{
     ReconcileCycleResult, ReconcilerMetrics, SettlementReconcilerConfig,
     SettlementReconcilerHandle,
 };
-
-// Multi-hub exports will be defined after the structures are defined below
 
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
