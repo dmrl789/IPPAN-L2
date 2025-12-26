@@ -9,7 +9,33 @@
 
 //! IPPAN L2 Bridge Module
 //!
-//! This module handles deposits (L1 → L2) and withdrawals (L2 → L1).
+//! This module handles deposits (L1 → L2), withdrawals (L2 → L1),
+//! and cross-hub intent coordination for atomic operations.
+
+pub mod intent_api;
+pub mod intent_metrics;
+pub mod intent_reconciler;
+pub mod intents;
+
+pub use intent_api::{
+    AbortIntentRequest, AbortIntentResponse, CommitIntentResponse, CreateIntentRequest,
+    CreateIntentResponse, IntentApi, IntentApiError, IntentCountsResponse, IntentListItem,
+    IntentStatusResponse, ListIntentsQuery, ListIntentsResponse, PrepareIntentResponse,
+};
+pub use intent_metrics::{
+    Counter, IntentHealthStatus, IntentMetrics, IntentMetricsSnapshot, InvariantSeverity,
+    InvariantViolation,
+};
+pub use intent_reconciler::{
+    get_intent_pending_summary, spawn_intent_reconciler, IntentBatchTracker,
+    IntentPendingSummary, IntentReconcileCycleResult, IntentReconcilerConfig,
+    IntentReconcilerHandle, IntentReconcilerMetrics, SettlementFinalityChecker,
+};
+pub use intents::{
+    AbortIntentResult, CommitIntentResult, CreateIntentResult, FinalityChecker, HubIntentExecutor,
+    IntentPolicy, IntentRouter, IntentRouterError, IntentStatus, MockFinalityChecker,
+    MockHubExecutor, PrepareFinality, PrepareIntentResult, DEFAULT_INTENT_EXPIRES_MS,
+};
 
 use std::sync::Arc;
 use std::time::Duration;
