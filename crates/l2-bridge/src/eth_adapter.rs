@@ -296,7 +296,10 @@ impl EthAttestationVerifier {
         attestation.validate_basic()?;
 
         // Step 2: Check attestor is in allowlist
-        if !self.config.is_attestor_allowed(&attestation.attestor_pubkey) {
+        if !self
+            .config
+            .is_attestor_allowed(&attestation.attestor_pubkey)
+        {
             let pubkey_hex = hex::encode(attestation.attestor_pubkey);
             warn!(
                 pubkey = %pubkey_hex,
@@ -329,8 +332,8 @@ impl EthAttestationVerifier {
         }
 
         // Build verified event
-        let proof_id = ExternalEventProofV1::EthReceiptAttestationV1(attestation.clone())
-            .proof_id()?;
+        let proof_id =
+            ExternalEventProofV1::EthReceiptAttestationV1(attestation.clone()).proof_id()?;
 
         debug!(
             proof_id = %proof_id,
@@ -520,9 +523,8 @@ impl ExternalVerifier for CompositeVerifier {
         }
 
         // All verifiers failed
-        Err(last_error.unwrap_or_else(|| {
-            ExternalVerifyError::Internal("verification failed".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| ExternalVerifyError::Internal("verification failed".to_string())))
     }
 }
 
@@ -794,8 +796,8 @@ mod tests {
         let config = EthAttestationVerifierConfig::default();
         let verifier = EthAttestationVerifier::new(config);
 
-        let proof = ExternalEventProofV1::EthReceiptMerkleProofV1(
-            l2_core::EthReceiptMerkleProofV1 {
+        let proof =
+            ExternalEventProofV1::EthReceiptMerkleProofV1(l2_core::EthReceiptMerkleProofV1 {
                 chain: ExternalChainId::EthereumMainnet,
                 tx_hash: [0xAA; 32],
                 log_index: 0,
@@ -807,8 +809,7 @@ mod tests {
                 receipt_rlp: vec![0x01],
                 proof_nodes: vec![vec![0x02]],
                 tx_index: 0,
-            },
-        );
+            });
 
         let result = verifier.verify(&proof, None);
         assert!(matches!(

@@ -525,7 +525,9 @@ mod tests {
         let proof_id = proof.proof_id().unwrap();
 
         // Store proof
-        let stored = storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        let stored = storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
         assert!(stored);
 
         // Get proof
@@ -542,11 +544,15 @@ mod tests {
         let proof = test_attestation(0xAA);
 
         // Store first time
-        let stored1 = storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        let stored1 = storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
         assert!(stored1);
 
         // Store second time - should return false
-        let stored2 = storage.put_proof_if_absent(&proof, 1_700_000_000_001).unwrap();
+        let stored2 = storage
+            .put_proof_if_absent(&proof, 1_700_000_000_001)
+            .unwrap();
         assert!(!stored2);
     }
 
@@ -560,7 +566,9 @@ mod tests {
 
         assert!(!storage.proof_exists(&proof_id).unwrap());
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
 
         assert!(storage.proof_exists(&proof_id).unwrap());
     }
@@ -575,7 +583,9 @@ mod tests {
         let proof = test_attestation(0xAA);
         let proof_id = proof.proof_id().unwrap();
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
 
         // Transition to Verified
         storage
@@ -594,7 +604,9 @@ mod tests {
         let proof = test_attestation(0xAA);
         let proof_id = proof.proof_id().unwrap();
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
 
         // Transition to Rejected
         storage
@@ -616,7 +628,9 @@ mod tests {
         let proof = test_attestation(0xAA);
         let proof_id = proof.proof_id().unwrap();
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
 
         // Transition to Verified
         storage
@@ -636,12 +650,16 @@ mod tests {
         let proof = test_attestation(0xAA);
         let proof_id = proof.proof_id().unwrap();
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
 
         let verified_state = ExternalProofState::verified(1_700_000_001_000);
 
         // Transition to Verified
-        storage.set_proof_state(&proof_id, verified_state.clone()).unwrap();
+        storage
+            .set_proof_state(&proof_id, verified_state.clone())
+            .unwrap();
 
         // Set same state again - should succeed (idempotent)
         storage.set_proof_state(&proof_id, verified_state).unwrap();
@@ -661,7 +679,9 @@ mod tests {
         let proof_id = proof.proof_id().unwrap();
         let intent_id = test_intent_id(0x01);
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
 
         // Bind proof to intent
         storage
@@ -690,8 +710,12 @@ mod tests {
         let proof_id2 = proof2.proof_id().unwrap();
         let intent_id = test_intent_id(0x01);
 
-        storage.put_proof_if_absent(&proof1, 1_700_000_000_000).unwrap();
-        storage.put_proof_if_absent(&proof2, 1_700_000_000_001).unwrap();
+        storage
+            .put_proof_if_absent(&proof1, 1_700_000_000_000)
+            .unwrap();
+        storage
+            .put_proof_if_absent(&proof2, 1_700_000_000_001)
+            .unwrap();
 
         storage
             .bind_proof_to_intent(&proof_id1, &intent_id, 1_700_000_001_000)
@@ -715,8 +739,12 @@ mod tests {
         let proof_id2 = proof2.proof_id().unwrap();
         let intent_id = test_intent_id(0x01);
 
-        storage.put_proof_if_absent(&proof1, 1_700_000_000_000).unwrap();
-        storage.put_proof_if_absent(&proof2, 1_700_000_000_001).unwrap();
+        storage
+            .put_proof_if_absent(&proof1, 1_700_000_000_000)
+            .unwrap();
+        storage
+            .put_proof_if_absent(&proof2, 1_700_000_000_001)
+            .unwrap();
 
         storage
             .bind_proof_to_intent(&proof_id1, &intent_id, 1_700_000_001_000)
@@ -762,7 +790,9 @@ mod tests {
         // Add some proofs
         for i in 0u8..5 {
             let proof = test_attestation(i);
-            storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+            storage
+                .put_proof_if_absent(&proof, 1_700_000_000_000)
+                .unwrap();
         }
 
         // All should be unverified
@@ -793,7 +823,9 @@ mod tests {
         // Add 10 proofs
         for i in 0u8..10 {
             let proof = test_attestation(i);
-            storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+            storage
+                .put_proof_if_absent(&proof, 1_700_000_000_000)
+                .unwrap();
         }
 
         // List with limit
@@ -811,7 +843,9 @@ mod tests {
         // Add some proofs
         for i in 0u8..5 {
             let proof = test_attestation(i);
-            storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+            storage
+                .put_proof_if_absent(&proof, 1_700_000_000_000)
+                .unwrap();
         }
 
         // Verify some, reject some
@@ -856,7 +890,9 @@ mod tests {
         let proof_id = proof.proof_id().unwrap();
         let intent_id = test_intent_id(0x01);
 
-        storage.put_proof_if_absent(&proof, 1_700_000_000_000).unwrap();
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
         storage
             .bind_proof_to_intent(&proof_id, &intent_id, 1_700_000_001_000)
             .unwrap();

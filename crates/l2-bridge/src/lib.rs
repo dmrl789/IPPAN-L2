@@ -25,6 +25,21 @@ pub mod intent_metrics;
 pub mod intent_reconciler;
 pub mod intents;
 
+pub use eth_adapter::{
+    CompositeVerifier, EthAttestationVerifier, EthAttestationVerifierConfig, ExpectedEventBinding,
+    ExternalVerifier, ExternalVerifyError, MockVerifier, VerifiedEvent,
+    DEFAULT_MIN_CONFIRMATIONS_MAINNET, DEFAULT_MIN_CONFIRMATIONS_TESTNET,
+};
+pub use external_proof_api::{
+    BindProofResponse, ExternalProofApi, ExternalProofApiError, IntentProofsVerifiedResponse,
+    ListProofsQuery, ListProofsResponse, ProofCountsResponse, ProofListItem, ProofStatusResponse,
+    SubmitProofRequest, SubmitProofResponse,
+};
+pub use external_proof_reconciler::{
+    spawn_external_proof_reconciler, ExternalProofReconcileCycleResult,
+    ExternalProofReconcilerConfig, ExternalProofReconcilerHandle, ExternalProofReconcilerMetrics,
+    ExternalProofReconcilerMetricsSnapshot, StorageExternalProofChecker,
+};
 pub use intent_api::{
     AbortIntentRequest, AbortIntentResponse, CommitIntentResponse, CreateIntentRequest,
     CreateIntentResponse, IntentApi, IntentApiError, IntentCountsResponse, IntentListItem,
@@ -38,22 +53,6 @@ pub use intent_reconciler::{
     get_intent_pending_summary, spawn_intent_reconciler, IntentBatchTracker, IntentPendingSummary,
     IntentReconcileCycleResult, IntentReconcilerConfig, IntentReconcilerHandle,
     IntentReconcilerMetrics, SettlementFinalityChecker,
-};
-pub use eth_adapter::{
-    CompositeVerifier, EthAttestationVerifier, EthAttestationVerifierConfig, ExpectedEventBinding,
-    ExternalVerifier, ExternalVerifyError, MockVerifier, VerifiedEvent,
-    DEFAULT_MIN_CONFIRMATIONS_MAINNET, DEFAULT_MIN_CONFIRMATIONS_TESTNET,
-};
-pub use external_proof_api::{
-    BindProofResponse, ExternalProofApi, ExternalProofApiError, IntentProofsVerifiedResponse,
-    ListProofsQuery, ListProofsResponse, ProofCountsResponse, ProofListItem, ProofStatusResponse,
-    SubmitProofRequest, SubmitProofResponse,
-};
-pub use external_proof_reconciler::{
-    spawn_external_proof_reconciler, ExternalProofReconcileCycleResult,
-    ExternalProofReconcilerConfig, ExternalProofReconcilerHandle,
-    ExternalProofReconcilerMetrics, ExternalProofReconcilerMetricsSnapshot,
-    StorageExternalProofChecker,
 };
 pub use intents::{
     AbortIntentResult, CommitIntentResult, CreateIntentResult, ExternalProofChecker,

@@ -46,9 +46,9 @@ impl ExternalProofApi {
         let proof_id = proof.proof_id()?;
 
         // Basic validation
-        proof
-            .validate_basic()
-            .map_err(|e| ExternalProofApiError::InvalidRequest(format!("validation failed: {}", e)))?;
+        proof.validate_basic().map_err(|e| {
+            ExternalProofApiError::InvalidRequest(format!("validation failed: {}", e))
+        })?;
 
         // Store (idempotent)
         let was_new = self.storage.put_proof_if_absent(&proof, now_ms)?;
@@ -65,9 +65,13 @@ impl ExternalProofApi {
     /// Get proof status.
     ///
     /// GET /bridge/proofs/:proof_id
-    pub fn get_proof(&self, proof_id_hex: &str) -> Result<ProofStatusResponse, ExternalProofApiError> {
-        let proof_id = ExternalProofId::from_hex(proof_id_hex)
-            .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid proof_id: {}", e)))?;
+    pub fn get_proof(
+        &self,
+        proof_id_hex: &str,
+    ) -> Result<ProofStatusResponse, ExternalProofApiError> {
+        let proof_id = ExternalProofId::from_hex(proof_id_hex).map_err(|e| {
+            ExternalProofApiError::InvalidRequest(format!("invalid proof_id: {}", e))
+        })?;
 
         let entry = self
             .storage
@@ -135,11 +139,13 @@ impl ExternalProofApi {
         proof_id_hex: &str,
         intent_id_hex: &str,
     ) -> Result<BindProofResponse, ExternalProofApiError> {
-        let proof_id = ExternalProofId::from_hex(proof_id_hex)
-            .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid proof_id: {}", e)))?;
+        let proof_id = ExternalProofId::from_hex(proof_id_hex).map_err(|e| {
+            ExternalProofApiError::InvalidRequest(format!("invalid proof_id: {}", e))
+        })?;
 
-        let intent_id = IntentId::from_hex(intent_id_hex)
-            .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid intent_id: {}", e)))?;
+        let intent_id = IntentId::from_hex(intent_id_hex).map_err(|e| {
+            ExternalProofApiError::InvalidRequest(format!("invalid intent_id: {}", e))
+        })?;
 
         let now_ms = now_ms();
 
@@ -170,8 +176,9 @@ impl ExternalProofApi {
         intent_id_hex: &str,
         limit: Option<usize>,
     ) -> Result<ListProofsResponse, ExternalProofApiError> {
-        let intent_id = IntentId::from_hex(intent_id_hex)
-            .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid intent_id: {}", e)))?;
+        let intent_id = IntentId::from_hex(intent_id_hex).map_err(|e| {
+            ExternalProofApiError::InvalidRequest(format!("invalid intent_id: {}", e))
+        })?;
 
         let limit = limit.unwrap_or(100).min(1000);
 
@@ -199,8 +206,9 @@ impl ExternalProofApi {
         &self,
         intent_id_hex: &str,
     ) -> Result<IntentProofsVerifiedResponse, ExternalProofApiError> {
-        let intent_id = IntentId::from_hex(intent_id_hex)
-            .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid intent_id: {}", e)))?;
+        let intent_id = IntentId::from_hex(intent_id_hex).map_err(|e| {
+            ExternalProofApiError::InvalidRequest(format!("invalid intent_id: {}", e))
+        })?;
 
         let all_verified = self.storage.all_proofs_verified_for_intent(&intent_id)?;
         let proofs = self.storage.list_proofs_for_intent(&intent_id, 100)?;
@@ -343,7 +351,10 @@ impl SubmitProofRequest {
                 // Try to parse as "chain_id:name"
                 if let Some((chain_id_str, name)) = other.split_once(':') {
                     let chain_id: u64 = chain_id_str.parse().map_err(|_| {
-                        ExternalProofApiError::InvalidRequest(format!("invalid chain_id: {}", other))
+                        ExternalProofApiError::InvalidRequest(format!(
+                            "invalid chain_id: {}",
+                            other
+                        ))
                     })?;
                     Ok(ExternalChainId::Other {
                         chain_id,
@@ -500,8 +511,9 @@ fn now_ms() -> u64 {
 
 fn parse_hex_32(s: &str, field: &str) -> Result<[u8; 32], ExternalProofApiError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e)))?;
+    let bytes = hex::decode(s).map_err(|e| {
+        ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e))
+    })?;
     if bytes.len() != 32 {
         return Err(ExternalProofApiError::InvalidRequest(format!(
             "{} must be 32 bytes, got {}",
@@ -516,8 +528,9 @@ fn parse_hex_32(s: &str, field: &str) -> Result<[u8; 32], ExternalProofApiError>
 
 fn parse_hex_20(s: &str, field: &str) -> Result<[u8; 20], ExternalProofApiError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e)))?;
+    let bytes = hex::decode(s).map_err(|e| {
+        ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e))
+    })?;
     if bytes.len() != 20 {
         return Err(ExternalProofApiError::InvalidRequest(format!(
             "{} must be 20 bytes, got {}",
@@ -532,8 +545,9 @@ fn parse_hex_20(s: &str, field: &str) -> Result<[u8; 20], ExternalProofApiError>
 
 fn parse_hex_64(s: &str, field: &str) -> Result<[u8; 64], ExternalProofApiError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .map_err(|e| ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e)))?;
+    let bytes = hex::decode(s).map_err(|e| {
+        ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e))
+    })?;
     if bytes.len() != 64 {
         return Err(ExternalProofApiError::InvalidRequest(format!(
             "{} must be 64 bytes, got {}",
@@ -738,15 +752,27 @@ mod tests {
             signature: Some(hex::encode([0x22; 64])),
         };
 
-        assert!(matches!(request.parse_chain(), Ok(ExternalChainId::EthereumMainnet)));
+        assert!(matches!(
+            request.parse_chain(),
+            Ok(ExternalChainId::EthereumMainnet)
+        ));
 
         let mut sepolia = request.clone();
         sepolia.chain = "sepolia".to_string();
-        assert!(matches!(sepolia.parse_chain(), Ok(ExternalChainId::EthereumSepolia)));
+        assert!(matches!(
+            sepolia.parse_chain(),
+            Ok(ExternalChainId::EthereumSepolia)
+        ));
 
         let mut custom = request.clone();
         custom.chain = "42161:arbitrum".to_string();
-        assert!(matches!(custom.parse_chain(), Ok(ExternalChainId::Other { chain_id: 42161, .. })));
+        assert!(matches!(
+            custom.parse_chain(),
+            Ok(ExternalChainId::Other {
+                chain_id: 42161,
+                ..
+            })
+        ));
     }
 
     #[test]

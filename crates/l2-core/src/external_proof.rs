@@ -677,7 +677,10 @@ mod tests {
 
     #[test]
     fn chain_id_display() {
-        assert_eq!(format!("{}", ExternalChainId::EthereumMainnet), "ethereum:1");
+        assert_eq!(
+            format!("{}", ExternalChainId::EthereumMainnet),
+            "ethereum:1"
+        );
         assert_eq!(
             format!("{}", ExternalChainId::EthereumSepolia),
             "sepolia:11155111"
@@ -871,7 +874,8 @@ mod tests {
         assert!(!verified.is_rejected());
         assert_eq!(verified.name(), "verified");
 
-        let rejected = ExternalProofState::rejected("invalid signature".to_string(), 1_700_000_000_000);
+        let rejected =
+            ExternalProofState::rejected("invalid signature".to_string(), 1_700_000_000_000);
         assert!(!rejected.is_unverified());
         assert!(!rejected.is_verified());
         assert!(rejected.is_rejected());
@@ -886,7 +890,10 @@ mod tests {
             "Verified(at=1234)"
         );
         assert_eq!(
-            format!("{}", ExternalProofState::rejected("bad sig".to_string(), 5678)),
+            format!(
+                "{}",
+                ExternalProofState::rejected("bad sig".to_string(), 5678)
+            ),
             "Rejected(at=5678, reason=bad sig)"
         );
     }

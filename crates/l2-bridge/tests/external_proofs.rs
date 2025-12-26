@@ -116,9 +116,15 @@ fn setup_router(db: &sled::Db) -> IntentRouter {
     // Register mock executors for all hubs
     router.register_executor(L2HubId::Fin, Arc::new(MockHubExecutor::new(L2HubId::Fin)));
     router.register_executor(L2HubId::Data, Arc::new(MockHubExecutor::new(L2HubId::Data)));
-    router.register_executor(L2HubId::World, Arc::new(MockHubExecutor::new(L2HubId::World)));
+    router.register_executor(
+        L2HubId::World,
+        Arc::new(MockHubExecutor::new(L2HubId::World)),
+    );
     router.register_executor(L2HubId::M2m, Arc::new(MockHubExecutor::new(L2HubId::M2m)));
-    router.register_executor(L2HubId::Bridge, Arc::new(MockHubExecutor::new(L2HubId::Bridge)));
+    router.register_executor(
+        L2HubId::Bridge,
+        Arc::new(MockHubExecutor::new(L2HubId::Bridge)),
+    );
 
     router
 }
@@ -299,9 +305,7 @@ async fn intent_router_external_proof_gating() {
     assert_eq!(create_result.intent_id, intent_id);
 
     // Try to prepare - should fail (no proof bound)
-    let prepare_result = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(matches!(
         prepare_result,
         Err(IntentRouterError::ExternalProofNotVerified { .. })
@@ -316,9 +320,7 @@ async fn intent_router_external_proof_gating() {
         .unwrap();
 
     // Try to prepare - should still fail (proof not verified)
-    let prepare_result2 = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result2 = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(matches!(
         prepare_result2,
         Err(IntentRouterError::ExternalProofNotVerified { .. })
@@ -330,9 +332,7 @@ async fn intent_router_external_proof_gating() {
         .unwrap();
 
     // Now prepare should succeed
-    let prepare_result3 = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result3 = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(prepare_result3.is_ok());
 }
 
@@ -355,9 +355,7 @@ async fn regular_intents_not_gated() {
     assert_eq!(create_result.intent_id, intent_id);
 
     // Prepare should succeed without any proofs
-    let prepare_result = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(prepare_result.is_ok());
 }
 
@@ -466,9 +464,7 @@ async fn full_external_proof_workflow() {
         .unwrap();
 
     // 4. Try to prepare - fails (proof not verified)
-    let prepare_result = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(matches!(
         prepare_result,
         Err(IntentRouterError::ExternalProofNotVerified { .. })
@@ -485,9 +481,7 @@ async fn full_external_proof_workflow() {
     assert!(verified_status.all_verified);
 
     // 7. Now prepare succeeds
-    let prepare_result2 = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result2 = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(prepare_result2.is_ok());
 }
 
@@ -582,9 +576,7 @@ async fn rejected_proof_blocks_intent() {
         .unwrap();
 
     // Prepare should still fail (rejected != verified)
-    let prepare_result = router
-        .prepare_intent(&intent_id, &intent, current_ms)
-        .await;
+    let prepare_result = router.prepare_intent(&intent_id, &intent, current_ms).await;
     assert!(matches!(
         prepare_result,
         Err(IntentRouterError::ExternalProofNotVerified { .. })

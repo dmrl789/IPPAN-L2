@@ -208,12 +208,7 @@ pub fn spawn_external_proof_reconciler(
 
     if config.enabled {
         tokio::spawn(reconciler_loop(
-            config,
-            storage,
-            verifier,
-            is_leader,
-            metrics,
-            shutdown,
+            config, storage, verifier, is_leader, metrics, shutdown,
         ));
     } else {
         info!("external proof reconciler disabled by config");
@@ -548,8 +543,16 @@ mod tests {
         let proof1_id = proof1.proof_id().unwrap();
         let proof2_id = proof2.proof_id().unwrap();
 
-        assert!(storage.get_proof_state(&proof1_id).unwrap().unwrap().is_verified());
-        assert!(storage.get_proof_state(&proof2_id).unwrap().unwrap().is_verified());
+        assert!(storage
+            .get_proof_state(&proof1_id)
+            .unwrap()
+            .unwrap()
+            .is_verified());
+        assert!(storage
+            .get_proof_state(&proof2_id)
+            .unwrap()
+            .unwrap()
+            .is_verified());
     }
 
     #[tokio::test]
@@ -577,7 +580,11 @@ mod tests {
 
         // Check proof is rejected
         let proof_id = proof.proof_id().unwrap();
-        assert!(storage.get_proof_state(&proof_id).unwrap().unwrap().is_rejected());
+        assert!(storage
+            .get_proof_state(&proof_id)
+            .unwrap()
+            .unwrap()
+            .is_rejected());
     }
 
     #[tokio::test]
