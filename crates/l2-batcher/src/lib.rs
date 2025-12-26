@@ -69,6 +69,8 @@ pub use reconciler::{
     SettlementReconcilerHandle,
 };
 
+// Multi-hub exports will be defined after the structures are defined below
+
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
     pub max_batch_txs: usize,
@@ -1060,6 +1062,473 @@ impl From<BatcherState> for BatcherSnapshot {
     }
 }
 
+// ============== Multi-Hub Batcher Structures ==============
+
+use l2_core::{L2HubId, ALL_HUBS};
+use std::collections::BTreeMap;
+
+/// Transaction with hub identification for multi-hub routing.
+#[derive(Debug, Clone)]
+pub struct HubTx {
+    /// The target hub for this transaction.
+    pub hub: L2HubId,
+    /// The underlying transaction.
+    pub tx: Tx,
+}
+
+impl HubTx {
+    /// Create a new hub-routed transaction.
+    pub fn new(hub: L2HubId, tx: Tx) -> Self {
+        Self { hub, tx }
+    }
+
+    /// Get the size of the transaction payload in bytes.
+    pub fn payload_size(&self) -> usize {
+        self.tx.payload.len()
+    }
+}
+
+/// Per-hub queue state for tracking individual hub queues.
+#[derive(Debug, Clone, Default)]
+pub struct PerHubQueueState {
+    /// Number of transactions in the normal queue.
+    pub queue_depth: u32,
+    /// Number of transactions in the forced queue.
+    pub forced_queue_depth: u32,
+    /// Number of batches currently in-flight (submitted but not finalised).
+    pub in_flight_batches: u32,
+    /// Recent reject count (rolling window).
+    pub recent_rejects: u32,
+    /// Estimated average transaction size in bytes.
+    pub avg_tx_bytes_est: u32,
+    /// Last batch hash (for chaining).
+    pub last_batch_hash: Option<Hash32>,
+    /// Last batch number.
+    pub batch_number: u64,
+    /// Total fees finalised (M2M hub only).
+    pub total_fees_finalised_scaled: u64,
+}
+
+impl PerHubQueueState {
+    /// Create a new empty per-hub queue state.
+    pub fn new() -> Self {
+        Self {
+            avg_tx_bytes_est: 256, // Default estimate
+            ..Default::default()
+        }
+    }
+
+    /// Update the EMA of tx bytes (integer-only computation).
+    pub fn update_avg_tx_bytes(&mut self, tx_bytes: u64) {
+        const ALPHA_SCALED: u64 = 125;
+        const ONE_MINUS_ALPHA_SCALED: u64 = 875;
+
+        let current_scaled = u64::from(self.avg_tx_bytes_est).saturating_mul(1000);
+        let sample_contribution = tx_bytes.saturating_mul(ALPHA_SCALED);
+        let old_contribution = current_scaled.saturating_mul(ONE_MINUS_ALPHA_SCALED).saturating_div(1000);
+        let new_scaled = sample_contribution.saturating_add(old_contribution);
+        self.avg_tx_bytes_est = u32::try_from(new_scaled.saturating_div(1000)).unwrap_or(u32::MAX);
+    }
+
+    /// Increment batch number and return the new value.
+    pub fn next_batch_number(&mut self) -> u64 {
+        self.batch_number = self.batch_number.saturating_add(1);
+        self.batch_number
+    }
+
+    /// Decay rolling counters.
+    pub fn decay_counters(&mut self) {
+        self.recent_rejects = self.recent_rejects.saturating_div(2);
+    }
+}
+
+/// Multi-hub batcher state with per-hub tracking.
+#[derive(Clone)]
+pub struct MultiHubBatcherState {
+    /// Per-hub states (BTreeMap for deterministic iteration order).
+    pub per_hub: BTreeMap<L2HubId, PerHubQueueState>,
+    /// Global organiser enabled flag.
+    pub organiser_enabled: bool,
+    /// Organiser version.
+    pub organiser_version: OrganiserVersion,
+    /// Organiser policy bounds.
+    pub organiser_bounds: OrganiserPolicyBounds,
+    /// Last V2 organiser decision.
+    pub last_v2_decision: Option<OrganiserDecisionV2>,
+    /// Rolling counter: recent quota rejects (global).
+    pub recent_quota_rejects: u32,
+    /// Rolling counter: recent insufficient balance (global).
+    pub recent_insufficient_balance: u32,
+}
+
+impl MultiHubBatcherState {
+    /// Create a new multi-hub batcher state.
+    pub fn new(
+        organiser_enabled: bool,
+        organiser_version: OrganiserVersion,
+        organiser_bounds: OrganiserPolicyBounds,
+    ) -> Self {
+        let mut per_hub = BTreeMap::new();
+        for hub in ALL_HUBS {
+            per_hub.insert(hub, PerHubQueueState::new());
+        }
+
+        Self {
+            per_hub,
+            organiser_enabled,
+            organiser_version,
+            organiser_bounds,
+            last_v2_decision: None,
+            recent_quota_rejects: 0,
+            recent_insufficient_balance: 0,
+        }
+    }
+
+    /// Get mutable reference to a hub's state.
+    pub fn hub_state_mut(&mut self, hub: L2HubId) -> &mut PerHubQueueState {
+        self.per_hub.entry(hub).or_insert_with(PerHubQueueState::new)
+    }
+
+    /// Get reference to a hub's state.
+    pub fn hub_state(&self, hub: L2HubId) -> Option<&PerHubQueueState> {
+        self.per_hub.get(&hub)
+    }
+
+    /// Get total queue depth across all hubs.
+    pub fn total_queue_depth(&self) -> u32 {
+        self.per_hub.values().map(|s| s.queue_depth).sum()
+    }
+
+    /// Get total forced queue depth across all hubs.
+    pub fn total_forced_queue_depth(&self) -> u32 {
+        self.per_hub.values().map(|s| s.forced_queue_depth).sum()
+    }
+
+    /// Get total in-flight batches across all hubs.
+    pub fn total_in_flight(&self) -> u32 {
+        self.per_hub.values().map(|s| s.in_flight_batches).sum()
+    }
+
+    /// Decay counters for all hubs.
+    pub fn decay_all_counters(&mut self) {
+        for state in self.per_hub.values_mut() {
+            state.decay_counters();
+        }
+        self.recent_quota_rejects = self.recent_quota_rejects.saturating_div(2);
+        self.recent_insufficient_balance = self.recent_insufficient_balance.saturating_div(2);
+    }
+
+    /// Build HubInputs for organiser V2.
+    pub fn build_hub_inputs(&self, hub: L2HubId) -> HubInputs {
+        let state = self.hub_state(hub).cloned().unwrap_or_default();
+        HubInputs {
+            hub,
+            queue_depth: state.queue_depth,
+            forced_queue_depth: state.forced_queue_depth,
+            in_flight_batches: state.in_flight_batches,
+            recent_rejects: state.recent_rejects,
+            avg_tx_bytes_est: state.avg_tx_bytes_est,
+        }
+    }
+
+    /// Build V2 organiser inputs from current state.
+    pub fn build_organiser_inputs_v2(&self, now_ms: u64) -> OrganiserInputsV2 {
+        let hubs: Vec<HubInputs> = ALL_HUBS
+            .iter()
+            .map(|&hub| self.build_hub_inputs(hub))
+            .collect();
+
+        OrganiserInputsV2 { now_ms, hubs }
+    }
+}
+
+/// Per-hub inputs for OrganiserV2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubInputs {
+    /// Hub identifier.
+    pub hub: L2HubId,
+    /// Number of transactions in the normal queue.
+    pub queue_depth: u32,
+    /// Number of transactions in the forced queue.
+    pub forced_queue_depth: u32,
+    /// Number of batches currently in-flight.
+    pub in_flight_batches: u32,
+    /// Recent reject count.
+    pub recent_rejects: u32,
+    /// Estimated average transaction size in bytes.
+    pub avg_tx_bytes_est: u32,
+}
+
+impl Default for HubInputs {
+    fn default() -> Self {
+        Self {
+            hub: L2HubId::Fin,
+            queue_depth: 0,
+            forced_queue_depth: 0,
+            in_flight_batches: 0,
+            recent_rejects: 0,
+            avg_tx_bytes_est: 256,
+        }
+    }
+}
+
+/// V2 organiser inputs with per-hub statistics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganiserInputsV2 {
+    /// Current timestamp in milliseconds since epoch.
+    pub now_ms: u64,
+    /// Per-hub inputs in deterministic order: Fin, Data, M2m, World, Bridge.
+    pub hubs: Vec<HubInputs>,
+}
+
+impl Default for OrganiserInputsV2 {
+    fn default() -> Self {
+        Self {
+            now_ms: 0,
+            hubs: ALL_HUBS
+                .iter()
+                .map(|&hub| HubInputs { hub, ..Default::default() })
+                .collect(),
+        }
+    }
+}
+
+impl OrganiserInputsV2 {
+    /// Get inputs for a specific hub.
+    pub fn get_hub(&self, hub: L2HubId) -> Option<&HubInputs> {
+        self.hubs.iter().find(|h| h.hub == hub)
+    }
+
+    /// Get total queue depth across all hubs.
+    pub fn total_queue_depth(&self) -> u32 {
+        self.hubs.iter().map(|h| h.queue_depth).sum()
+    }
+
+    /// Get total forced queue depth across all hubs.
+    pub fn total_forced_depth(&self) -> u32 {
+        self.hubs.iter().map(|h| h.forced_queue_depth).sum()
+    }
+}
+
+/// V2 organiser decision with hub selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrganiserDecisionV2 {
+    /// The hub chosen to serve in this batch cycle.
+    pub chosen_hub: L2HubId,
+    /// Sleep duration before building next batch (milliseconds).
+    pub sleep_ms: u64,
+    /// Maximum number of transactions to include in the batch.
+    pub max_txs: u32,
+    /// Maximum bytes to include in the batch.
+    pub max_bytes: u32,
+    /// Maximum number of forced queue transactions to drain.
+    pub forced_drain_max: u32,
+}
+
+impl Default for OrganiserDecisionV2 {
+    fn default() -> Self {
+        Self {
+            chosen_hub: L2HubId::Fin,
+            sleep_ms: 1000,
+            max_txs: 256,
+            max_bytes: 512 * 1024,
+            forced_drain_max: 128,
+        }
+    }
+}
+
+impl OrganiserDecisionV2 {
+    /// Create a new V2 decision.
+    pub fn new(
+        chosen_hub: L2HubId,
+        sleep_ms: u64,
+        max_txs: u32,
+        max_bytes: u32,
+        forced_drain_max: u32,
+    ) -> Self {
+        Self {
+            chosen_hub,
+            sleep_ms,
+            max_txs,
+            max_bytes,
+            forced_drain_max,
+        }
+    }
+}
+
+/// Multi-hub batcher snapshot for /status endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MultiHubBatcherSnapshot {
+    /// Per-hub snapshots.
+    pub per_hub: BTreeMap<String, HubQueueSnapshot>,
+    /// Total queue depth across all hubs.
+    pub total_queue_depth: u32,
+    /// Total forced queue depth across all hubs.
+    pub total_forced_depth: u32,
+    /// Total in-flight batches.
+    pub total_in_flight: u32,
+    /// Last V2 organiser decision.
+    pub last_v2_decision: Option<OrganiserDecisionV2>,
+    /// Organiser status.
+    pub organiser_enabled: bool,
+    /// Organiser version string.
+    pub organiser_version: String,
+}
+
+/// Per-hub snapshot for /status endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HubQueueSnapshot {
+    /// Queue depth.
+    pub queue_depth: u32,
+    /// Forced queue depth.
+    pub forced_queue_depth: u32,
+    /// In-flight batches.
+    pub in_flight_batches: u32,
+    /// Last batch hash (hex).
+    pub last_batch_hash: Option<String>,
+    /// Batch number.
+    pub batch_number: u64,
+    /// Total fees finalised (M2M hub only).
+    pub total_fees_finalised_scaled: Option<u64>,
+}
+
+impl From<&MultiHubBatcherState> for MultiHubBatcherSnapshot {
+    fn from(state: &MultiHubBatcherState) -> Self {
+        let mut per_hub = BTreeMap::new();
+        for (hub, hub_state) in &state.per_hub {
+            let snapshot = HubQueueSnapshot {
+                queue_depth: hub_state.queue_depth,
+                forced_queue_depth: hub_state.forced_queue_depth,
+                in_flight_batches: hub_state.in_flight_batches,
+                last_batch_hash: hub_state.last_batch_hash.map(|h| h.to_hex()),
+                batch_number: hub_state.batch_number,
+                total_fees_finalised_scaled: if hub.uses_m2m_fees() {
+                    Some(hub_state.total_fees_finalised_scaled)
+                } else {
+                    None
+                },
+            };
+            per_hub.insert(hub.as_str().to_string(), snapshot);
+        }
+
+        Self {
+            per_hub,
+            total_queue_depth: state.total_queue_depth(),
+            total_forced_depth: state.total_forced_queue_depth(),
+            total_in_flight: state.total_in_flight(),
+            last_v2_decision: state.last_v2_decision.clone(),
+            organiser_enabled: state.organiser_enabled,
+            organiser_version: state.organiser_version.to_string(),
+        }
+    }
+}
+
+/// Multi-hub batcher handle for submitting transactions to specific hubs.
+#[derive(Clone)]
+pub struct MultiHubBatcherHandle {
+    /// Per-hub senders (BTreeMap for deterministic iteration).
+    senders: BTreeMap<L2HubId, mpsc::Sender<Tx>>,
+    /// Shared multi-hub state.
+    state: Arc<Mutex<MultiHubBatcherState>>,
+}
+
+impl MultiHubBatcherHandle {
+    /// Create a new multi-hub batcher handle.
+    pub fn new(
+        senders: BTreeMap<L2HubId, mpsc::Sender<Tx>>,
+        state: Arc<Mutex<MultiHubBatcherState>>,
+    ) -> Self {
+        Self { senders, state }
+    }
+
+    /// Submit a transaction to a specific hub.
+    pub async fn submit_tx(&self, hub: L2HubId, tx: Tx) -> Result<(), BatcherError> {
+        let sender = self.senders.get(&hub).ok_or_else(|| {
+            BatcherError::Poster(format!("no sender for hub {:?}", hub))
+        })?;
+
+        sender.send(tx).await.map_err(|_| BatcherError::QueueClosed)?;
+
+        let mut guard = self.state.lock().await;
+        let hub_state = guard.hub_state_mut(hub);
+        hub_state.queue_depth = hub_state.queue_depth.saturating_add(1);
+        Ok(())
+    }
+
+    /// Submit a hub-tagged transaction.
+    pub async fn submit_hub_tx(&self, hub_tx: HubTx) -> Result<(), BatcherError> {
+        self.submit_tx(hub_tx.hub, hub_tx.tx).await
+    }
+
+    /// Get a snapshot of the multi-hub batcher state.
+    pub async fn snapshot(&self) -> MultiHubBatcherSnapshot {
+        let state = self.state.lock().await;
+        MultiHubBatcherSnapshot::from(&*state)
+    }
+
+    /// Get queue depth for a specific hub.
+    pub async fn hub_queue_depth(&self, hub: L2HubId) -> u32 {
+        let state = self.state.lock().await;
+        state.hub_state(hub).map(|s| s.queue_depth).unwrap_or(0)
+    }
+
+    /// Get forced queue depth for a specific hub.
+    pub async fn hub_forced_depth(&self, hub: L2HubId) -> u32 {
+        let state = self.state.lock().await;
+        state.hub_state(hub).map(|s| s.forced_queue_depth).unwrap_or(0)
+    }
+
+    /// Update hub stats from storage.
+    pub async fn sync_hub_stats(&self, hub: L2HubId, queue: u32, forced: u32, in_flight: u32) {
+        let mut guard = self.state.lock().await;
+        let hub_state = guard.hub_state_mut(hub);
+        hub_state.queue_depth = queue;
+        hub_state.forced_queue_depth = forced;
+        hub_state.in_flight_batches = in_flight;
+    }
+}
+
+// ============== Per-Hub Receiver Collection ==============
+
+/// Collection of per-hub receivers for the batcher loop.
+pub struct MultiHubReceivers {
+    receivers: BTreeMap<L2HubId, mpsc::Receiver<Tx>>,
+}
+
+impl MultiHubReceivers {
+    /// Create from a map of receivers.
+    pub fn new(receivers: BTreeMap<L2HubId, mpsc::Receiver<Tx>>) -> Self {
+        Self { receivers }
+    }
+
+    /// Get mutable reference to a specific hub's receiver.
+    pub fn get_mut(&mut self, hub: L2HubId) -> Option<&mut mpsc::Receiver<Tx>> {
+        self.receivers.get_mut(&hub)
+    }
+
+    /// Check if a hub has pending messages.
+    pub fn hub_has_pending(&self, hub: L2HubId) -> bool {
+        self.receivers.get(&hub).map(|r| !r.is_empty()).unwrap_or(false)
+    }
+}
+
+/// Create per-hub channels for multi-hub batcher.
+pub fn create_multi_hub_channels(buffer_size: usize) -> (
+    BTreeMap<L2HubId, mpsc::Sender<Tx>>,
+    MultiHubReceivers,
+) {
+    let mut senders = BTreeMap::new();
+    let mut receivers = BTreeMap::new();
+
+    for hub in ALL_HUBS {
+        let (tx, rx) = mpsc::channel(buffer_size);
+        senders.insert(hub, tx);
+        receivers.insert(hub, rx);
+    }
+
+    (senders, MultiHubReceivers::new(receivers))
+}
+
 pub struct BatcherHandle {
     tx: mpsc::Sender<Tx>,
     state: Arc<Mutex<BatcherState>>,
@@ -1639,6 +2108,259 @@ mod tests {
         assert!(json.contains("\"batch_hash\":\"aabbccdd\""));
         assert!(json.contains("\"chain_id\":1337"));
         assert!(json.contains("\"batch_number\":42"));
+    }
+
+    // ========== Multi-Hub Tests ==========
+
+    #[test]
+    fn hub_tx_creation() {
+        let tx = Tx {
+            chain_id: ChainId(1337),
+            nonce: 1,
+            from: "alice".to_string(),
+            payload: vec![1, 2, 3, 4, 5],
+        };
+        let hub_tx = HubTx::new(L2HubId::Fin, tx);
+        assert_eq!(hub_tx.hub, L2HubId::Fin);
+        assert_eq!(hub_tx.payload_size(), 5);
+    }
+
+    #[test]
+    fn per_hub_queue_state_defaults() {
+        let state = PerHubQueueState::new();
+        assert_eq!(state.queue_depth, 0);
+        assert_eq!(state.forced_queue_depth, 0);
+        assert_eq!(state.in_flight_batches, 0);
+        assert_eq!(state.avg_tx_bytes_est, 256);
+        assert_eq!(state.batch_number, 0);
+    }
+
+    #[test]
+    fn per_hub_queue_state_batch_number() {
+        let mut state = PerHubQueueState::new();
+        assert_eq!(state.next_batch_number(), 1);
+        assert_eq!(state.next_batch_number(), 2);
+        assert_eq!(state.next_batch_number(), 3);
+        assert_eq!(state.batch_number, 3);
+    }
+
+    #[test]
+    fn per_hub_queue_state_avg_bytes_update() {
+        let mut state = PerHubQueueState::new();
+        assert_eq!(state.avg_tx_bytes_est, 256);
+        
+        // Update with larger tx
+        state.update_avg_tx_bytes(1024);
+        // EMA should move towards 1024
+        assert!(state.avg_tx_bytes_est > 256);
+        assert!(state.avg_tx_bytes_est < 1024);
+    }
+
+    #[test]
+    fn multi_hub_batcher_state_creation() {
+        let state = MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        );
+        
+        // Should have all 5 hubs
+        assert_eq!(state.per_hub.len(), 5);
+        assert!(state.per_hub.contains_key(&L2HubId::Fin));
+        assert!(state.per_hub.contains_key(&L2HubId::Data));
+        assert!(state.per_hub.contains_key(&L2HubId::M2m));
+        assert!(state.per_hub.contains_key(&L2HubId::World));
+        assert!(state.per_hub.contains_key(&L2HubId::Bridge));
+    }
+
+    #[test]
+    fn multi_hub_batcher_state_totals() {
+        let mut state = MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        );
+        
+        // Add some queue depths
+        state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
+        state.hub_state_mut(L2HubId::Data).queue_depth = 50;
+        state.hub_state_mut(L2HubId::M2m).queue_depth = 75;
+        
+        assert_eq!(state.total_queue_depth(), 225);
+        
+        // Add forced queue depths
+        state.hub_state_mut(L2HubId::Fin).forced_queue_depth = 5;
+        state.hub_state_mut(L2HubId::M2m).forced_queue_depth = 3;
+        
+        assert_eq!(state.total_forced_queue_depth(), 8);
+    }
+
+    #[test]
+    fn multi_hub_batcher_state_hub_inputs() {
+        let mut state = MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        );
+        
+        state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
+        state.hub_state_mut(L2HubId::Fin).forced_queue_depth = 5;
+        state.hub_state_mut(L2HubId::Fin).in_flight_batches = 2;
+        
+        let inputs = state.build_hub_inputs(L2HubId::Fin);
+        assert_eq!(inputs.hub, L2HubId::Fin);
+        assert_eq!(inputs.queue_depth, 100);
+        assert_eq!(inputs.forced_queue_depth, 5);
+        assert_eq!(inputs.in_flight_batches, 2);
+    }
+
+    #[test]
+    fn organiser_inputs_v2_default() {
+        let inputs = OrganiserInputsV2::default();
+        assert_eq!(inputs.now_ms, 0);
+        assert_eq!(inputs.hubs.len(), 5);
+        assert_eq!(inputs.total_queue_depth(), 0);
+    }
+
+    #[test]
+    fn organiser_inputs_v2_build() {
+        let mut state = MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        );
+        
+        state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
+        state.hub_state_mut(L2HubId::Data).queue_depth = 50;
+        
+        let inputs = state.build_organiser_inputs_v2(1_700_000_000_000);
+        
+        assert_eq!(inputs.now_ms, 1_700_000_000_000);
+        assert_eq!(inputs.hubs.len(), 5);
+        assert_eq!(inputs.total_queue_depth(), 150);
+        
+        let fin_inputs = inputs.get_hub(L2HubId::Fin).unwrap();
+        assert_eq!(fin_inputs.queue_depth, 100);
+        
+        let data_inputs = inputs.get_hub(L2HubId::Data).unwrap();
+        assert_eq!(data_inputs.queue_depth, 50);
+    }
+
+    #[test]
+    fn organiser_decision_v2_default() {
+        let decision = OrganiserDecisionV2::default();
+        assert_eq!(decision.chosen_hub, L2HubId::Fin);
+        assert_eq!(decision.sleep_ms, 1000);
+        assert_eq!(decision.max_txs, 256);
+    }
+
+    #[test]
+    fn organiser_decision_v2_creation() {
+        let decision = OrganiserDecisionV2::new(L2HubId::M2m, 500, 128, 256 * 1024, 64);
+        assert_eq!(decision.chosen_hub, L2HubId::M2m);
+        assert_eq!(decision.sleep_ms, 500);
+        assert_eq!(decision.max_txs, 128);
+        assert_eq!(decision.max_bytes, 256 * 1024);
+        assert_eq!(decision.forced_drain_max, 64);
+    }
+
+    #[test]
+    fn multi_hub_snapshot_creation() {
+        let mut state = MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        );
+        
+        state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
+        state.hub_state_mut(L2HubId::Fin).batch_number = 42;
+        state.hub_state_mut(L2HubId::M2m).queue_depth = 50;
+        state.hub_state_mut(L2HubId::M2m).total_fees_finalised_scaled = 1_000_000;
+        
+        let snapshot = MultiHubBatcherSnapshot::from(&state);
+        
+        assert_eq!(snapshot.total_queue_depth, 150);
+        assert_eq!(snapshot.per_hub.len(), 5);
+        
+        let fin_snap = snapshot.per_hub.get("fin").unwrap();
+        assert_eq!(fin_snap.queue_depth, 100);
+        assert_eq!(fin_snap.batch_number, 42);
+        assert!(fin_snap.total_fees_finalised_scaled.is_none()); // Not M2M hub
+        
+        let m2m_snap = snapshot.per_hub.get("m2m").unwrap();
+        assert_eq!(m2m_snap.queue_depth, 50);
+        assert_eq!(m2m_snap.total_fees_finalised_scaled, Some(1_000_000));
+    }
+
+    #[test]
+    fn create_multi_hub_channels_creates_all_hubs() {
+        let (senders, receivers) = create_multi_hub_channels(64);
+        
+        assert_eq!(senders.len(), 5);
+        assert!(senders.contains_key(&L2HubId::Fin));
+        assert!(senders.contains_key(&L2HubId::Data));
+        assert!(senders.contains_key(&L2HubId::M2m));
+        assert!(senders.contains_key(&L2HubId::World));
+        assert!(senders.contains_key(&L2HubId::Bridge));
+        
+        // Can't easily check receiver count without consuming them
+        // but we can check one hub works
+        assert!(!receivers.hub_has_pending(L2HubId::Fin));
+    }
+
+    #[tokio::test]
+    async fn multi_hub_handle_submit() {
+        let (senders, _receivers) = create_multi_hub_channels(64);
+        let state = Arc::new(Mutex::new(MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        )));
+        
+        let handle = MultiHubBatcherHandle::new(senders, state);
+        
+        // Submit to FIN hub
+        let tx = Tx {
+            chain_id: ChainId(1337),
+            nonce: 1,
+            from: "alice".to_string(),
+            payload: vec![1, 2, 3],
+        };
+        
+        handle.submit_tx(L2HubId::Fin, tx.clone()).await.unwrap();
+        
+        assert_eq!(handle.hub_queue_depth(L2HubId::Fin).await, 1);
+        assert_eq!(handle.hub_queue_depth(L2HubId::Data).await, 0);
+        
+        // Submit to DATA hub
+        handle.submit_tx(L2HubId::Data, tx.clone()).await.unwrap();
+        assert_eq!(handle.hub_queue_depth(L2HubId::Data).await, 1);
+        
+        // Check snapshot
+        let snapshot = handle.snapshot().await;
+        assert_eq!(snapshot.total_queue_depth, 2);
+    }
+
+    #[tokio::test]
+    async fn multi_hub_handle_submit_hub_tx() {
+        let (senders, _receivers) = create_multi_hub_channels(64);
+        let state = Arc::new(Mutex::new(MultiHubBatcherState::new(
+            true,
+            OrganiserVersion::GbdtV1,
+            OrganiserPolicyBounds::default(),
+        )));
+        
+        let handle = MultiHubBatcherHandle::new(senders, state);
+        
+        let hub_tx = HubTx::new(L2HubId::M2m, Tx {
+            chain_id: ChainId(1337),
+            nonce: 1,
+            from: "machine001".to_string(),
+            payload: vec![1, 2, 3],
+        });
+        
+        handle.submit_hub_tx(hub_tx).await.unwrap();
+        assert_eq!(handle.hub_queue_depth(L2HubId::M2m).await, 1);
     }
 }
 
