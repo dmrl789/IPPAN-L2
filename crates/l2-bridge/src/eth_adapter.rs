@@ -830,15 +830,18 @@ mod tests {
             ExternalEventProofV1::EthReceiptMerkleProofV1(l2_core::EthReceiptMerkleProofV1 {
                 chain: ExternalChainId::EthereumMainnet,
                 tx_hash: [0xAA; 32],
+                block_number: 18_000_000,
+                block_hash: [0xEE; 32],
+                header_rlp: vec![0x01, 0x02],
+                receipt_rlp: vec![0x03],
+                proof_nodes: vec![vec![0x04]],
+                tx_index: 0,
                 log_index: 0,
                 contract: [0xBB; 20],
                 topic0: [0xCC; 32],
                 data_hash: [0xDD; 32],
-                block_number: 18_000_000,
-                block_hash: [0xEE; 32],
-                receipt_rlp: vec![0x01],
-                proof_nodes: vec![vec![0x02]],
-                tx_index: 0,
+                confirmations: Some(15),
+                tip_block_number: Some(18_000_015),
             });
 
         let result = verifier.verify(&proof, None);
