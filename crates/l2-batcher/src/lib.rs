@@ -1109,6 +1109,8 @@ pub struct PerHubQueueState {
     pub batch_number: u64,
     /// Total fees finalised (M2M hub only).
     pub total_fees_finalised_scaled: u64,
+    /// Last batch creation timestamp (ms).
+    pub last_batch_created_ms: Option<u64>,
 }
 
 impl PerHubQueueState {
@@ -1141,6 +1143,16 @@ impl PerHubQueueState {
     /// Decay rolling counters.
     pub fn decay_counters(&mut self) {
         self.recent_rejects = self.recent_rejects.saturating_div(2);
+    }
+
+    /// Set the last batch hash (for chaining).
+    pub fn set_last_batch_hash(&mut self, hash: [u8; 32]) {
+        self.last_batch_hash = Some(Hash32(hash));
+    }
+
+    /// Add finalised fees (M2M hub only).
+    pub fn add_finalised_fees(&mut self, fees: u64) {
+        self.total_fees_finalised_scaled = self.total_fees_finalised_scaled.saturating_add(fees);
     }
 }
 
@@ -1529,6 +1541,426 @@ pub fn create_multi_hub_channels(buffer_size: usize) -> (
     }
 
     (senders, MultiHubReceivers::new(receivers))
+}
+
+// ============== Multi-Hub Batcher ==============
+
+/// Configuration for multi-hub batcher.
+#[derive(Debug, Clone)]
+pub struct MultiHubBatcherConfig {
+    /// Maximum transactions per batch per hub.
+    pub max_batch_txs: usize,
+    /// Maximum bytes per batch per hub.
+    pub max_batch_bytes: usize,
+    /// Maximum wait time before building a batch (ms).
+    pub max_wait_ms: u64,
+    /// Chain ID.
+    pub chain_id: ChainId,
+    /// Policy bounds for organiser.
+    pub organiser_bounds: OrganiserPolicyBounds,
+    /// Channel buffer size per hub.
+    pub channel_buffer_size: usize,
+}
+
+impl Default for MultiHubBatcherConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_txs: 256,
+            max_batch_bytes: 512 * 1024,
+            max_wait_ms: 1_000,
+            chain_id: ChainId(1),
+            organiser_bounds: OrganiserPolicyBounds::default(),
+            channel_buffer_size: 1024,
+        }
+    }
+}
+
+impl MultiHubBatcherConfig {
+    /// Create from environment variables.
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            max_batch_txs: std::env::var("L2_MAX_BATCH_TXS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.max_batch_txs),
+            max_batch_bytes: std::env::var("L2_MAX_BATCH_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.max_batch_bytes),
+            max_wait_ms: std::env::var("L2_MAX_WAIT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.max_wait_ms),
+            chain_id: ChainId(
+                std::env::var("L2_CHAIN_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(default.chain_id.0),
+            ),
+            organiser_bounds: OrganiserPolicyBounds::from_env(),
+            channel_buffer_size: std::env::var("L2_CHANNEL_BUFFER_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.channel_buffer_size),
+        }
+    }
+}
+
+/// Spawn a multi-hub batcher with per-hub queues and fairness scheduling.
+///
+/// Returns a handle for submitting transactions to specific hubs.
+pub fn spawn_multi_hub(
+    config: MultiHubBatcherConfig,
+    storage: Arc<Storage>,
+    poster: Arc<dyn BatchPoster>,
+    m2m_storage: Option<Arc<M2mStorage>>,
+    organiser: Option<Arc<dyn OrganiserV2 + Send + Sync>>,
+) -> MultiHubBatcherHandle {
+    let (senders, receivers) = create_multi_hub_channels(config.channel_buffer_size);
+
+    let state = Arc::new(Mutex::new(MultiHubBatcherState::new(
+        true,
+        OrganiserVersion::GbdtV1, // Will be upgraded in loop
+        config.organiser_bounds.clone(),
+    )));
+
+    // Create default organiser if none provided
+    let organiser: Arc<dyn OrganiserV2 + Send + Sync> = organiser.unwrap_or_else(|| {
+        Arc::new(GbdtOrganiserV2::new())
+    });
+
+    tokio::spawn(run_multi_hub_loop(
+        config,
+        storage,
+        poster,
+        receivers,
+        Arc::clone(&state),
+        m2m_storage,
+        organiser,
+    ));
+
+    MultiHubBatcherHandle::new(senders, state)
+}
+
+/// Main loop for multi-hub batcher.
+#[allow(clippy::too_many_arguments)]
+async fn run_multi_hub_loop(
+    config: MultiHubBatcherConfig,
+    storage: Arc<Storage>,
+    poster: Arc<dyn BatchPoster>,
+    mut receivers: MultiHubReceivers,
+    state: Arc<Mutex<MultiHubBatcherState>>,
+    m2m_storage: Option<Arc<M2mStorage>>,
+    organiser: Arc<dyn OrganiserV2 + Send + Sync>,
+) {
+    let mut iteration_counter: u64 = 0;
+    let mut organiser_state = GbdtOrganiserV2::new();
+
+    loop {
+        iteration_counter = iteration_counter.wrapping_add(1);
+
+        // Build V2 organiser inputs from current state
+        let (_inputs_v2, decision) = {
+            let mut guard = state.lock().await;
+
+            // Sync per-hub stats from storage
+            for hub in ALL_HUBS {
+                let hub_str = hub.as_str();
+                let chain_id = config.chain_id.0;
+
+                // Get queue stats
+                let (_queue_depth, forced_depth) = storage
+                    .get_hub_queue_stats(hub_str)
+                    .unwrap_or((0, 0));
+
+                // Get in-flight count
+                let in_flight = storage
+                    .get_hub_in_flight_count(hub_str, chain_id)
+                    .unwrap_or(0);
+
+                let hub_state = guard.hub_state_mut(hub);
+                hub_state.forced_queue_depth = u32::try_from(forced_depth).unwrap_or(u32::MAX);
+                hub_state.in_flight_batches = in_flight;
+            }
+
+            // Build inputs
+            let inputs = guard.build_organiser_inputs_v2(now_ms());
+
+            // Get decision from organiser
+            let decision = organiser.decide(&inputs);
+
+            // Store decision in state
+            guard.last_v2_decision = Some(decision.clone());
+
+            // Decay counters periodically
+            if iteration_counter % 10 == 0 {
+                guard.decay_all_counters();
+            }
+
+            (inputs, decision)
+        };
+
+        debug!(
+            chosen_hub = %decision.chosen_hub,
+            sleep_ms = decision.sleep_ms,
+            max_txs = decision.max_txs,
+            max_bytes = decision.max_bytes,
+            forced_drain_max = decision.forced_drain_max,
+            "organiser v2 decision"
+        );
+
+        // Apply sleep from organiser decision
+        let deadline = Instant::now() + Duration::from_millis(decision.sleep_ms);
+        let chosen_hub = decision.chosen_hub;
+        let hub_str = chosen_hub.as_str();
+        let chain_id = config.chain_id.0;
+
+        let mut batch_txs: Vec<Tx> = Vec::new();
+        let mut batch_bytes: usize = 0;
+        let mut forced_tx_hashes: Vec<Hash32> = Vec::new();
+
+        let max_txs = usize::try_from(decision.max_txs).unwrap_or(config.max_batch_txs);
+        let max_bytes = usize::try_from(decision.max_bytes).unwrap_or(config.max_batch_bytes);
+        let forced_drain_max = usize::try_from(decision.forced_drain_max).unwrap_or(max_txs / 2);
+
+        // Step 1: Get forced txs for this hub
+        match get_forced_txs_for_hub(&storage, hub_str, forced_drain_max).await {
+            Ok(forced_txs) => {
+                let mut forced_bytes_this_batch: u64 = 0;
+                for (tx, tx_hash) in forced_txs {
+                    if batch_txs.len() >= max_txs || batch_bytes >= max_bytes {
+                        break;
+                    }
+                    let tx_size = tx.payload.len();
+                    batch_txs.push(tx);
+                    batch_bytes += tx_size;
+                    forced_tx_hashes.push(tx_hash);
+                    forced_bytes_this_batch =
+                        forced_bytes_this_batch.saturating_add(u64::try_from(tx_size).unwrap_or(0));
+                }
+                if !forced_tx_hashes.is_empty() {
+                    info!(
+                        hub = hub_str,
+                        count = forced_tx_hashes.len(),
+                        bytes = forced_bytes_this_batch,
+                        "including forced txs in hub batch"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(hub = hub_str, error = %err, "failed to get forced txs for hub");
+            }
+        }
+
+        // Step 2: Fill remaining slots from this hub's queue
+        if let Some(rx) = receivers.get_mut(chosen_hub) {
+            while batch_txs.len() < max_txs && batch_bytes < max_bytes {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match timeout(remaining, rx.recv()).await {
+                    Ok(Some(tx)) => {
+                        let tx_size = tx.payload.len();
+                        batch_txs.push(tx);
+                        batch_bytes += tx_size;
+
+                        // Update state
+                        let mut guard = state.lock().await;
+                        let hub_state = guard.hub_state_mut(chosen_hub);
+                        hub_state.queue_depth = hub_state.queue_depth.saturating_sub(1);
+                        hub_state.update_avg_tx_bytes(u64::try_from(tx_size).unwrap_or(0));
+                    }
+                    Ok(None) => {
+                        // Channel closed
+                        info!(hub = hub_str, "hub channel closed, exiting loop");
+                        return;
+                    }
+                    Err(_) => break, // Timeout
+                }
+            }
+        }
+
+        // If no txs, try to drain one from any hub to avoid idle
+        if batch_txs.is_empty() {
+            // Try the chosen hub first
+            if let Some(rx) = receivers.get_mut(chosen_hub) {
+                match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                    Ok(Some(tx)) => {
+                        batch_txs.push(tx);
+                        let mut guard = state.lock().await;
+                        let hub_state = guard.hub_state_mut(chosen_hub);
+                        hub_state.queue_depth = hub_state.queue_depth.saturating_sub(1);
+                    }
+                    Ok(None) => {
+                        info!(hub = hub_str, "hub channel closed");
+                        return;
+                    }
+                    Err(_) => {
+                        // No messages, continue to next iteration
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            }
+        }
+
+        // Get per-hub batch number
+        let batch_number = match storage.next_hub_batch_number(hub_str, chain_id) {
+            Ok(num) => num,
+            Err(err) => {
+                warn!(hub = hub_str, error = %err, "failed to obtain hub batch number");
+                continue;
+            }
+        };
+
+        let batch = Batch {
+            chain_id: config.chain_id,
+            batch_number,
+            txs: batch_txs,
+            created_ms: now_ms(),
+        };
+
+        match storage.put_batch(&batch) {
+            Ok(hash) => {
+                // Mark forced txs as included
+                for forced_hash in &forced_tx_hashes {
+                    if let Err(err) = mark_forced_included(&storage, forced_hash, &hash) {
+                        warn!(
+                            hub = hub_str,
+                            error = %err,
+                            tx_hash = %forced_hash.to_hex(),
+                            "failed to mark forced tx as included"
+                        );
+                    }
+                }
+
+                // Update per-hub stats
+                {
+                    let mut guard = state.lock().await;
+                    let hub_state = guard.hub_state_mut(chosen_hub);
+                    hub_state.batch_number = batch_number;
+                    hub_state.set_last_batch_hash(hash.0);
+                    hub_state.last_batch_created_ms = Some(batch.created_ms);
+                }
+
+                // Increment in-flight count for this hub
+                if let Err(err) = storage.inc_hub_in_flight(hub_str, chain_id) {
+                    warn!(hub = hub_str, error = %err, "failed to increment in-flight count");
+                }
+
+                // Handle M2M fees if this is the M2M hub
+                if chosen_hub.uses_m2m_fees() {
+                    if let Some(m2m) = &m2m_storage {
+                        let batch_hash_hex = hash.to_hex();
+                        let mut batch_total_fee_scaled: u64 = 0;
+                        let mut m2m_tx_count: u64 = 0;
+
+                        for tx in &batch.txs {
+                            let tx_hash = match l2_core::canonical_hash(tx) {
+                                Ok(h) => h,
+                                Err(_) => continue,
+                            };
+
+                            if let Ok(Some(res)) = m2m.get_reservation(&tx_hash.0) {
+                                let final_fee = res.breakdown.total_fee.scaled();
+                                match m2m.finalise_fee_with_batch(
+                                    &res.machine_id,
+                                    tx_hash.0,
+                                    final_fee,
+                                    now_ms(),
+                                    &batch_hash_hex,
+                                ) {
+                                    Ok(result) => {
+                                        if result.is_new() {
+                                            let (charged, _refund) = match &result {
+                                                l2_storage::m2m::FinaliseFeeResult::Finalised {
+                                                    charged_scaled, ..
+                                                } => (*charged_scaled, 0),
+                                                l2_storage::m2m::FinaliseFeeResult::AlreadyFinalised {
+                                                    charged_scaled, ..
+                                                } => (*charged_scaled, 0),
+                                            };
+                                            batch_total_fee_scaled =
+                                                batch_total_fee_scaled.saturating_add(charged);
+                                            m2m_tx_count = m2m_tx_count.saturating_add(1);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(error = %err, "failed to finalize M2M fee");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Update hub fee totals
+                        if batch_total_fee_scaled > 0 {
+                            if let Err(err) = storage.add_hub_total_fees(hub_str, chain_id, batch_total_fee_scaled) {
+                                warn!(error = %err, "failed to update hub fee totals");
+                            }
+
+                            let mut guard = state.lock().await;
+                            let hub_state = guard.hub_state_mut(chosen_hub);
+                            hub_state.add_finalised_fees(batch_total_fee_scaled);
+                        }
+
+                        info!(
+                            hub = hub_str,
+                            batch_hash = %hash.to_hex(),
+                            total_fees = batch_total_fee_scaled,
+                            m2m_tx_count = m2m_tx_count,
+                            "finalized M2M fees for hub batch"
+                        );
+                    }
+                }
+
+                // Post the batch
+                if let Err(err) = poster.post_batch(&batch, &hash).await {
+                    warn!(hub = hub_str, error = %err, "poster failed for hub batch");
+                } else {
+                    // Update last batch hash in storage for chaining
+                    if let Err(err) = storage.set_last_batch_hash(hub_str, chain_id, &hash) {
+                        warn!(hub = hub_str, error = %err, "failed to update last batch hash");
+                    }
+                }
+
+                // Mark hub as served for fairness tracking
+                organiser_state.mark_hub_served(chosen_hub);
+
+                info!(
+                    hub = hub_str,
+                    batch_number = batch_number,
+                    tx_count = batch.txs.len(),
+                    batch_hash = %hash.to_hex(),
+                    forced_count = forced_tx_hashes.len(),
+                    "created hub batch"
+                );
+            }
+            Err(err) => {
+                warn!(hub = hub_str, error = %err, "failed to persist hub batch");
+            }
+        }
+    }
+}
+
+/// Get forced txs for a specific hub.
+async fn get_forced_txs_for_hub(
+    storage: &Storage,
+    hub: &str,
+    limit: usize,
+) -> Result<Vec<(Tx, Hash32)>, BatcherError> {
+    let tickets = storage.list_queued_forced_for_hub(hub, limit)?;
+    let mut txs = Vec::new();
+
+    for ticket in tickets {
+        if let Ok(Some(tx)) = storage.get_tx(&ticket.tx_hash) {
+            txs.push((tx, ticket.tx_hash));
+        }
+    }
+
+    Ok(txs)
 }
 
 pub struct BatcherHandle {
@@ -2363,6 +2795,69 @@ mod tests {
         
         handle.submit_hub_tx(hub_tx).await.unwrap();
         assert_eq!(handle.hub_queue_depth(L2HubId::M2m).await, 1);
+    }
+
+    #[test]
+    fn multi_hub_batcher_config_defaults() {
+        let config = MultiHubBatcherConfig::default();
+        assert_eq!(config.max_batch_txs, 256);
+        assert_eq!(config.max_batch_bytes, 512 * 1024);
+        assert_eq!(config.max_wait_ms, 1_000);
+        assert_eq!(config.chain_id.0, 1);
+        assert_eq!(config.channel_buffer_size, 1024);
+    }
+
+    #[test]
+    fn per_hub_queue_state_set_last_batch_hash() {
+        let mut state = PerHubQueueState::new();
+        assert!(state.last_batch_hash.is_none());
+        
+        let hash = [0xaa; 32];
+        state.set_last_batch_hash(hash);
+        assert!(state.last_batch_hash.is_some());
+        assert_eq!(state.last_batch_hash.unwrap().0, hash);
+    }
+
+    #[test]
+    fn per_hub_queue_state_add_finalised_fees() {
+        let mut state = PerHubQueueState::new();
+        assert_eq!(state.total_fees_finalised_scaled, 0);
+        
+        state.add_finalised_fees(1000);
+        assert_eq!(state.total_fees_finalised_scaled, 1000);
+        
+        state.add_finalised_fees(500);
+        assert_eq!(state.total_fees_finalised_scaled, 1500);
+        
+        // Test saturation
+        state.total_fees_finalised_scaled = u64::MAX - 10;
+        state.add_finalised_fees(100);
+        assert_eq!(state.total_fees_finalised_scaled, u64::MAX);
+    }
+
+    #[test]
+    fn per_hub_queue_state_last_batch_created_ms() {
+        let mut state = PerHubQueueState::new();
+        assert!(state.last_batch_created_ms.is_none());
+        
+        state.last_batch_created_ms = Some(now_ms());
+        assert!(state.last_batch_created_ms.is_some());
+    }
+
+    #[test]
+    fn get_forced_txs_for_hub_handles_empty() {
+        // This tests the async function with an empty storage
+        // The function should return an empty vec when no forced txs
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            get_forced_txs_for_hub(&storage, "fin", 10).await
+        });
+        
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }
 
