@@ -12,6 +12,7 @@
 //! This crate provides persistent storage for batches, transactions, and
 //! settlement state. All operations are crash-safe and atomic.
 
+pub mod intents;
 pub mod m2m;
 pub mod m2m_ops;
 pub mod settlement;
@@ -28,6 +29,11 @@ use tracing::info;
 pub use settlement::{
     validate_transition, SettlementState, SettlementStateCounts, SettlementStateEntry,
     SettlementTransitionError,
+};
+
+pub use intents::{
+    validate_intent_transition, IntentState, IntentStateCounts, IntentStateEntry, IntentStorage,
+    IntentStorageError, IntentTransitionError,
 };
 
 pub const SCHEMA_VERSION: &str = "3";
