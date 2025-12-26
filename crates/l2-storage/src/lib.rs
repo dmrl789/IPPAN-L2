@@ -690,6 +690,246 @@ impl Storage {
         Ok(self.meta.remove(key.as_bytes())?.is_some())
     }
 
+    // ========== Per-Hub Batch Number APIs ==========
+
+    /// Get the last batch number for a given hub and chain.
+    ///
+    /// Returns 0 if no batches have been created yet (genesis case).
+    pub fn get_hub_batch_number(&self, hub: &str, chain_id: u64) -> Result<u64, StorageError> {
+        let key = format!("hub_batch_number:{}:{}", hub, chain_id);
+        match self.meta.get(key.as_bytes())? {
+            Some(ivec) => {
+                if ivec.len() != 8 {
+                    return Err(StorageError::Canonical(l2_core::CanonicalError::FromHex(
+                        "invalid batch number length".to_string(),
+                    )));
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&ivec);
+                Ok(u64::from_le_bytes(bytes))
+            }
+            None => {
+                // Check for legacy key migration
+                self.migrate_legacy_batch_number(hub, chain_id)
+            }
+        }
+    }
+
+    /// Increment and get the next batch number for a given hub and chain.
+    ///
+    /// This is atomic and safe for concurrent access.
+    pub fn next_hub_batch_number(&self, hub: &str, chain_id: u64) -> Result<u64, StorageError> {
+        let current = self.get_hub_batch_number(hub, chain_id)?;
+        let next = current.saturating_add(1);
+        self.set_hub_batch_number(hub, chain_id, next)?;
+        Ok(next)
+    }
+
+    /// Set the batch number for a given hub and chain.
+    pub fn set_hub_batch_number(
+        &self,
+        hub: &str,
+        chain_id: u64,
+        batch_number: u64,
+    ) -> Result<(), StorageError> {
+        let key = format!("hub_batch_number:{}:{}", hub, chain_id);
+        self.meta.insert(key.as_bytes(), &batch_number.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Migrate legacy batch number to per-hub format.
+    ///
+    /// If legacy key exists, map it to the default hub (Fin) for backward compatibility.
+    fn migrate_legacy_batch_number(&self, hub: &str, chain_id: u64) -> Result<u64, StorageError> {
+        // Only migrate if hub is "fin" (default hub)
+        if hub == "fin" {
+            if let Some(legacy_bytes) = self.meta.get("last_batch_number")? {
+                if let Ok(bytes) = legacy_bytes.as_ref().try_into() {
+                    let legacy_number = u64::from_le_bytes(bytes);
+                    // Migrate to new key
+                    self.set_hub_batch_number(hub, chain_id, legacy_number)?;
+                    tracing::info!(
+                        hub = hub,
+                        chain_id = chain_id,
+                        batch_number = legacy_number,
+                        "migrated legacy batch number to per-hub format"
+                    );
+                    return Ok(legacy_number);
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    // ========== Per-Hub Queue Statistics ==========
+
+    /// Get per-hub queue statistics.
+    ///
+    /// Returns (queue_depth, forced_queue_depth) for the given hub.
+    pub fn get_hub_queue_stats(&self, hub: &str) -> Result<(u64, u64), StorageError> {
+        let queue_key = format!("hub_queue_depth:{}", hub);
+        let forced_key = format!("hub_forced_depth:{}", hub);
+
+        let queue_depth = self.meta.get(queue_key.as_bytes())?
+            .and_then(|ivec| ivec.as_ref().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+
+        let forced_depth = self.meta.get(forced_key.as_bytes())?
+            .and_then(|ivec| ivec.as_ref().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+
+        Ok((queue_depth, forced_depth))
+    }
+
+    /// Update per-hub queue statistics.
+    pub fn set_hub_queue_stats(
+        &self,
+        hub: &str,
+        queue_depth: u64,
+        forced_depth: u64,
+    ) -> Result<(), StorageError> {
+        let queue_key = format!("hub_queue_depth:{}", hub);
+        let forced_key = format!("hub_forced_depth:{}", hub);
+
+        self.meta.insert(queue_key.as_bytes(), &queue_depth.to_le_bytes())?;
+        self.meta.insert(forced_key.as_bytes(), &forced_depth.to_le_bytes())?;
+        Ok(())
+    }
+
+    // ========== Per-Hub Fee Totals ==========
+
+    /// Get total finalised fees for a hub (M2M hub only).
+    pub fn get_hub_total_fees(&self, hub: &str, chain_id: u64) -> Result<u64, StorageError> {
+        let key = format!("hub_total_fees:{}:{}", hub, chain_id);
+        Ok(self.meta.get(key.as_bytes())?
+            .and_then(|ivec| ivec.as_ref().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0))
+    }
+
+    /// Add to total finalised fees for a hub.
+    pub fn add_hub_total_fees(
+        &self,
+        hub: &str,
+        chain_id: u64,
+        amount_scaled: u64,
+    ) -> Result<u64, StorageError> {
+        let current = self.get_hub_total_fees(hub, chain_id)?;
+        let new_total = current.saturating_add(amount_scaled);
+        let key = format!("hub_total_fees:{}:{}", hub, chain_id);
+        self.meta.insert(key.as_bytes(), &new_total.to_le_bytes())?;
+        Ok(new_total)
+    }
+
+    // ========== Per-Hub In-Flight Batch Tracking ==========
+
+    /// Get the count of in-flight batches for a given hub.
+    pub fn get_hub_in_flight_count(&self, hub: &str, chain_id: u64) -> Result<u32, StorageError> {
+        let key = format!("hub_in_flight:{}:{}", hub, chain_id);
+        Ok(self.meta.get(key.as_bytes())?
+            .and_then(|ivec| ivec.as_ref().try_into().ok().map(u32::from_le_bytes))
+            .unwrap_or(0))
+    }
+
+    /// Increment in-flight batch count for a hub.
+    pub fn inc_hub_in_flight(&self, hub: &str, chain_id: u64) -> Result<u32, StorageError> {
+        let current = self.get_hub_in_flight_count(hub, chain_id)?;
+        let new_count = current.saturating_add(1);
+        let key = format!("hub_in_flight:{}:{}", hub, chain_id);
+        self.meta.insert(key.as_bytes(), &new_count.to_le_bytes())?;
+        Ok(new_count)
+    }
+
+    /// Decrement in-flight batch count for a hub.
+    pub fn dec_hub_in_flight(&self, hub: &str, chain_id: u64) -> Result<u32, StorageError> {
+        let current = self.get_hub_in_flight_count(hub, chain_id)?;
+        let new_count = current.saturating_sub(1);
+        let key = format!("hub_in_flight:{}:{}", hub, chain_id);
+        self.meta.insert(key.as_bytes(), &new_count.to_le_bytes())?;
+        Ok(new_count)
+    }
+
+    // ========== Per-Hub Forced Queue APIs ==========
+
+    /// Store a forced inclusion ticket with hub association.
+    pub fn put_forced_ticket_for_hub(
+        &self,
+        hub: &str,
+        ticket: &InclusionTicket,
+    ) -> Result<(), StorageError> {
+        // Store the ticket
+        self.put_forced_ticket(ticket)?;
+        // Also store the hub association
+        let hub_key = format!("forced_hub:{}:{}", hub, hex::encode(ticket.tx_hash.0));
+        self.meta.insert(hub_key.as_bytes(), hub.as_bytes())?;
+        Ok(())
+    }
+
+    /// Get the hub for a forced ticket.
+    pub fn get_forced_ticket_hub(&self, tx_hash: &Hash32) -> Result<Option<String>, StorageError> {
+        // Check all hubs for this tx_hash
+        for hub in &["fin", "data", "m2m", "world", "bridge"] {
+            let hub_key = format!("forced_hub:{}:{}", hub, hex::encode(tx_hash.0));
+            if self.meta.contains_key(hub_key.as_bytes())? {
+                return Ok(Some((*hub).to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// List queued forced tickets for a specific hub.
+    pub fn list_queued_forced_for_hub(
+        &self,
+        hub: &str,
+        limit: usize,
+    ) -> Result<Vec<InclusionTicket>, StorageError> {
+        let mut tickets = Vec::new();
+        for result in self.forced_queue.iter() {
+            if tickets.len() >= limit {
+                break;
+            }
+            let (key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            if ticket.status == ForcedInclusionStatus::Queued {
+                // Check if this ticket belongs to this hub
+                let tx_hash = Hash32(key.as_ref().try_into().map_err(|_| {
+                    StorageError::Canonical(l2_core::CanonicalError::FromHex(
+                        "invalid tx hash length".to_string(),
+                    ))
+                })?);
+                let hub_key = format!("forced_hub:{}:{}", hub, hex::encode(tx_hash.0));
+                if self.meta.contains_key(hub_key.as_bytes())? {
+                    tickets.push(ticket);
+                }
+            }
+        }
+        Ok(tickets)
+    }
+
+    /// Count forced tickets by hub and status.
+    pub fn count_forced_queue_for_hub(&self, hub: &str) -> Result<ForcedQueueCounts, StorageError> {
+        let mut counts = ForcedQueueCounts::default();
+        for result in self.forced_queue.iter() {
+            let (key, value) = result?;
+            let ticket: InclusionTicket = canonical_decode(&value)?;
+            // Check if this ticket belongs to this hub
+            let tx_hash = Hash32(key.as_ref().try_into().map_err(|_| {
+                StorageError::Canonical(l2_core::CanonicalError::FromHex(
+                    "invalid tx hash length".to_string(),
+                ))
+            })?);
+            let hub_key = format!("forced_hub:{}:{}", hub, hex::encode(tx_hash.0));
+            if self.meta.contains_key(hub_key.as_bytes())? {
+                match ticket.status {
+                    ForcedInclusionStatus::Queued => counts.queued += 1,
+                    ForcedInclusionStatus::Included => counts.included += 1,
+                    ForcedInclusionStatus::Rejected => counts.rejected += 1,
+                    ForcedInclusionStatus::Expired => counts.expired += 1,
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     // ========== Settlement State APIs ==========
 
     /// Set the settlement state for a batch.
@@ -1631,5 +1871,170 @@ mod tests {
             .unwrap();
         assert_eq!(loaded_hash, hash2);
         assert_eq!(loaded_ts, timestamp2);
+    }
+
+    // ========== Per-Hub Batch Number Tests ==========
+
+    #[test]
+    fn hub_batch_number_starts_at_zero() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let batch_number = storage.get_hub_batch_number("fin", 1337).unwrap();
+        assert_eq!(batch_number, 0);
+    }
+
+    #[test]
+    fn hub_batch_number_increment() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        assert_eq!(storage.next_hub_batch_number("fin", 1337).unwrap(), 1);
+        assert_eq!(storage.next_hub_batch_number("fin", 1337).unwrap(), 2);
+        assert_eq!(storage.next_hub_batch_number("fin", 1337).unwrap(), 3);
+        assert_eq!(storage.get_hub_batch_number("fin", 1337).unwrap(), 3);
+    }
+
+    #[test]
+    fn hub_batch_number_per_hub_isolation() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Each hub has independent batch numbers
+        assert_eq!(storage.next_hub_batch_number("fin", 1337).unwrap(), 1);
+        assert_eq!(storage.next_hub_batch_number("data", 1337).unwrap(), 1);
+        assert_eq!(storage.next_hub_batch_number("m2m", 1337).unwrap(), 1);
+
+        assert_eq!(storage.next_hub_batch_number("fin", 1337).unwrap(), 2);
+        assert_eq!(storage.get_hub_batch_number("data", 1337).unwrap(), 1);
+        assert_eq!(storage.get_hub_batch_number("m2m", 1337).unwrap(), 1);
+    }
+
+    #[test]
+    fn hub_batch_number_per_chain_isolation() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        // Same hub, different chains have independent batch numbers
+        assert_eq!(storage.next_hub_batch_number("fin", 1).unwrap(), 1);
+        assert_eq!(storage.next_hub_batch_number("fin", 2).unwrap(), 1);
+
+        assert_eq!(storage.next_hub_batch_number("fin", 1).unwrap(), 2);
+        assert_eq!(storage.get_hub_batch_number("fin", 2).unwrap(), 1);
+    }
+
+    // ========== Per-Hub Queue Stats Tests ==========
+
+    #[test]
+    fn hub_queue_stats_default_zero() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        let (queue, forced) = storage.get_hub_queue_stats("fin").unwrap();
+        assert_eq!(queue, 0);
+        assert_eq!(forced, 0);
+    }
+
+    #[test]
+    fn hub_queue_stats_roundtrip() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        storage.set_hub_queue_stats("fin", 100, 5).unwrap();
+        let (queue, forced) = storage.get_hub_queue_stats("fin").unwrap();
+        assert_eq!(queue, 100);
+        assert_eq!(forced, 5);
+    }
+
+    #[test]
+    fn hub_queue_stats_per_hub_isolation() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        storage.set_hub_queue_stats("fin", 100, 5).unwrap();
+        storage.set_hub_queue_stats("data", 200, 10).unwrap();
+
+        let (fin_queue, fin_forced) = storage.get_hub_queue_stats("fin").unwrap();
+        assert_eq!(fin_queue, 100);
+        assert_eq!(fin_forced, 5);
+
+        let (data_queue, data_forced) = storage.get_hub_queue_stats("data").unwrap();
+        assert_eq!(data_queue, 200);
+        assert_eq!(data_forced, 10);
+    }
+
+    // ========== Per-Hub Fee Totals Tests ==========
+
+    #[test]
+    fn hub_total_fees_default_zero() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        assert_eq!(storage.get_hub_total_fees("m2m", 1337).unwrap(), 0);
+    }
+
+    #[test]
+    fn hub_total_fees_accumulate() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        storage.add_hub_total_fees("m2m", 1337, 1_000_000).unwrap();
+        assert_eq!(storage.get_hub_total_fees("m2m", 1337).unwrap(), 1_000_000);
+
+        storage.add_hub_total_fees("m2m", 1337, 500_000).unwrap();
+        assert_eq!(storage.get_hub_total_fees("m2m", 1337).unwrap(), 1_500_000);
+    }
+
+    #[test]
+    fn hub_total_fees_per_hub_isolation() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        storage.add_hub_total_fees("m2m", 1337, 1_000_000).unwrap();
+        storage.add_hub_total_fees("fin", 1337, 500_000).unwrap();
+
+        assert_eq!(storage.get_hub_total_fees("m2m", 1337).unwrap(), 1_000_000);
+        assert_eq!(storage.get_hub_total_fees("fin", 1337).unwrap(), 500_000);
+    }
+
+    // ========== Per-Hub In-Flight Tests ==========
+
+    #[test]
+    fn hub_in_flight_starts_at_zero() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        assert_eq!(storage.get_hub_in_flight_count("fin", 1337).unwrap(), 0);
+    }
+
+    #[test]
+    fn hub_in_flight_increment_decrement() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        assert_eq!(storage.inc_hub_in_flight("fin", 1337).unwrap(), 1);
+        assert_eq!(storage.inc_hub_in_flight("fin", 1337).unwrap(), 2);
+        assert_eq!(storage.inc_hub_in_flight("fin", 1337).unwrap(), 3);
+
+        assert_eq!(storage.dec_hub_in_flight("fin", 1337).unwrap(), 2);
+        assert_eq!(storage.dec_hub_in_flight("fin", 1337).unwrap(), 1);
+        assert_eq!(storage.dec_hub_in_flight("fin", 1337).unwrap(), 0);
+
+        // Should not go negative
+        assert_eq!(storage.dec_hub_in_flight("fin", 1337).unwrap(), 0);
+    }
+
+    #[test]
+    fn hub_in_flight_per_hub_isolation() {
+        let dir = tempdir().expect("tmpdir");
+        let storage = Storage::open(dir.path()).expect("open");
+
+        storage.inc_hub_in_flight("fin", 1337).unwrap();
+        storage.inc_hub_in_flight("fin", 1337).unwrap();
+        storage.inc_hub_in_flight("data", 1337).unwrap();
+
+        assert_eq!(storage.get_hub_in_flight_count("fin", 1337).unwrap(), 2);
+        assert_eq!(storage.get_hub_in_flight_count("data", 1337).unwrap(), 1);
+        assert_eq!(storage.get_hub_in_flight_count("m2m", 1337).unwrap(), 0);
     }
 }
