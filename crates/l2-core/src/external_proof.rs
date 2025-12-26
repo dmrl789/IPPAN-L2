@@ -26,6 +26,54 @@ use thiserror::Error;
 /// Used to prevent cross-protocol replay attacks.
 pub const EXTERNAL_PROOF_SIGNING_DOMAIN_V1: &[u8] = b"IPPAN-L2:EXTERNAL_PROOF_ATTESTATION:V1\n";
 
+/// Maximum size for receipt RLP bytes.
+pub const MAX_RECEIPT_RLP_SIZE: usize = 65536; // 64 KB
+
+/// Maximum size for a single proof node.
+pub const MAX_PROOF_NODE_SIZE: usize = 4096; // 4 KB
+
+/// Maximum number of proof nodes in a Merkle proof.
+pub const MAX_PROOF_NODES: usize = 128;
+
+/// Maximum size for block header RLP bytes.
+pub const MAX_HEADER_RLP_SIZE: usize = 8192; // 8 KB
+
+/// Verification mode for external chain proofs.
+///
+/// This enum represents the trust model used to verify an external event:
+///
+/// - `Attestation`: Fastest but requires trust in allowlisted attestors
+/// - `EthMerkleReceiptProof`: Stronger cryptographic verification using MPT proofs
+/// - Future: `LightClient` for fully trust-minimised verification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VerificationMode {
+    /// Verification via signed attestation from a trusted attestor.
+    ///
+    /// Trust assumption: The attestor is honest and correctly observed the event.
+    Attestation,
+
+    /// Verification via Ethereum Merkle Patricia Trie receipt inclusion proof.
+    ///
+    /// Trust assumption: The block header is valid (confirmations policy or light client).
+    EthMerkleReceiptProof,
+}
+
+impl VerificationMode {
+    /// Get a human-readable name for the mode.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Attestation => "attestation",
+            Self::EthMerkleReceiptProof => "eth_merkle_receipt_proof",
+        }
+    }
+}
+
+impl fmt::Display for VerificationMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
 /// Identifier for an external chain.
 ///
 /// Uses explicit enum variants for well-known chains to avoid arbitrary string
@@ -194,6 +242,62 @@ impl ExternalEventProofV1 {
             ExternalEventProofV1::EthReceiptMerkleProofV1(_) => "eth_receipt_merkle_v1",
         }
     }
+
+    /// Get the verification mode for this proof.
+    pub fn verification_mode(&self) -> VerificationMode {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => p.verification_mode(),
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => p.verification_mode(),
+        }
+    }
+
+    /// Get the log index this proof refers to.
+    pub fn log_index(&self) -> u32 {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => p.log_index,
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => p.log_index,
+        }
+    }
+
+    /// Get the contract address this proof refers to.
+    pub fn contract(&self) -> &[u8; 20] {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => &p.contract,
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => &p.contract,
+        }
+    }
+
+    /// Get the topic0 (event signature) this proof refers to.
+    pub fn topic0(&self) -> &[u8; 32] {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => &p.topic0,
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => &p.topic0,
+        }
+    }
+
+    /// Get the data hash this proof refers to.
+    pub fn data_hash(&self) -> &[u8; 32] {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => &p.data_hash,
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => &p.data_hash,
+        }
+    }
+
+    /// Get the block hash this proof refers to.
+    pub fn block_hash(&self) -> &[u8; 32] {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => &p.block_hash,
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => &p.block_hash,
+        }
+    }
+
+    /// Get the confirmations (if available).
+    pub fn confirmations(&self) -> Option<u32> {
+        match self {
+            ExternalEventProofV1::EthReceiptAttestationV1(p) => Some(p.confirmations),
+            ExternalEventProofV1::EthReceiptMerkleProofV1(p) => p.confirmations,
+        }
+    }
 }
 
 /// Ethereum receipt attestation (signed statement from trusted attestor).
@@ -320,6 +424,11 @@ impl EthReceiptAttestationV1 {
         message.extend_from_slice(&canonical_bytes);
         Ok(message)
     }
+
+    /// Get the verification mode for this proof type.
+    pub fn verification_mode(&self) -> VerificationMode {
+        VerificationMode::Attestation
+    }
 }
 
 /// Attestation data (everything except the signature).
@@ -345,9 +454,18 @@ pub struct AttestationData {
     pub attestor_pubkey: [u8; 32],
 }
 
-/// Ethereum receipt Merkle proof (stub for future implementation).
+/// Ethereum receipt Merkle/Patricia proof (V1).
 ///
-/// This will contain the Merkle proof against the receipts root in the block header.
+/// This provides cryptographic proof of receipt inclusion in a block's receipts trie.
+/// Verification steps:
+/// 1. Verify block header hash matches `block_hash`
+/// 2. Verify receipt RLP is included in the receipts trie at `tx_index` using MPT proof
+/// 3. Decode receipt and verify the log at `log_index` matches expected event filters
+///
+/// ## Trust Model
+///
+/// This proof eliminates trust in attestors but still requires policy decisions about
+/// block finality (confirmation count, light client, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EthReceiptMerkleProofV1 {
     /// The external chain this event occurred on.
@@ -357,36 +475,58 @@ pub struct EthReceiptMerkleProofV1 {
     #[serde(with = "hex_32")]
     pub tx_hash: [u8; 32],
 
-    /// Log index within the transaction receipt.
-    pub log_index: u32,
-
-    /// Contract address that emitted the event (20 bytes).
-    #[serde(with = "hex_20")]
-    pub contract: [u8; 20],
-
-    /// First topic (event signature, 32 bytes).
-    #[serde(with = "hex_32")]
-    pub topic0: [u8; 32],
-
-    /// Blake3 hash of the event data.
-    #[serde(with = "hex_32")]
-    pub data_hash: [u8; 32],
-
     /// Block number where the transaction was included.
     pub block_number: u64,
 
     /// Block hash where the transaction was included (32 bytes).
+    /// This must match keccak256(header_rlp).
     #[serde(with = "hex_32")]
     pub block_hash: [u8; 32],
 
-    /// RLP-encoded receipt (for Merkle verification).
+    /// RLP-encoded block header.
+    /// Used to verify block_hash and extract receipts_root.
+    #[serde(with = "hex_vec")]
+    pub header_rlp: Vec<u8>,
+
+    /// RLP-encoded transaction receipt.
+    /// May be prefixed with transaction type byte for EIP-2718 typed receipts.
+    #[serde(with = "hex_vec")]
     pub receipt_rlp: Vec<u8>,
 
-    /// Merkle proof nodes (list of hashes).
+    /// Merkle Patricia Trie proof nodes.
+    /// Each node is RLP-encoded. The proof demonstrates inclusion of `receipt_rlp`
+    /// at key `rlp_encode(tx_index)` in the trie with root `receipts_root`.
+    #[serde(with = "hex_vec_vec")]
     pub proof_nodes: Vec<Vec<u8>>,
 
-    /// Transaction index in the block.
+    /// Transaction index in the block (receipt position).
     pub tx_index: u32,
+
+    /// Log index within the transaction receipt.
+    pub log_index: u32,
+
+    /// Expected contract address that emitted the event (20 bytes).
+    #[serde(with = "hex_20")]
+    pub contract: [u8; 20],
+
+    /// Expected first topic / event signature (32 bytes).
+    #[serde(with = "hex_32")]
+    pub topic0: [u8; 32],
+
+    /// Blake3 hash of the expected event data.
+    /// Verifier computes blake3(log.data) and compares.
+    #[serde(with = "hex_32")]
+    pub data_hash: [u8; 32],
+
+    /// Optional: Number of confirmations at proof creation time.
+    /// This is informational and may be verified against RPC tip or light client.
+    #[serde(default)]
+    pub confirmations: Option<u32>,
+
+    /// Optional: Tip block number at proof creation time.
+    /// Used for RPC-assisted confirmation checking.
+    #[serde(default)]
+    pub tip_block_number: Option<u64>,
 }
 
 impl EthReceiptMerkleProofV1 {
@@ -402,14 +542,41 @@ impl EthReceiptMerkleProofV1 {
             return Err(ExternalProofValidationError::ZeroContractAddress);
         }
 
+        // Topic0 must not be zero (event signature)
+        if self.topic0 == [0u8; 32] {
+            return Err(ExternalProofValidationError::ZeroTopic);
+        }
+
         // Tx hash must not be zero
         if self.tx_hash == [0u8; 32] {
             return Err(ExternalProofValidationError::ZeroTxHash);
         }
 
-        // Receipt RLP must not be empty
+        // Block hash must not be zero
+        if self.block_hash == [0u8; 32] {
+            return Err(ExternalProofValidationError::ZeroBlockHash);
+        }
+
+        // Header RLP must not be empty and within bounds
+        if self.header_rlp.is_empty() {
+            return Err(ExternalProofValidationError::EmptyHeaderRlp);
+        }
+        if self.header_rlp.len() > MAX_HEADER_RLP_SIZE {
+            return Err(ExternalProofValidationError::HeaderRlpTooLarge {
+                size: self.header_rlp.len(),
+                max: MAX_HEADER_RLP_SIZE,
+            });
+        }
+
+        // Receipt RLP must not be empty and within bounds
         if self.receipt_rlp.is_empty() {
             return Err(ExternalProofValidationError::EmptyReceiptRlp);
+        }
+        if self.receipt_rlp.len() > MAX_RECEIPT_RLP_SIZE {
+            return Err(ExternalProofValidationError::ReceiptRlpTooLarge {
+                size: self.receipt_rlp.len(),
+                max: MAX_RECEIPT_RLP_SIZE,
+            });
         }
 
         // Proof nodes must not be empty
@@ -417,7 +584,31 @@ impl EthReceiptMerkleProofV1 {
             return Err(ExternalProofValidationError::EmptyProofNodes);
         }
 
+        // Proof node count within bounds
+        if self.proof_nodes.len() > MAX_PROOF_NODES {
+            return Err(ExternalProofValidationError::TooManyProofNodes {
+                count: self.proof_nodes.len(),
+                max: MAX_PROOF_NODES,
+            });
+        }
+
+        // Each proof node within bounds
+        for (i, node) in self.proof_nodes.iter().enumerate() {
+            if node.len() > MAX_PROOF_NODE_SIZE {
+                return Err(ExternalProofValidationError::ProofNodeTooLarge {
+                    index: i,
+                    size: node.len(),
+                    max: MAX_PROOF_NODE_SIZE,
+                });
+            }
+        }
+
         Ok(())
+    }
+
+    /// Get the verification mode for this proof type.
+    pub fn verification_mode(&self) -> VerificationMode {
+        VerificationMode::EthMerkleReceiptProof
     }
 }
 
@@ -445,11 +636,30 @@ pub enum ExternalProofValidationError {
     #[error("zero attestor public key not allowed")]
     ZeroAttestorKey,
 
+    #[error("empty header RLP not allowed")]
+    EmptyHeaderRlp,
+
+    #[error("header RLP too large: {size} bytes > max {max}")]
+    HeaderRlpTooLarge { size: usize, max: usize },
+
     #[error("empty receipt RLP not allowed")]
     EmptyReceiptRlp,
 
+    #[error("receipt RLP too large: {size} bytes > max {max}")]
+    ReceiptRlpTooLarge { size: usize, max: usize },
+
     #[error("empty proof nodes not allowed")]
     EmptyProofNodes,
+
+    #[error("too many proof nodes: {count} > max {max}")]
+    TooManyProofNodes { count: usize, max: usize },
+
+    #[error("proof node {index} too large: {size} bytes > max {max}")]
+    ProofNodeTooLarge {
+        index: usize,
+        size: usize,
+        max: usize,
+    },
 }
 
 /// Verification state for an external proof.
@@ -609,6 +819,54 @@ mod hex_64 {
         let mut out = [0u8; 64];
         out.copy_from_slice(&raw);
         Ok(out)
+    }
+}
+
+/// Serde helper for encoding `Vec<u8>` as lowercase hex string.
+mod hex_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        hex::decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Serde helper for encoding `Vec<Vec<u8>>` as array of lowercase hex strings.
+mod hex_vec_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(bytes_vec: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hex_strings: Vec<String> = bytes_vec.iter().map(hex::encode).collect();
+        hex_strings.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let strings: Vec<String> = Vec::deserialize(deserializer)?;
+        strings
+            .into_iter()
+            .map(|s| {
+                let s = s.strip_prefix("0x").unwrap_or(&s);
+                hex::decode(s).map_err(serde::de::Error::custom)
+            })
+            .collect()
     }
 }
 
@@ -917,42 +1175,59 @@ mod tests {
         assert_eq!(msg1, msg2);
     }
 
-    // ========== Merkle Proof Stub Tests ==========
+    // ========== Merkle Proof Tests ==========
 
-    #[test]
-    fn merkle_proof_validate_basic() {
-        let proof = EthReceiptMerkleProofV1 {
+    fn test_merkle_proof() -> EthReceiptMerkleProofV1 {
+        EthReceiptMerkleProofV1 {
             chain: ExternalChainId::EthereumMainnet,
             tx_hash: [0xAA; 32],
+            block_number: 18_000_000,
+            block_hash: [0xEE; 32],
+            header_rlp: vec![0x01, 0x02, 0x03],
+            receipt_rlp: vec![0x04, 0x05, 0x06],
+            proof_nodes: vec![vec![0x07, 0x08]],
+            tx_index: 0,
             log_index: 0,
             contract: [0xBB; 20],
             topic0: [0xCC; 32],
             data_hash: [0xDD; 32],
-            block_number: 18_000_000,
-            block_hash: [0xEE; 32],
-            receipt_rlp: vec![0x01, 0x02, 0x03],
-            proof_nodes: vec![vec![0x04, 0x05]],
-            tx_index: 0,
-        };
+            confirmations: Some(15),
+            tip_block_number: Some(18_000_015),
+        }
+    }
 
+    #[test]
+    fn merkle_proof_validate_basic() {
+        let proof = test_merkle_proof();
         assert!(proof.validate_basic().is_ok());
     }
 
     #[test]
+    fn merkle_proof_validate_empty_header_rlp() {
+        let mut proof = test_merkle_proof();
+        proof.header_rlp = vec![];
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::EmptyHeaderRlp)
+        ));
+    }
+
+    #[test]
+    fn merkle_proof_validate_header_rlp_too_large() {
+        let mut proof = test_merkle_proof();
+        proof.header_rlp = vec![0u8; MAX_HEADER_RLP_SIZE + 1];
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::HeaderRlpTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn merkle_proof_validate_empty_rlp() {
-        let proof = EthReceiptMerkleProofV1 {
-            chain: ExternalChainId::EthereumMainnet,
-            tx_hash: [0xAA; 32],
-            log_index: 0,
-            contract: [0xBB; 20],
-            topic0: [0xCC; 32],
-            data_hash: [0xDD; 32],
-            block_number: 18_000_000,
-            block_hash: [0xEE; 32],
-            receipt_rlp: vec![],
-            proof_nodes: vec![vec![0x01]],
-            tx_index: 0,
-        };
+        let mut proof = test_merkle_proof();
+        proof.receipt_rlp = vec![];
 
         assert!(matches!(
             proof.validate_basic(),
@@ -961,24 +1236,134 @@ mod tests {
     }
 
     #[test]
+    fn merkle_proof_validate_receipt_rlp_too_large() {
+        let mut proof = test_merkle_proof();
+        proof.receipt_rlp = vec![0u8; MAX_RECEIPT_RLP_SIZE + 1];
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::ReceiptRlpTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn merkle_proof_validate_empty_nodes() {
-        let proof = EthReceiptMerkleProofV1 {
-            chain: ExternalChainId::EthereumMainnet,
-            tx_hash: [0xAA; 32],
-            log_index: 0,
-            contract: [0xBB; 20],
-            topic0: [0xCC; 32],
-            data_hash: [0xDD; 32],
-            block_number: 18_000_000,
-            block_hash: [0xEE; 32],
-            receipt_rlp: vec![0x01],
-            proof_nodes: vec![],
-            tx_index: 0,
-        };
+        let mut proof = test_merkle_proof();
+        proof.proof_nodes = vec![];
 
         assert!(matches!(
             proof.validate_basic(),
             Err(ExternalProofValidationError::EmptyProofNodes)
         ));
+    }
+
+    #[test]
+    fn merkle_proof_validate_too_many_nodes() {
+        let mut proof = test_merkle_proof();
+        proof.proof_nodes = (0..MAX_PROOF_NODES + 1).map(|_| vec![0x01]).collect();
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::TooManyProofNodes { .. })
+        ));
+    }
+
+    #[test]
+    fn merkle_proof_validate_node_too_large() {
+        let mut proof = test_merkle_proof();
+        proof.proof_nodes = vec![vec![0u8; MAX_PROOF_NODE_SIZE + 1]];
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::ProofNodeTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn merkle_proof_validate_zero_topic() {
+        let mut proof = test_merkle_proof();
+        proof.topic0 = [0u8; 32];
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::ZeroTopic)
+        ));
+    }
+
+    #[test]
+    fn merkle_proof_validate_zero_block_hash() {
+        let mut proof = test_merkle_proof();
+        proof.block_hash = [0u8; 32];
+
+        assert!(matches!(
+            proof.validate_basic(),
+            Err(ExternalProofValidationError::ZeroBlockHash)
+        ));
+    }
+
+    // ========== VerificationMode Tests ==========
+
+    #[test]
+    fn verification_mode_attestation() {
+        let mode = VerificationMode::Attestation;
+        assert_eq!(mode.name(), "attestation");
+        assert_eq!(format!("{}", mode), "attestation");
+    }
+
+    #[test]
+    fn verification_mode_merkle_proof() {
+        let mode = VerificationMode::EthMerkleReceiptProof;
+        assert_eq!(mode.name(), "eth_merkle_receipt_proof");
+        assert_eq!(format!("{}", mode), "eth_merkle_receipt_proof");
+    }
+
+    #[test]
+    fn attestation_verification_mode() {
+        let attestation = test_attestation();
+        assert_eq!(attestation.verification_mode(), VerificationMode::Attestation);
+    }
+
+    #[test]
+    fn merkle_proof_verification_mode() {
+        let proof = test_merkle_proof();
+        assert_eq!(proof.verification_mode(), VerificationMode::EthMerkleReceiptProof);
+    }
+
+    #[test]
+    fn proof_verification_mode_accessor() {
+        let attestation = test_attestation();
+        let proof = ExternalEventProofV1::EthReceiptAttestationV1(attestation);
+        assert_eq!(proof.verification_mode(), VerificationMode::Attestation);
+
+        let merkle_proof = test_merkle_proof();
+        let proof = ExternalEventProofV1::EthReceiptMerkleProofV1(merkle_proof);
+        assert_eq!(proof.verification_mode(), VerificationMode::EthMerkleReceiptProof);
+    }
+
+    // ========== Additional Accessor Tests ==========
+
+    #[test]
+    fn proof_accessors_merkle() {
+        let merkle_proof = test_merkle_proof();
+        let proof = ExternalEventProofV1::EthReceiptMerkleProofV1(merkle_proof.clone());
+
+        assert_eq!(proof.chain(), &merkle_proof.chain);
+        assert_eq!(proof.tx_hash(), &merkle_proof.tx_hash);
+        assert_eq!(proof.block_number(), merkle_proof.block_number);
+        assert_eq!(proof.log_index(), merkle_proof.log_index);
+        assert_eq!(proof.contract(), &merkle_proof.contract);
+        assert_eq!(proof.topic0(), &merkle_proof.topic0);
+        assert_eq!(proof.data_hash(), &merkle_proof.data_hash);
+        assert_eq!(proof.block_hash(), &merkle_proof.block_hash);
+        assert_eq!(proof.confirmations(), merkle_proof.confirmations);
+        assert_eq!(proof.proof_type(), "eth_receipt_merkle_v1");
+    }
+
+    #[test]
+    fn proof_confirmations_optional() {
+        let mut merkle_proof = test_merkle_proof();
+        merkle_proof.confirmations = None;
+        let proof = ExternalEventProofV1::EthReceiptMerkleProofV1(merkle_proof);
+        assert_eq!(proof.confirmations(), None);
     }
 }

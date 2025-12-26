@@ -38,7 +38,8 @@ pub use canonical::{
 pub use external_proof::{
     AttestationData, EthReceiptAttestationV1, EthReceiptMerkleProofV1, ExternalChainId,
     ExternalEventProofV1, ExternalProofId, ExternalProofState, ExternalProofValidationError,
-    EXTERNAL_PROOF_SIGNING_DOMAIN_V1,
+    VerificationMode, EXTERNAL_PROOF_SIGNING_DOMAIN_V1, MAX_HEADER_RLP_SIZE, MAX_PROOF_NODES,
+    MAX_PROOF_NODE_SIZE, MAX_RECEIPT_RLP_SIZE,
 };
 pub use intent::{
     BurnAndUnlockPayload, CommitReceipt, CrossHubTransferPayload, ExternalBurnAndUnlockPayload,
