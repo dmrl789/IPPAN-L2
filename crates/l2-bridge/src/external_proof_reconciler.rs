@@ -603,8 +603,10 @@ mod tests {
         let verifier = MockVerifier::accepting();
         let metrics = Arc::new(ExternalProofReconcilerMetrics::new());
 
-        let mut config = ExternalProofReconcilerConfig::default();
-        config.max_proofs_per_cycle = 3;
+        let config = ExternalProofReconcilerConfig {
+            max_proofs_per_cycle: 3,
+            ..Default::default()
+        };
 
         let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics).await;
 
