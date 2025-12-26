@@ -184,6 +184,14 @@ pub struct EthAttestationVerifierConfig {
 
     /// Minimum confirmations required for testnets.
     pub min_confirmations_testnet: u32,
+
+    /// Skip signature verification (FOR TESTING ONLY).
+    ///
+    /// When true, signature verification is skipped. This should NEVER
+    /// be used in production - only for unit tests that need to test
+    /// other error conditions without dealing with real cryptography.
+    #[cfg(test)]
+    pub skip_signature_verification: bool,
 }
 
 impl Default for EthAttestationVerifierConfig {
@@ -192,6 +200,8 @@ impl Default for EthAttestationVerifierConfig {
             attestor_pubkeys: HashSet::new(),
             min_confirmations_mainnet: DEFAULT_MIN_CONFIRMATIONS_MAINNET,
             min_confirmations_testnet: DEFAULT_MIN_CONFIRMATIONS_TESTNET,
+            #[cfg(test)]
+            skip_signature_verification: false,
         }
     }
 }
@@ -227,6 +237,8 @@ impl EthAttestationVerifierConfig {
             attestor_pubkeys,
             min_confirmations_mainnet,
             min_confirmations_testnet,
+            #[cfg(test)]
+            skip_signature_verification: false,
         }
     }
 
@@ -308,8 +320,10 @@ impl EthAttestationVerifier {
             return Err(ExternalVerifyError::AttestorNotAllowed { pubkey_hex });
         }
 
-        // Step 3: Verify Ed25519 signature
-        self.verify_signature(attestation)?;
+        // Step 3: Verify Ed25519 signature (can be skipped in tests)
+        if !self.should_skip_signature_verification() {
+            self.verify_signature(attestation)?;
+        }
 
         // Step 4: Check confirmations
         let min_confirmations = self.config.min_confirmations(&attestation.chain);
@@ -398,6 +412,18 @@ impl EthAttestationVerifier {
         // is handled externally.
         warn!("signature verification skipped (signed-envelopes feature not enabled)");
         Ok(())
+    }
+
+    /// Check if signature verification should be skipped (test-only).
+    #[cfg(test)]
+    fn should_skip_signature_verification(&self) -> bool {
+        self.config.skip_signature_verification
+    }
+
+    /// Check if signature verification should be skipped (production: never skip).
+    #[cfg(not(test))]
+    fn should_skip_signature_verification(&self) -> bool {
+        false
     }
 
     /// Verify the event binding matches expectations.
@@ -718,6 +744,7 @@ mod tests {
         let mut config = EthAttestationVerifierConfig::default();
         config.add_attestor(&hex::encode([0x11; 32]));
         config.min_confirmations_mainnet = 20; // Higher than attestation's 12
+        config.skip_signature_verification = true; // Skip sig check to test confirmations
 
         let verifier = EthAttestationVerifier::new(config);
 
@@ -736,6 +763,7 @@ mod tests {
         let mut config = EthAttestationVerifierConfig::default();
         config.add_attestor(&hex::encode([0x11; 32]));
         config.min_confirmations_mainnet = 1;
+        config.skip_signature_verification = true; // Skip sig check to test binding
 
         let verifier = EthAttestationVerifier::new(config);
 
@@ -756,6 +784,7 @@ mod tests {
         let mut config = EthAttestationVerifierConfig::default();
         config.add_attestor(&hex::encode([0x11; 32]));
         config.min_confirmations_mainnet = 1;
+        config.skip_signature_verification = true; // Skip sig check to test binding
 
         let verifier = EthAttestationVerifier::new(config);
 
@@ -776,6 +805,7 @@ mod tests {
         let mut config = EthAttestationVerifierConfig::default();
         config.add_attestor(&hex::encode([0x11; 32]));
         config.min_confirmations_mainnet = 1;
+        config.skip_signature_verification = true; // Skip sig check to test binding
 
         let verifier = EthAttestationVerifier::new(config);
 
