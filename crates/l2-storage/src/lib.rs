@@ -34,7 +34,7 @@ pub use settlement::{
 
 pub use external::{
     ExternalProofCounts, ExternalProofEntry, ExternalProofStorage, ExternalProofStorageError,
-    ProofIntentBinding,
+    ProofIntentBinding, VerifiedSummary,
 };
 pub use intents::{
     validate_intent_transition, IntentState, IntentStateCounts, IntentStateEntry, IntentStorage,
