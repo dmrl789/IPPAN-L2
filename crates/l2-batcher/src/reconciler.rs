@@ -1012,9 +1012,8 @@ pub fn get_multi_hub_settlement_summary(
 
         // Get total fees for this hub (if applicable)
         if hub.uses_m2m_fees() {
-            hub_summary.total_fees_finalised_scaled = storage
-                .get_hub_total_fees(hub_str, chain_id)
-                .unwrap_or(0);
+            hub_summary.total_fees_finalised_scaled =
+                storage.get_hub_total_fees(hub_str, chain_id).unwrap_or(0);
         }
 
         summary.update_hub(hub_summary);
@@ -1515,7 +1514,7 @@ mod tests {
     #[test]
     fn multi_hub_settlement_summary_creation() {
         let summary = MultiHubSettlementSummary::new();
-        
+
         // Should have all 5 hubs
         assert_eq!(summary.per_hub.len(), 5);
         assert!(summary.per_hub.contains_key(&L2HubId::Fin));
@@ -1523,7 +1522,7 @@ mod tests {
         assert!(summary.per_hub.contains_key(&L2HubId::M2m));
         assert!(summary.per_hub.contains_key(&L2HubId::World));
         assert!(summary.per_hub.contains_key(&L2HubId::Bridge));
-        
+
         assert_eq!(summary.total_submitted, 0);
         assert_eq!(summary.total_in_flight, 0);
     }
@@ -1531,17 +1530,17 @@ mod tests {
     #[test]
     fn multi_hub_settlement_summary_update() {
         let mut summary = MultiHubSettlementSummary::new();
-        
+
         let mut fin_summary = HubSettlementSummary::new(L2HubId::Fin);
         fin_summary.submitted_count = 5;
         fin_summary.in_flight_count = 10;
         summary.update_hub(fin_summary);
-        
+
         let mut m2m_summary = HubSettlementSummary::new(L2HubId::M2m);
         m2m_summary.submitted_count = 3;
         m2m_summary.in_flight_count = 7;
         summary.update_hub(m2m_summary);
-        
+
         assert_eq!(summary.total_submitted, 8);
         assert_eq!(summary.total_in_flight, 17);
     }
@@ -1557,7 +1556,7 @@ mod tests {
     #[test]
     fn multi_hub_reconcile_cycle_result_update() {
         let mut result = MultiHubReconcileCycleResult::new();
-        
+
         let fin_result = ReconcileCycleResult {
             included: 2,
             finalised: 1,
@@ -1565,7 +1564,7 @@ mod tests {
             in_flight: 3,
         };
         result.set_hub_result(L2HubId::Fin, fin_result);
-        
+
         let data_result = ReconcileCycleResult {
             included: 1,
             finalised: 2,
@@ -1573,7 +1572,7 @@ mod tests {
             in_flight: 2,
         };
         result.set_hub_result(L2HubId::Data, data_result);
-        
+
         assert_eq!(result.total_included, 3);
         assert_eq!(result.total_finalised, 3);
         assert_eq!(result.total_failed, 1);

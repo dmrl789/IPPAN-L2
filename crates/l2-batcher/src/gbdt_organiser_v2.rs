@@ -275,7 +275,7 @@ impl GbdtOrganiserV2 {
     }
 
     /// Update internal state after serving a hub.
-    /// 
+    ///
     /// This should be called by the batcher after processing a batch.
     pub fn mark_hub_served(&mut self, hub: L2HubId) {
         let idx = hub.index();
@@ -310,10 +310,7 @@ impl OrganiserV2 for GbdtOrganiserV2 {
         let chosen_hub = self.select_hub(inputs);
 
         // Get inputs for the chosen hub
-        let hub_inputs = inputs
-            .get_hub(chosen_hub)
-            .cloned()
-            .unwrap_or_default();
+        let hub_inputs = inputs.get_hub(chosen_hub).cloned().unwrap_or_default();
 
         // Compute parameters for the chosen hub
         let raw_decision = OrganiserDecisionV2 {
@@ -554,8 +551,8 @@ mod tests {
 
         // WORLD has low queue depth but should be served due to starvation
         let inputs = make_inputs(&[
-            (L2HubId::Fin, 500, 0),    // High queue
-            (L2HubId::World, 10, 0),   // Low queue but starving
+            (L2HubId::Fin, 500, 0),  // High queue
+            (L2HubId::World, 10, 0), // Low queue but starving
         ]);
 
         let decision = organiser.decide(&inputs);
@@ -598,10 +595,7 @@ mod tests {
         let organiser1 = GbdtOrganiserV2::new();
         let organiser2 = GbdtOrganiserV2::new();
 
-        let inputs = make_inputs(&[
-            (L2HubId::Data, 200, 10),
-            (L2HubId::M2m, 150, 3),
-        ]);
+        let inputs = make_inputs(&[(L2HubId::Data, 200, 10), (L2HubId::M2m, 150, 3)]);
 
         let d1 = organiser1.decide(&inputs);
         let d2 = organiser2.decide(&inputs);
@@ -772,6 +766,7 @@ mod tests {
     // ========== Overflow Safety Tests ==========
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn no_panic_on_extreme_inputs() {
         let organiser = GbdtOrganiserV2::new();
 

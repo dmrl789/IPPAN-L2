@@ -100,7 +100,7 @@ impl L2HubId {
     }
 
     /// Parse from canonical string key.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "fin" => Some(L2HubId::Fin),
             "data" => Some(L2HubId::Data),
@@ -213,7 +213,9 @@ impl HubState {
 
     /// Add to total finalised fees (M2M hub).
     pub fn add_finalised_fees(&mut self, amount_scaled: u64) {
-        self.total_fees_finalised_scaled = self.total_fees_finalised_scaled.saturating_add(amount_scaled);
+        self.total_fees_finalised_scaled = self
+            .total_fees_finalised_scaled
+            .saturating_add(amount_scaled);
     }
 }
 
@@ -442,19 +444,19 @@ mod tests {
     fn hub_id_as_str_roundtrip() {
         for hub in L2HubId::all() {
             let s = hub.as_str();
-            let parsed = L2HubId::from_str(s).expect("should parse");
+            let parsed = L2HubId::parse(s).expect("should parse");
             assert_eq!(*hub, parsed);
         }
     }
 
     #[test]
     fn hub_id_from_str_case_insensitive() {
-        assert_eq!(L2HubId::from_str("FIN"), Some(L2HubId::Fin));
-        assert_eq!(L2HubId::from_str("Data"), Some(L2HubId::Data));
-        assert_eq!(L2HubId::from_str("M2M"), Some(L2HubId::M2m));
-        assert_eq!(L2HubId::from_str("WORLD"), Some(L2HubId::World));
-        assert_eq!(L2HubId::from_str("bridge"), Some(L2HubId::Bridge));
-        assert_eq!(L2HubId::from_str("invalid"), None);
+        assert_eq!(L2HubId::parse("FIN"), Some(L2HubId::Fin));
+        assert_eq!(L2HubId::parse("Data"), Some(L2HubId::Data));
+        assert_eq!(L2HubId::parse("M2M"), Some(L2HubId::M2m));
+        assert_eq!(L2HubId::parse("WORLD"), Some(L2HubId::World));
+        assert_eq!(L2HubId::parse("bridge"), Some(L2HubId::Bridge));
+        assert_eq!(L2HubId::parse("invalid"), None);
     }
 
     #[test]
@@ -533,10 +535,10 @@ mod tests {
     fn hub_state_batch_hash() {
         let mut state = HubState::new();
         let hash = [0xAA; 32];
-        
+
         state.set_last_batch_hash(hash);
         assert_eq!(state.last_batch_hash, Some(hash));
-        
+
         let hash2 = [0xBB; 32];
         state.set_last_finalised_hash(hash2);
         assert_eq!(state.last_finalised_hash, Some(hash2));

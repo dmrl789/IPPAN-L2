@@ -733,7 +733,8 @@ impl Storage {
         batch_number: u64,
     ) -> Result<(), StorageError> {
         let key = format!("hub_batch_number:{}:{}", hub, chain_id);
-        self.meta.insert(key.as_bytes(), &batch_number.to_le_bytes())?;
+        self.meta
+            .insert(key.as_bytes(), &batch_number.to_le_bytes())?;
         Ok(())
     }
 
@@ -770,11 +771,15 @@ impl Storage {
         let queue_key = format!("hub_queue_depth:{}", hub);
         let forced_key = format!("hub_forced_depth:{}", hub);
 
-        let queue_depth = self.meta.get(queue_key.as_bytes())?
+        let queue_depth = self
+            .meta
+            .get(queue_key.as_bytes())?
             .and_then(|ivec| ivec.as_ref().try_into().ok().map(u64::from_le_bytes))
             .unwrap_or(0);
 
-        let forced_depth = self.meta.get(forced_key.as_bytes())?
+        let forced_depth = self
+            .meta
+            .get(forced_key.as_bytes())?
             .and_then(|ivec| ivec.as_ref().try_into().ok().map(u64::from_le_bytes))
             .unwrap_or(0);
 
@@ -791,8 +796,10 @@ impl Storage {
         let queue_key = format!("hub_queue_depth:{}", hub);
         let forced_key = format!("hub_forced_depth:{}", hub);
 
-        self.meta.insert(queue_key.as_bytes(), &queue_depth.to_le_bytes())?;
-        self.meta.insert(forced_key.as_bytes(), &forced_depth.to_le_bytes())?;
+        self.meta
+            .insert(queue_key.as_bytes(), &queue_depth.to_le_bytes())?;
+        self.meta
+            .insert(forced_key.as_bytes(), &forced_depth.to_le_bytes())?;
         Ok(())
     }
 
@@ -801,7 +808,9 @@ impl Storage {
     /// Get total finalised fees for a hub (M2M hub only).
     pub fn get_hub_total_fees(&self, hub: &str, chain_id: u64) -> Result<u64, StorageError> {
         let key = format!("hub_total_fees:{}:{}", hub, chain_id);
-        Ok(self.meta.get(key.as_bytes())?
+        Ok(self
+            .meta
+            .get(key.as_bytes())?
             .and_then(|ivec| ivec.as_ref().try_into().ok().map(u64::from_le_bytes))
             .unwrap_or(0))
     }
@@ -825,7 +834,9 @@ impl Storage {
     /// Get the count of in-flight batches for a given hub.
     pub fn get_hub_in_flight_count(&self, hub: &str, chain_id: u64) -> Result<u32, StorageError> {
         let key = format!("hub_in_flight:{}:{}", hub, chain_id);
-        Ok(self.meta.get(key.as_bytes())?
+        Ok(self
+            .meta
+            .get(key.as_bytes())?
             .and_then(|ivec| ivec.as_ref().try_into().ok().map(u32::from_le_bytes))
             .unwrap_or(0))
     }

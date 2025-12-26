@@ -1091,7 +1091,7 @@ impl HubTx {
 }
 
 /// Per-hub queue state for tracking individual hub queues.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PerHubQueueState {
     /// Number of transactions in the normal queue.
     pub queue_depth: u32,
@@ -1113,13 +1113,26 @@ pub struct PerHubQueueState {
     pub last_batch_created_ms: Option<u64>,
 }
 
+impl Default for PerHubQueueState {
+    fn default() -> Self {
+        Self {
+            queue_depth: 0,
+            forced_queue_depth: 0,
+            in_flight_batches: 0,
+            recent_rejects: 0,
+            avg_tx_bytes_est: 256, // Default estimate
+            last_batch_hash: None,
+            batch_number: 0,
+            total_fees_finalised_scaled: 0,
+            last_batch_created_ms: None,
+        }
+    }
+}
+
 impl PerHubQueueState {
     /// Create a new empty per-hub queue state.
     pub fn new() -> Self {
-        Self {
-            avg_tx_bytes_est: 256, // Default estimate
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Update the EMA of tx bytes (integer-only computation).
@@ -1129,7 +1142,9 @@ impl PerHubQueueState {
 
         let current_scaled = u64::from(self.avg_tx_bytes_est).saturating_mul(1000);
         let sample_contribution = tx_bytes.saturating_mul(ALPHA_SCALED);
-        let old_contribution = current_scaled.saturating_mul(ONE_MINUS_ALPHA_SCALED).saturating_div(1000);
+        let old_contribution = current_scaled
+            .saturating_mul(ONE_MINUS_ALPHA_SCALED)
+            .saturating_div(1000);
         let new_scaled = sample_contribution.saturating_add(old_contribution);
         self.avg_tx_bytes_est = u32::try_from(new_scaled.saturating_div(1000)).unwrap_or(u32::MAX);
     }
@@ -1200,7 +1215,7 @@ impl MultiHubBatcherState {
 
     /// Get mutable reference to a hub's state.
     pub fn hub_state_mut(&mut self, hub: L2HubId) -> &mut PerHubQueueState {
-        self.per_hub.entry(hub).or_insert_with(PerHubQueueState::new)
+        self.per_hub.entry(hub).or_default()
     }
 
     /// Get reference to a hub's state.
@@ -1301,7 +1316,10 @@ impl Default for OrganiserInputsV2 {
             now_ms: 0,
             hubs: ALL_HUBS
                 .iter()
-                .map(|&hub| HubInputs { hub, ..Default::default() })
+                .map(|&hub| HubInputs {
+                    hub,
+                    ..Default::default()
+                })
                 .collect(),
         }
     }
@@ -1496,11 +1514,15 @@ impl MultiHubBatcherHandle {
 
     /// Submit a transaction to a specific hub.
     pub async fn submit_tx(&self, hub: L2HubId, tx: Tx) -> Result<(), BatcherError> {
-        let sender = self.senders.get(&hub).ok_or_else(|| {
-            BatcherError::Poster(format!("no sender for hub {:?}", hub))
-        })?;
+        let sender = self
+            .senders
+            .get(&hub)
+            .ok_or_else(|| BatcherError::Poster(format!("no sender for hub {:?}", hub)))?;
 
-        sender.send(tx).await.map_err(|_| BatcherError::QueueClosed)?;
+        sender
+            .send(tx)
+            .await
+            .map_err(|_| BatcherError::QueueClosed)?;
 
         let mut guard = self.state.lock().await;
         let hub_state = guard.hub_state_mut(hub);
@@ -1528,7 +1550,10 @@ impl MultiHubBatcherHandle {
     /// Get forced queue depth for a specific hub.
     pub async fn hub_forced_depth(&self, hub: L2HubId) -> u32 {
         let state = self.state.lock().await;
-        state.hub_state(hub).map(|s| s.forced_queue_depth).unwrap_or(0)
+        state
+            .hub_state(hub)
+            .map(|s| s.forced_queue_depth)
+            .unwrap_or(0)
     }
 
     /// Update hub stats from storage.
@@ -1561,15 +1586,17 @@ impl MultiHubReceivers {
 
     /// Check if a hub has pending messages.
     pub fn hub_has_pending(&self, hub: L2HubId) -> bool {
-        self.receivers.get(&hub).map(|r| !r.is_empty()).unwrap_or(false)
+        self.receivers
+            .get(&hub)
+            .map(|r| !r.is_empty())
+            .unwrap_or(false)
     }
 }
 
 /// Create per-hub channels for multi-hub batcher.
-pub fn create_multi_hub_channels(buffer_size: usize) -> (
-    BTreeMap<L2HubId, mpsc::Sender<Tx>>,
-    MultiHubReceivers,
-) {
+pub fn create_multi_hub_channels(
+    buffer_size: usize,
+) -> (BTreeMap<L2HubId, mpsc::Sender<Tx>>, MultiHubReceivers) {
     let mut senders = BTreeMap::new();
     let mut receivers = BTreeMap::new();
 
@@ -1665,9 +1692,8 @@ pub fn spawn_multi_hub(
     )));
 
     // Create default organiser if none provided
-    let organiser: Arc<dyn OrganiserV2 + Send + Sync> = organiser.unwrap_or_else(|| {
-        Arc::new(GbdtOrganiserV2::new())
-    });
+    let organiser: Arc<dyn OrganiserV2 + Send + Sync> =
+        organiser.unwrap_or_else(|| Arc::new(GbdtOrganiserV2::new()));
 
     tokio::spawn(run_multi_hub_loop(
         config,
@@ -1709,9 +1735,8 @@ async fn run_multi_hub_loop(
                 let chain_id = config.chain_id.0;
 
                 // Get queue stats
-                let (_queue_depth, forced_depth) = storage
-                    .get_hub_queue_stats(hub_str)
-                    .unwrap_or((0, 0));
+                let (_queue_depth, forced_depth) =
+                    storage.get_hub_queue_stats(hub_str).unwrap_or((0, 0));
 
                 // Get in-flight count
                 let in_flight = storage
@@ -1936,7 +1961,11 @@ async fn run_multi_hub_loop(
 
                         // Update hub fee totals
                         if batch_total_fee_scaled > 0 {
-                            if let Err(err) = storage.add_hub_total_fees(hub_str, chain_id, batch_total_fee_scaled) {
+                            if let Err(err) = storage.add_hub_total_fees(
+                                hub_str,
+                                chain_id,
+                                batch_total_fee_scaled,
+                            ) {
                                 warn!(error = %err, "failed to update hub fee totals");
                             }
 
@@ -2621,7 +2650,7 @@ mod tests {
     fn per_hub_queue_state_avg_bytes_update() {
         let mut state = PerHubQueueState::new();
         assert_eq!(state.avg_tx_bytes_est, 256);
-        
+
         // Update with larger tx
         state.update_avg_tx_bytes(1024);
         // EMA should move towards 1024
@@ -2636,7 +2665,7 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         );
-        
+
         // Should have all 5 hubs
         assert_eq!(state.per_hub.len(), 5);
         assert!(state.per_hub.contains_key(&L2HubId::Fin));
@@ -2653,18 +2682,18 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         );
-        
+
         // Add some queue depths
         state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
         state.hub_state_mut(L2HubId::Data).queue_depth = 50;
         state.hub_state_mut(L2HubId::M2m).queue_depth = 75;
-        
+
         assert_eq!(state.total_queue_depth(), 225);
-        
+
         // Add forced queue depths
         state.hub_state_mut(L2HubId::Fin).forced_queue_depth = 5;
         state.hub_state_mut(L2HubId::M2m).forced_queue_depth = 3;
-        
+
         assert_eq!(state.total_forced_queue_depth(), 8);
     }
 
@@ -2675,11 +2704,11 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         );
-        
+
         state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
         state.hub_state_mut(L2HubId::Fin).forced_queue_depth = 5;
         state.hub_state_mut(L2HubId::Fin).in_flight_batches = 2;
-        
+
         let inputs = state.build_hub_inputs(L2HubId::Fin);
         assert_eq!(inputs.hub, L2HubId::Fin);
         assert_eq!(inputs.queue_depth, 100);
@@ -2702,19 +2731,19 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         );
-        
+
         state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
         state.hub_state_mut(L2HubId::Data).queue_depth = 50;
-        
+
         let inputs = state.build_organiser_inputs_v2(1_700_000_000_000);
-        
+
         assert_eq!(inputs.now_ms, 1_700_000_000_000);
         assert_eq!(inputs.hubs.len(), 5);
         assert_eq!(inputs.total_queue_depth(), 150);
-        
+
         let fin_inputs = inputs.get_hub(L2HubId::Fin).unwrap();
         assert_eq!(fin_inputs.queue_depth, 100);
-        
+
         let data_inputs = inputs.get_hub(L2HubId::Data).unwrap();
         assert_eq!(data_inputs.queue_depth, 50);
     }
@@ -2744,22 +2773,24 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         );
-        
+
         state.hub_state_mut(L2HubId::Fin).queue_depth = 100;
         state.hub_state_mut(L2HubId::Fin).batch_number = 42;
         state.hub_state_mut(L2HubId::M2m).queue_depth = 50;
-        state.hub_state_mut(L2HubId::M2m).total_fees_finalised_scaled = 1_000_000;
-        
+        state
+            .hub_state_mut(L2HubId::M2m)
+            .total_fees_finalised_scaled = 1_000_000;
+
         let snapshot = MultiHubBatcherSnapshot::from(&state);
-        
+
         assert_eq!(snapshot.total_queue_depth, 150);
         assert_eq!(snapshot.per_hub.len(), 5);
-        
+
         let fin_snap = snapshot.per_hub.get("fin").unwrap();
         assert_eq!(fin_snap.queue_depth, 100);
         assert_eq!(fin_snap.batch_number, 42);
         assert!(fin_snap.total_fees_finalised_scaled.is_none()); // Not M2M hub
-        
+
         let m2m_snap = snapshot.per_hub.get("m2m").unwrap();
         assert_eq!(m2m_snap.queue_depth, 50);
         assert_eq!(m2m_snap.total_fees_finalised_scaled, Some(1_000_000));
@@ -2768,14 +2799,14 @@ mod tests {
     #[test]
     fn create_multi_hub_channels_creates_all_hubs() {
         let (senders, receivers) = create_multi_hub_channels(64);
-        
+
         assert_eq!(senders.len(), 5);
         assert!(senders.contains_key(&L2HubId::Fin));
         assert!(senders.contains_key(&L2HubId::Data));
         assert!(senders.contains_key(&L2HubId::M2m));
         assert!(senders.contains_key(&L2HubId::World));
         assert!(senders.contains_key(&L2HubId::Bridge));
-        
+
         // Can't easily check receiver count without consuming them
         // but we can check one hub works
         assert!(!receivers.hub_has_pending(L2HubId::Fin));
@@ -2789,9 +2820,9 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         )));
-        
+
         let handle = MultiHubBatcherHandle::new(senders, state);
-        
+
         // Submit to FIN hub
         let tx = Tx {
             chain_id: ChainId(1337),
@@ -2799,16 +2830,16 @@ mod tests {
             from: "alice".to_string(),
             payload: vec![1, 2, 3],
         };
-        
+
         handle.submit_tx(L2HubId::Fin, tx.clone()).await.unwrap();
-        
+
         assert_eq!(handle.hub_queue_depth(L2HubId::Fin).await, 1);
         assert_eq!(handle.hub_queue_depth(L2HubId::Data).await, 0);
-        
+
         // Submit to DATA hub
         handle.submit_tx(L2HubId::Data, tx.clone()).await.unwrap();
         assert_eq!(handle.hub_queue_depth(L2HubId::Data).await, 1);
-        
+
         // Check snapshot
         let snapshot = handle.snapshot().await;
         assert_eq!(snapshot.total_queue_depth, 2);
@@ -2822,16 +2853,19 @@ mod tests {
             OrganiserVersion::GbdtV1,
             OrganiserPolicyBounds::default(),
         )));
-        
+
         let handle = MultiHubBatcherHandle::new(senders, state);
-        
-        let hub_tx = HubTx::new(L2HubId::M2m, Tx {
-            chain_id: ChainId(1337),
-            nonce: 1,
-            from: "machine001".to_string(),
-            payload: vec![1, 2, 3],
-        });
-        
+
+        let hub_tx = HubTx::new(
+            L2HubId::M2m,
+            Tx {
+                chain_id: ChainId(1337),
+                nonce: 1,
+                from: "machine001".to_string(),
+                payload: vec![1, 2, 3],
+            },
+        );
+
         handle.submit_hub_tx(hub_tx).await.unwrap();
         assert_eq!(handle.hub_queue_depth(L2HubId::M2m).await, 1);
     }
@@ -2850,7 +2884,7 @@ mod tests {
     fn per_hub_queue_state_set_last_batch_hash() {
         let mut state = PerHubQueueState::new();
         assert!(state.last_batch_hash.is_none());
-        
+
         let hash = [0xaa; 32];
         state.set_last_batch_hash(hash);
         assert!(state.last_batch_hash.is_some());
@@ -2861,13 +2895,13 @@ mod tests {
     fn per_hub_queue_state_add_finalised_fees() {
         let mut state = PerHubQueueState::new();
         assert_eq!(state.total_fees_finalised_scaled, 0);
-        
+
         state.add_finalised_fees(1000);
         assert_eq!(state.total_fees_finalised_scaled, 1000);
-        
+
         state.add_finalised_fees(500);
         assert_eq!(state.total_fees_finalised_scaled, 1500);
-        
+
         // Test saturation
         state.total_fees_finalised_scaled = u64::MAX - 10;
         state.add_finalised_fees(100);
@@ -2878,7 +2912,7 @@ mod tests {
     fn per_hub_queue_state_last_batch_created_ms() {
         let mut state = PerHubQueueState::new();
         assert!(state.last_batch_created_ms.is_none());
-        
+
         state.last_batch_created_ms = Some(now_ms());
         assert!(state.last_batch_created_ms.is_some());
     }
@@ -2889,12 +2923,10 @@ mod tests {
         // The function should return an empty vec when no forced txs
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
-        
+
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            get_forced_txs_for_hub(&storage, "fin", 10).await
-        });
-        
+        let result = rt.block_on(async { get_forced_txs_for_hub(&storage, "fin", 10).await });
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }

@@ -471,8 +471,10 @@ pub static BOOTSTRAP_ROLLBACK_BLOCKED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
 
 // ============================================================
 // L2 Multi-Hub Metrics
+// These metrics are registered for future multi-hub batcher integration.
 // ============================================================
 
+#[allow(dead_code)]
 pub static L2_QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(
         Opts::new("l2_queue_depth", "L2 transaction queue depth per hub"),
@@ -483,6 +485,7 @@ pub static L2_QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     g
 });
 
+#[allow(dead_code)]
 pub static L2_FORCED_QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(
         Opts::new(
@@ -496,9 +499,13 @@ pub static L2_FORCED_QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     g
 });
 
+#[allow(dead_code)]
 pub static L2_BATCHES_CREATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
-        Opts::new("l2_batches_created_total", "Total L2 batches created per hub"),
+        Opts::new(
+            "l2_batches_created_total",
+            "Total L2 batches created per hub",
+        ),
         &["hub"],
     )
     .expect("metric");
@@ -506,6 +513,7 @@ pub static L2_BATCHES_CREATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static L2_BATCHES_SUBMITTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -519,6 +527,7 @@ pub static L2_BATCHES_SUBMITTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static L2_BATCHES_FINALISED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -532,6 +541,7 @@ pub static L2_BATCHES_FINALISED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static L2_IN_FLIGHT_BATCHES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(
         Opts::new(
@@ -545,6 +555,7 @@ pub static L2_IN_FLIGHT_BATCHES: Lazy<IntGaugeVec> = Lazy::new(|| {
     g
 });
 
+#[allow(dead_code)]
 pub static L2_M2M_FEE_FINALISED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -558,6 +569,7 @@ pub static L2_M2M_FEE_FINALISED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static L2_ORGANISER_CHOSEN_HUB: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(
         Opts::new(
@@ -571,6 +583,7 @@ pub static L2_ORGANISER_CHOSEN_HUB: Lazy<IntGaugeVec> = Lazy::new(|| {
     g
 });
 
+#[allow(dead_code)]
 pub static L2_ORGANISER_DECISIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     let c = IntCounter::with_opts(Opts::new(
         "l2_organiser_decisions_total",
@@ -581,9 +594,13 @@ pub static L2_ORGANISER_DECISIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static L2_TXS_RECEIVED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
-        Opts::new("l2_txs_received_total", "Total L2 transactions received per hub"),
+        Opts::new(
+            "l2_txs_received_total",
+            "Total L2 transactions received per hub",
+        ),
         &["hub"],
     )
     .expect("metric");
@@ -591,6 +608,7 @@ pub static L2_TXS_RECEIVED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static L2_TXS_BATCHED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -605,6 +623,7 @@ pub static L2_TXS_BATCHED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 /// Update L2 organiser chosen hub metric.
+#[allow(dead_code)]
 pub fn set_l2_chosen_hub(chosen_hub: &str) {
     // Clear all and set chosen
     for hub in &["fin", "data", "m2m", "world", "bridge"] {

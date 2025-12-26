@@ -222,10 +222,16 @@ fn determinism_same_inputs_same_output() {
     let d1 = org1.decide(&inputs);
     let d2 = org2.decide(&inputs);
 
-    assert_eq!(d1.chosen_hub, d2.chosen_hub, "chosen_hub must be deterministic");
+    assert_eq!(
+        d1.chosen_hub, d2.chosen_hub,
+        "chosen_hub must be deterministic"
+    );
     assert_eq!(d1.sleep_ms, d2.sleep_ms, "sleep_ms must be deterministic");
     assert_eq!(d1.max_txs, d2.max_txs, "max_txs must be deterministic");
-    assert_eq!(d1.max_bytes, d2.max_bytes, "max_bytes must be deterministic");
+    assert_eq!(
+        d1.max_bytes, d2.max_bytes,
+        "max_bytes must be deterministic"
+    );
     assert_eq!(
         d1.forced_drain_max, d2.forced_drain_max,
         "forced_drain_max must be deterministic"
@@ -489,7 +495,7 @@ fn parameters_scale_with_inputs() {
 #[test]
 fn version_is_gbdt_v2() {
     use l2_batcher::gbdt_organiser_v2::OrganiserVersionV2;
-    
+
     let organiser = GbdtOrganiserV2::new();
     let version = organiser.version();
     assert_eq!(
