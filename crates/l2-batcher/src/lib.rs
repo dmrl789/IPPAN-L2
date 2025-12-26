@@ -31,6 +31,7 @@
 
 pub mod async_l1_client;
 pub mod contract_bridge;
+pub mod gbdt_organiser;
 pub mod reconciler;
 
 use std::sync::Arc;
@@ -56,6 +57,12 @@ pub use contract_bridge::{
     BATCH_ENVELOPE_CONTENT_TYPE_BINARY, BATCH_ENVELOPE_CONTENT_TYPE_JSON,
     BATCH_ENVELOPE_SCHEMA_VERSION, MAX_PAYLOAD_SIZE,
 };
+pub use gbdt_organiser::{GbdtOrganiserConfig, GbdtOrganiserV1};
+// Re-export organiser types from l2-core for convenience
+pub use l2_core::{
+    NoopOrganiser, Organiser, OrganiserDecision, OrganiserInputs, OrganiserPolicyBounds,
+    OrganiserStatus, OrganiserVersion,
+};
 pub use reconciler::{
     get_in_flight_summary, get_settlement_counts, spawn_settlement_reconciler, InFlightSummary,
     ReconcileCycleResult, ReconcilerMetrics, SettlementReconcilerConfig,
@@ -68,6 +75,10 @@ pub struct BatcherConfig {
     pub max_batch_bytes: usize,
     pub max_wait_ms: u64,
     pub chain_id: ChainId,
+    /// Whether the organiser is enabled.
+    pub organiser_enabled: bool,
+    /// Policy bounds for organiser decisions.
+    pub organiser_bounds: OrganiserPolicyBounds,
 }
 
 impl Default for BatcherConfig {
@@ -77,6 +88,39 @@ impl Default for BatcherConfig {
             max_batch_bytes: 512 * 1024,
             max_wait_ms: 1_000,
             chain_id: ChainId(1),
+            organiser_enabled: true,
+            organiser_bounds: OrganiserPolicyBounds::default(),
+        }
+    }
+}
+
+impl BatcherConfig {
+    /// Create configuration from environment variables.
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            max_batch_txs: std::env::var("L2_MAX_BATCH_TXS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.max_batch_txs),
+            max_batch_bytes: std::env::var("L2_MAX_BATCH_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.max_batch_bytes),
+            max_wait_ms: std::env::var("L2_MAX_WAIT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default.max_wait_ms),
+            chain_id: ChainId(
+                std::env::var("L2_CHAIN_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(default.chain_id.0),
+            ),
+            organiser_enabled: std::env::var("L2_ORGANISER_ENABLED")
+                .map(|s| s != "0" && s.to_lowercase() != "false")
+                .unwrap_or(default.organiser_enabled),
+            organiser_bounds: OrganiserPolicyBounds::from_env(),
         }
     }
 }
@@ -913,6 +957,8 @@ pub struct BatcherSnapshot {
     pub queue_depth: usize,
     pub last_batch_hash: Option<String>,
     pub last_post_time_ms: Option<u64>,
+    /// Organiser status snapshot.
+    pub organiser: OrganiserStatus,
 }
 
 #[derive(Clone)]
@@ -920,6 +966,81 @@ struct BatcherState {
     queue_depth: usize,
     last_batch_hash: Option<Hash32>,
     last_post_time_ms: Option<u64>,
+    /// Organiser enabled flag.
+    organiser_enabled: bool,
+    /// Organiser version.
+    organiser_version: OrganiserVersion,
+    /// Last organiser inputs.
+    last_organiser_inputs: Option<OrganiserInputs>,
+    /// Last organiser decision.
+    last_organiser_decision: Option<OrganiserDecision>,
+    /// Organiser policy bounds.
+    organiser_bounds: OrganiserPolicyBounds,
+    /// Rolling counter: recent quota rejects.
+    recent_quota_rejects: u32,
+    /// Rolling counter: recent insufficient balance rejects.
+    recent_insufficient_balance: u32,
+    /// Rolling counter: recent forced bytes used.
+    recent_forced_used_bytes: u64,
+    /// Integer EMA of tx bytes (scaled by 1000 for precision).
+    avg_tx_bytes_ema_scaled: u64,
+}
+
+impl BatcherState {
+    fn new(
+        organiser_enabled: bool,
+        organiser_version: OrganiserVersion,
+        organiser_bounds: OrganiserPolicyBounds,
+    ) -> Self {
+        Self {
+            queue_depth: 0,
+            last_batch_hash: None,
+            last_post_time_ms: None,
+            organiser_enabled,
+            organiser_version,
+            last_organiser_inputs: None,
+            last_organiser_decision: None,
+            organiser_bounds,
+            recent_quota_rejects: 0,
+            recent_insufficient_balance: 0,
+            recent_forced_used_bytes: 0,
+            avg_tx_bytes_ema_scaled: 256_000, // Default: 256 bytes scaled by 1000
+        }
+    }
+
+    /// Update the EMA of tx bytes (integer-only computation).
+    /// Uses EMA formula: new_ema = (alpha * sample + (1 - alpha) * old_ema)
+    /// With alpha = 1/8 (12.5%), scaled by 1000 for integer math.
+    fn update_avg_tx_bytes(&mut self, tx_bytes: u64) {
+        // alpha_scaled = 125 (12.5% * 1000)
+        // one_minus_alpha_scaled = 875 (87.5% * 1000)
+        const ALPHA_SCALED: u64 = 125;
+        const ONE_MINUS_ALPHA_SCALED: u64 = 875;
+
+        // new_ema_scaled = (ALPHA * sample * 1000 + ONE_MINUS_ALPHA * old_ema) / 1000
+        let sample_contribution = tx_bytes.saturating_mul(ALPHA_SCALED);
+        let old_contribution = self
+            .avg_tx_bytes_ema_scaled
+            .saturating_mul(ONE_MINUS_ALPHA_SCALED)
+            .saturating_div(1000);
+
+        self.avg_tx_bytes_ema_scaled = sample_contribution.saturating_add(old_contribution);
+    }
+
+    /// Get the current EMA value (unscaled).
+    fn avg_tx_bytes_est(&self) -> u32 {
+        // Unscale by dividing by 1000, then truncate to u32
+        let unscaled = self.avg_tx_bytes_ema_scaled.saturating_div(1000);
+        u32::try_from(unscaled).unwrap_or(u32::MAX)
+    }
+
+    /// Decay rolling counters (called periodically to prevent stale values).
+    fn decay_counters(&mut self) {
+        // Decay by halving (integer-safe)
+        self.recent_quota_rejects = self.recent_quota_rejects.saturating_div(2);
+        self.recent_insufficient_balance = self.recent_insufficient_balance.saturating_div(2);
+        self.recent_forced_used_bytes = self.recent_forced_used_bytes.saturating_div(2);
+    }
 }
 
 impl From<BatcherState> for BatcherSnapshot {
@@ -928,6 +1049,13 @@ impl From<BatcherState> for BatcherSnapshot {
             queue_depth: state.queue_depth,
             last_batch_hash: state.last_batch_hash.map(Hash32::to_hex),
             last_post_time_ms: state.last_post_time_ms,
+            organiser: OrganiserStatus {
+                enabled: state.organiser_enabled,
+                version: state.organiser_version.to_string(),
+                last_inputs: state.last_organiser_inputs,
+                last_decision: state.last_organiser_decision,
+                bounds: state.organiser_bounds,
+            },
         }
     }
 }
@@ -968,7 +1096,7 @@ pub fn spawn(
     storage: Arc<Storage>,
     poster: Arc<dyn BatchPoster>,
 ) -> BatcherHandle {
-    spawn_with_m2m(config, storage, poster, None, None)
+    spawn_with_m2m(config, storage, poster, None, None, None)
 }
 
 /// Spawn batcher with optional M2M fee storage for fee finalization.
@@ -978,13 +1106,34 @@ pub fn spawn_with_m2m(
     poster: Arc<dyn BatchPoster>,
     m2m_storage: Option<Arc<M2mStorage>>,
     fee_schedule: Option<FeeSchedule>,
+    organiser: Option<Arc<dyn Organiser>>,
 ) -> BatcherHandle {
     let (tx, rx) = mpsc::channel(1024);
-    let state = Arc::new(Mutex::new(BatcherState {
-        queue_depth: 0,
-        last_batch_hash: None,
-        last_post_time_ms: None,
-    }));
+
+    // Determine organiser version
+    let organiser_version = organiser
+        .as_ref()
+        .map(|o| o.version())
+        .unwrap_or(OrganiserVersion::None);
+
+    // Create default organiser if none provided and organiser is enabled
+    let organiser: Arc<dyn Organiser> = if config.organiser_enabled {
+        organiser.unwrap_or_else(|| Arc::new(GbdtOrganiserV1::new()))
+    } else {
+        Arc::new(NoopOrganiser::new(OrganiserDecision::new(
+            config.max_wait_ms,
+            u32::try_from(config.max_batch_txs).unwrap_or(u32::MAX),
+            u32::try_from(config.max_batch_bytes).unwrap_or(u32::MAX),
+            u32::try_from(config.max_batch_txs / 2).unwrap_or(u32::MAX),
+        )))
+    };
+
+    let state = Arc::new(Mutex::new(BatcherState::new(
+        config.organiser_enabled,
+        organiser_version,
+        config.organiser_bounds.clone(),
+    )));
+
     tokio::spawn(run_loop(
         config,
         storage,
@@ -993,10 +1142,12 @@ pub fn spawn_with_m2m(
         Arc::clone(&state),
         m2m_storage,
         fee_schedule.unwrap_or_default(),
+        organiser,
     ));
     BatcherHandle { tx, state }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     config: BatcherConfig,
     storage: Arc<Storage>,
@@ -1005,33 +1156,106 @@ async fn run_loop(
     state: Arc<Mutex<BatcherState>>,
     m2m_storage: Option<Arc<M2mStorage>>,
     _fee_schedule: FeeSchedule,
+    organiser: Arc<dyn Organiser>,
 ) {
+    // Counter for decay interval (decay every 10 iterations)
+    let mut iteration_counter: u64 = 0;
+
     loop {
-        let deadline = Instant::now() + Duration::from_millis(config.max_wait_ms);
+        iteration_counter = iteration_counter.wrapping_add(1);
+
+        // Build organiser inputs from current state
+        let (organiser_inputs, decision) = {
+            let guard = state.lock().await;
+
+            // Get in-flight batch count from storage
+            let in_flight_batches = storage
+                .count_settlement_states()
+                .map(|c| c.in_flight())
+                .unwrap_or(0);
+
+            // Get forced queue depth from storage
+            let forced_queue_depth = storage.count_forced_queue().map(|c| c.queued).unwrap_or(0);
+
+            let inputs = OrganiserInputs {
+                now_ms: now_ms(),
+                queue_depth: u32::try_from(guard.queue_depth).unwrap_or(u32::MAX),
+                forced_queue_depth: u32::try_from(forced_queue_depth).unwrap_or(u32::MAX),
+                in_flight_batches: u32::try_from(in_flight_batches).unwrap_or(u32::MAX),
+                recent_quota_rejects: guard.recent_quota_rejects,
+                recent_insufficient_balance: guard.recent_insufficient_balance,
+                recent_forced_used_bytes: guard.recent_forced_used_bytes,
+                avg_tx_bytes_est: guard.avg_tx_bytes_est(),
+            };
+
+            // Get organiser decision
+            let raw_decision = organiser.decide(&inputs);
+
+            // Clamp to bounds
+            let clamped_decision = guard.organiser_bounds.clamp(raw_decision);
+
+            (inputs, clamped_decision)
+        };
+
+        // Update state with last inputs/decision
+        {
+            let mut guard = state.lock().await;
+            guard.last_organiser_inputs = Some(organiser_inputs.clone());
+            guard.last_organiser_decision = Some(decision.clone());
+
+            // Decay counters periodically (every 10 iterations)
+            if iteration_counter % 10 == 0 {
+                guard.decay_counters();
+            }
+        }
+
+        debug!(
+            sleep_ms = decision.sleep_ms,
+            max_txs = decision.max_txs,
+            max_bytes = decision.max_bytes,
+            forced_drain_max = decision.forced_drain_max,
+            queue_depth = organiser_inputs.queue_depth,
+            in_flight = organiser_inputs.in_flight_batches,
+            "organiser decision"
+        );
+
+        // Apply sleep from organiser decision
+        let deadline = Instant::now() + Duration::from_millis(decision.sleep_ms);
         let mut batch_txs: Vec<Tx> = Vec::new();
         let mut batch_bytes: usize = 0;
         let mut forced_tx_hashes: Vec<Hash32> = Vec::new();
 
-        // Step 1: First include due forced txs from storage
-        let forced_limit = config.max_batch_txs / 2; // Reserve half for forced
-        match get_forced_txs(&storage, forced_limit).await {
+        // Use organiser decision for limits
+        let max_txs = usize::try_from(decision.max_txs).unwrap_or(config.max_batch_txs);
+        let max_bytes = usize::try_from(decision.max_bytes).unwrap_or(config.max_batch_bytes);
+        let forced_drain_max = usize::try_from(decision.forced_drain_max).unwrap_or(max_txs / 2);
+
+        // Step 1: First include due forced txs from storage (capped by organiser)
+        match get_forced_txs(&storage, forced_drain_max).await {
             Ok(forced_txs) => {
+                let mut forced_bytes_this_batch: u64 = 0;
                 for (tx, tx_hash) in forced_txs {
-                    if batch_txs.len() >= config.max_batch_txs
-                        || batch_bytes >= config.max_batch_bytes
-                    {
+                    if batch_txs.len() >= max_txs || batch_bytes >= max_bytes {
                         break;
                     }
                     let tx_size = tx.payload.len();
                     batch_txs.push(tx);
                     batch_bytes += tx_size;
                     forced_tx_hashes.push(tx_hash);
+                    forced_bytes_this_batch =
+                        forced_bytes_this_batch.saturating_add(u64::try_from(tx_size).unwrap_or(0));
                 }
                 if !forced_tx_hashes.is_empty() {
                     info!(
                         count = forced_tx_hashes.len(),
+                        bytes = forced_bytes_this_batch,
                         "including forced txs in batch"
                     );
+                    // Update forced bytes counter
+                    let mut guard = state.lock().await;
+                    guard.recent_forced_used_bytes = guard
+                        .recent_forced_used_bytes
+                        .saturating_add(forced_bytes_this_batch);
                 }
             }
             Err(err) => {
@@ -1039,8 +1263,8 @@ async fn run_loop(
             }
         }
 
-        // Step 2: Fill remaining slots with normal pool txs
-        while batch_txs.len() < config.max_batch_txs && batch_bytes < config.max_batch_bytes {
+        // Step 2: Fill remaining slots with normal pool txs (using organiser limits)
+        while batch_txs.len() < max_txs && batch_bytes < max_bytes {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -1050,8 +1274,12 @@ async fn run_loop(
                     let tx_size = tx.payload.len();
                     batch_txs.push(tx);
                     batch_bytes += tx_size;
+
+                    // Update state
                     let mut guard = state.lock().await;
                     guard.queue_depth = guard.queue_depth.saturating_sub(1);
+                    // Update tx bytes EMA
+                    guard.update_avg_tx_bytes(u64::try_from(tx_size).unwrap_or(0));
                 }
                 Ok(None) => return,
                 Err(_) => break,
@@ -1314,16 +1542,16 @@ fn now_ms() -> u64 {
 }
 
 pub fn build_handle_for_tests(
-    _config: BatcherConfig,
+    config: BatcherConfig,
     _storage: Arc<Storage>,
     _poster: Arc<dyn BatchPoster>,
 ) -> (BatcherHandle, mpsc::Receiver<Tx>) {
     let (tx, rx) = mpsc::channel(1024);
-    let state = Arc::new(Mutex::new(BatcherState {
-        queue_depth: 0,
-        last_batch_hash: None,
-        last_post_time_ms: None,
-    }));
+    let state = Arc::new(Mutex::new(BatcherState::new(
+        config.organiser_enabled,
+        OrganiserVersion::None,
+        config.organiser_bounds,
+    )));
     let handle = BatcherHandle { tx, state };
     (handle, rx)
 }
@@ -1353,6 +1581,8 @@ mod tests {
             max_batch_bytes: 1024,
             max_wait_ms: 10,
             chain_id: ChainId(7),
+            organiser_enabled: false, // Disable organiser for deterministic test timing
+            ..BatcherConfig::default()
         };
         let handle = spawn(config, Arc::clone(&storage), poster);
         handle

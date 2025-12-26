@@ -294,6 +294,11 @@ struct Metrics {
     m2m_quota_reject_total: IntCounter,
     m2m_insufficient_balance_reject_total: IntCounter,
     m2m_forced_included_total: IntCounter,
+    // Organiser metrics
+    organiser_decisions_total: IntCounter,
+    organiser_sleep_ms_last: IntGauge,
+    organiser_max_txs_last: IntGauge,
+    organiser_max_bytes_last: IntGauge,
 }
 
 impl Metrics {
@@ -493,6 +498,31 @@ impl Metrics {
         ))
         .expect("m2m forced included counter");
 
+        // Organiser metrics
+        let organiser_decisions_total = IntCounter::with_opts(Opts::new(
+            "l2_organiser_decisions_total",
+            "Total organiser scheduling decisions made",
+        ))
+        .expect("organiser decisions counter");
+
+        let organiser_sleep_ms_last = IntGauge::with_opts(Opts::new(
+            "l2_organiser_sleep_ms_last",
+            "Last organiser-decided sleep duration (ms)",
+        ))
+        .expect("organiser sleep gauge");
+
+        let organiser_max_txs_last = IntGauge::with_opts(Opts::new(
+            "l2_organiser_max_txs_last",
+            "Last organiser-decided max txs per batch",
+        ))
+        .expect("organiser max_txs gauge");
+
+        let organiser_max_bytes_last = IntGauge::with_opts(Opts::new(
+            "l2_organiser_max_bytes_last",
+            "Last organiser-decided max bytes per batch",
+        ))
+        .expect("organiser max_bytes gauge");
+
         // Register all metrics
         for metric in [
             Box::new(uptime_ms.clone()) as Box<dyn prometheus::core::Collector>,
@@ -527,6 +557,10 @@ impl Metrics {
             Box::new(m2m_quota_reject_total.clone()),
             Box::new(m2m_insufficient_balance_reject_total.clone()),
             Box::new(m2m_forced_included_total.clone()),
+            Box::new(organiser_decisions_total.clone()),
+            Box::new(organiser_sleep_ms_last.clone()),
+            Box::new(organiser_max_txs_last.clone()),
+            Box::new(organiser_max_bytes_last.clone()),
         ] {
             registry.register(metric).expect("register metric");
         }
@@ -565,7 +599,20 @@ impl Metrics {
             m2m_quota_reject_total,
             m2m_insufficient_balance_reject_total,
             m2m_forced_included_total,
+            organiser_decisions_total,
+            organiser_sleep_ms_last,
+            organiser_max_txs_last,
+            organiser_max_bytes_last,
         }
+    }
+
+    fn update_organiser_metrics(&self, decision: &l2_batcher::OrganiserDecision) {
+        self.organiser_decisions_total.inc();
+        self.organiser_sleep_ms_last
+            .set(i64::try_from(decision.sleep_ms).unwrap_or(i64::MAX));
+        self.organiser_max_txs_last.set(i64::from(decision.max_txs));
+        self.organiser_max_bytes_last
+            .set(i64::from(decision.max_bytes));
     }
 
     fn update_posting_counts(&self, counts: &PostingStateCounts) {
@@ -745,6 +792,23 @@ struct StatusResponse {
     settlement: SettlementInfo,
     forced_inclusion: ForcedInclusionInfo,
     m2m_fees: M2mFeesInfo,
+    organiser: OrganiserInfo,
+}
+
+#[derive(Serialize)]
+struct OrganiserInfo {
+    /// Whether the organiser is enabled.
+    enabled: bool,
+    /// Organiser version.
+    version: String,
+    /// Last inputs used for decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_inputs: Option<l2_batcher::OrganiserInputs>,
+    /// Last decision made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_decision: Option<l2_batcher::OrganiserDecision>,
+    /// Policy bounds.
+    bounds: l2_batcher::OrganiserPolicyBounds,
 }
 
 #[derive(Serialize)]
@@ -1019,6 +1083,7 @@ async fn run() -> Result<(), NodeError> {
             max_batch_bytes: 512 * 1024,
             max_wait_ms: 1_000,
             chain_id: ChainId(settings.chain_id),
+            ..BatcherConfig::default()
         };
 
         // Create poster based on L2_POSTER_MODE and IPPAN_RPC_URL
@@ -1081,6 +1146,7 @@ async fn run() -> Result<(), NodeError> {
             poster,
             m2m_storage.clone(),
             Some(fee_schedule.clone()),
+            None, // Use default GBDT organiser
         );
         batcher_handle = Some(handle);
 
@@ -1425,6 +1491,13 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
                 }
             }
         },
+        organiser: OrganiserInfo {
+            enabled: batcher_snapshot.organiser.enabled,
+            version: batcher_snapshot.organiser.version.clone(),
+            last_inputs: batcher_snapshot.organiser.last_inputs.clone(),
+            last_decision: batcher_snapshot.organiser.last_decision.clone(),
+            bounds: batcher_snapshot.organiser.bounds.clone(),
+        },
     };
 
     Json(response)
@@ -1433,15 +1506,20 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
 async fn metrics_handler(state: axum::extract::State<AppState>) -> impl IntoResponse {
     let uptime_millis = state.start_instant.elapsed().as_millis();
     let uptime_ms = i64::try_from(uptime_millis).unwrap_or(i64::MAX);
-    let queue_depth = if let Some(handle) = &state.batcher {
-        let depth = handle.snapshot().await.queue_depth;
-        i64::try_from(depth).unwrap_or(i64::MAX)
+    let batcher_snapshot = if let Some(handle) = &state.batcher {
+        handle.snapshot().await
     } else {
-        0
+        BatcherSnapshot::default()
     };
+    let queue_depth = i64::try_from(batcher_snapshot.queue_depth).unwrap_or(i64::MAX);
 
     state.metrics.uptime_ms.set(uptime_ms);
     state.metrics.queue_depth.set(queue_depth);
+
+    // Update organiser metrics
+    if let Some(decision) = &batcher_snapshot.organiser.last_decision {
+        state.metrics.update_organiser_metrics(decision);
+    }
 
     // Update posting counts
     if let Ok(counts) = state.storage.count_posting_states() {

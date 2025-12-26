@@ -22,6 +22,7 @@ pub mod finality;
 pub mod forced_inclusion;
 pub mod hub_linkage;
 pub mod l1_contract;
+pub mod organiser;
 pub mod policy;
 
 pub use batch_envelope::{
@@ -31,6 +32,10 @@ pub use batch_envelope::{
 pub use canonical::{
     canonical_decode, canonical_encode, canonical_hash, canonical_hash_bytes, Batch,
     CanonicalError, ChainId, Hash32, Receipt, Tx,
+};
+pub use organiser::{
+    NoopOrganiser, Organiser, OrganiserDecision, OrganiserInputs, OrganiserPolicyBounds,
+    OrganiserStatus, OrganiserVersion,
 };
 
 #[cfg(feature = "signed-envelopes")]

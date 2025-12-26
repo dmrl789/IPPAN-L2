@@ -326,6 +326,10 @@ elif resp.status_code == 429:
 4. **Overflow Safety**: All arithmetic uses checked operations
 5. **Crash Safe**: All state changes are atomic via sled transactions
 
+> **Note**: The [GBDT Organiser](./ORGANISER.md) influences batch *scheduling and fairness*
+> (batch timing, queue draining, forced traffic treatment), but **never** changes fee rates
+> or accepts unpaid transactions. Fee pricing remains determined by the schedule above.
+
 ## Configuration
 
 Environment variables:
