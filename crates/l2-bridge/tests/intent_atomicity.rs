@@ -15,11 +15,8 @@
 //! - Crash recovery scenarios
 //! - Finality coupling
 
-use l2_bridge::{
-    FinalityChecker, IntentPolicy, IntentRouter, MockFinalityChecker, MockHubExecutor,
-    PrepareFinality, DEFAULT_INTENT_EXPIRES_MS,
-};
-use l2_core::{Intent, IntentId, IntentKind, Hash32, L2HubId};
+use l2_bridge::{IntentPolicy, IntentRouter, MockFinalityChecker, MockHubExecutor};
+use l2_core::{Hash32, Intent, IntentId, IntentKind, L2HubId};
 use l2_storage::{IntentState, IntentStorage};
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -233,7 +230,10 @@ fn invariant_cannot_create_expired_intent() {
     let current_ms = 1_700_000_200_000; // After expiry
     let result = router.create_intent(intent, current_ms);
 
-    assert!(result.is_err(), "Should not create an already-expired intent");
+    assert!(
+        result.is_err(),
+        "Should not create an already-expired intent"
+    );
 }
 
 /// INVARIANT: Cannot prepare an expired intent.
@@ -268,11 +268,16 @@ async fn invariant_commit_requires_finality_when_enabled() {
         require_prep_finality: true,
         ..Default::default()
     };
-    let finality_checker = Arc::new(MockFinalityChecker { is_finalised: false });
+    let finality_checker = Arc::new(MockFinalityChecker {
+        is_finalised: false,
+    });
 
     let mut router = IntentRouter::new(storage, policy, finality_checker);
     router.register_executor(L2HubId::Fin, Arc::new(MockHubExecutor::new(L2HubId::Fin)));
-    router.register_executor(L2HubId::World, Arc::new(MockHubExecutor::new(L2HubId::World)));
+    router.register_executor(
+        L2HubId::World,
+        Arc::new(MockHubExecutor::new(L2HubId::World)),
+    );
 
     let intent = make_intent(L2HubId::Fin, L2HubId::World, 1_700_000_600_000);
     let current_ms = 1_700_000_100_000;
@@ -308,7 +313,10 @@ async fn invariant_commit_succeeds_with_finality() {
 
     let mut router = IntentRouter::new(storage, policy, finality_checker);
     router.register_executor(L2HubId::Fin, Arc::new(MockHubExecutor::new(L2HubId::Fin)));
-    router.register_executor(L2HubId::World, Arc::new(MockHubExecutor::new(L2HubId::World)));
+    router.register_executor(
+        L2HubId::World,
+        Arc::new(MockHubExecutor::new(L2HubId::World)),
+    );
 
     let intent = make_intent(L2HubId::Fin, L2HubId::World, 1_700_000_600_000);
     let current_ms = 1_700_000_100_000;
@@ -445,15 +453,15 @@ async fn multiple_intents_coexist() {
     let current_ms = 1_700_000_100_000;
 
     // Create multiple different intents
-    let intents: Vec<Intent> = (0..5)
+    let intents: Vec<Intent> = (0u8..5)
         .map(|i| Intent {
             kind: IntentKind::CrossHubTransfer,
-            created_ms: 1_700_000_000_000 + i,
+            created_ms: 1_700_000_000_000 + u64::from(i),
             expires_ms: 1_700_000_600_000,
             from_hub: L2HubId::Fin,
             to_hub: L2HubId::World,
             initiator: format!("user_{}", i),
-            payload: vec![i as u8],
+            payload: vec![i],
         })
         .collect();
 
@@ -465,7 +473,11 @@ async fn multiple_intents_coexist() {
 
     // All IDs should be unique
     let unique_ids: std::collections::HashSet<_> = ids.iter().map(|id| id.to_hex()).collect();
-    assert_eq!(unique_ids.len(), ids.len(), "All intent IDs should be unique");
+    assert_eq!(
+        unique_ids.len(),
+        ids.len(),
+        "All intent IDs should be unique"
+    );
 
     // All intents should be in Created state
     for id in &ids {
@@ -515,5 +527,8 @@ fn invariant_initiator_required() {
     };
 
     let validation = intent.validate();
-    assert!(validation.is_err(), "Should reject intent with empty initiator");
+    assert!(
+        validation.is_err(),
+        "Should reject intent with empty initiator"
+    );
 }

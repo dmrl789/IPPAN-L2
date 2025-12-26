@@ -471,9 +471,9 @@ impl IntentStorage {
         let key = intent_id.to_hex();
 
         // Get current state
-        let current = self.get(intent_id)?.ok_or_else(|| {
-            IntentStorageError::NotFound(intent_id.to_hex())
-        })?;
+        let current = self
+            .get(intent_id)?
+            .ok_or_else(|| IntentStorageError::NotFound(intent_id.to_hex()))?;
 
         // Validate transition
         validate_intent_transition(&current, new_state)?;
@@ -1053,24 +1053,15 @@ mod tests {
 
         // Move some to prepared
         storage
-            .update(
-                &test_intent_id(0),
-                &IntentState::prepared(1500, vec![]),
-            )
+            .update(&test_intent_id(0), &IntentState::prepared(1500, vec![]))
             .unwrap();
         storage
-            .update(
-                &test_intent_id(1),
-                &IntentState::prepared(1500, vec![]),
-            )
+            .update(&test_intent_id(1), &IntentState::prepared(1500, vec![]))
             .unwrap();
 
         // Commit one
         storage
-            .update(
-                &test_intent_id(0),
-                &IntentState::committed(2000, vec![]),
-            )
+            .update(&test_intent_id(0), &IntentState::committed(2000, vec![]))
             .unwrap();
 
         // Abort one

@@ -32,8 +32,8 @@ pub use settlement::{
 };
 
 pub use intents::{
-    validate_intent_transition, IntentState, IntentStateCounts, IntentStateEntry,
-    IntentStorage, IntentStorageError, IntentTransitionError,
+    validate_intent_transition, IntentState, IntentStateCounts, IntentStateEntry, IntentStorage,
+    IntentStorageError, IntentTransitionError,
 };
 
 pub const SCHEMA_VERSION: &str = "3";

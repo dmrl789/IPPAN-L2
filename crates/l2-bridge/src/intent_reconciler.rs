@@ -20,7 +20,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-
 /// Configuration for the intent reconciler.
 #[derive(Debug, Clone)]
 pub struct IntentReconcilerConfig {
@@ -256,7 +255,10 @@ async fn run_intent_reconcile_cycle(
     // Phase 1: Check prepared intents for finality
     let prepared = intent_storage.list_prepared(config.intent_limit)?;
     if !prepared.is_empty() {
-        debug!(count = prepared.len(), "checking prepared intents for finality");
+        debug!(
+            count = prepared.len(),
+            "checking prepared intents for finality"
+        );
     }
 
     for entry in prepared {
@@ -359,7 +361,10 @@ impl SettlementFinalityChecker {
     /// Synchronously check finality (uses blocking).
     ///
     /// Note: In a fully async context, you'd use the async version instead.
-    pub fn check_prepare_finality_sync(&self, intent_id: &IntentId) -> crate::intents::PrepareFinality {
+    pub fn check_prepare_finality_sync(
+        &self,
+        intent_id: &IntentId,
+    ) -> crate::intents::PrepareFinality {
         // Try to get the lock without blocking forever
         let tracker = match self.batch_tracker.try_lock() {
             Ok(guard) => guard,
@@ -577,8 +582,8 @@ mod tests {
             .create(
                 &intent_id,
                 &IntentState::created(
-                    now - 2000,      // created 2 seconds ago
-                    now - 1000,      // expired 1 second ago
+                    now - 2000, // created 2 seconds ago
+                    now - 1000, // expired 1 second ago
                     L2HubId::Fin,
                     L2HubId::World,
                 ),

@@ -363,7 +363,9 @@ impl IntentHealthStatus {
     /// Create a health status from metrics.
     pub fn from_metrics(metrics: IntentMetricsSnapshot) -> Self {
         let violations = metrics.check_invariants();
-        let healthy = violations.iter().all(|v| v.severity != InvariantSeverity::Critical);
+        let healthy = violations
+            .iter()
+            .all(|v| v.severity != InvariantSeverity::Critical);
 
         let success_pct = metrics.success_rate_bps() / 100; // Convert to whole percent for display
         let message = if violations.is_empty() {

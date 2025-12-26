@@ -483,7 +483,12 @@ impl IntentHubTx {
     /// Intent hub transactions are settled via the existing batch posting mechanism.
     /// Each phase transition is recorded as a normal L2 transaction that gets
     /// included in per-hub batches and settled on L1.
-    pub fn to_l2_tx(&self, chain_id: crate::ChainId, from: &str, nonce: u64) -> Result<crate::Tx, CanonicalError> {
+    pub fn to_l2_tx(
+        &self,
+        chain_id: crate::ChainId,
+        from: &str,
+        nonce: u64,
+    ) -> Result<crate::Tx, CanonicalError> {
         Ok(crate::Tx {
             chain_id,
             nonce,

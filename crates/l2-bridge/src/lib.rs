@@ -27,9 +27,9 @@ pub use intent_metrics::{
     InvariantViolation,
 };
 pub use intent_reconciler::{
-    get_intent_pending_summary, spawn_intent_reconciler, IntentBatchTracker,
-    IntentPendingSummary, IntentReconcileCycleResult, IntentReconcilerConfig,
-    IntentReconcilerHandle, IntentReconcilerMetrics, SettlementFinalityChecker,
+    get_intent_pending_summary, spawn_intent_reconciler, IntentBatchTracker, IntentPendingSummary,
+    IntentReconcileCycleResult, IntentReconcilerConfig, IntentReconcilerHandle,
+    IntentReconcilerMetrics, SettlementFinalityChecker,
 };
 pub use intents::{
     AbortIntentResult, CommitIntentResult, CreateIntentResult, FinalityChecker, HubIntentExecutor,

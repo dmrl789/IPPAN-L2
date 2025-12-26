@@ -20,7 +20,7 @@
 use async_trait::async_trait;
 use l2_core::{
     canonical_hash_bytes, CommitReceipt, Hash32, Intent, IntentHubTx, IntentId, IntentPhase,
-    PrepareReceipt, L2HubId,
+    L2HubId, PrepareReceipt,
 };
 use l2_storage::{IntentState, IntentStateCounts, IntentStateEntry, IntentStorage};
 use serde::{Deserialize, Serialize};
@@ -701,12 +701,7 @@ impl IntentRouter {
             Ok(expired) => {
                 for entry in expired {
                     let result = self
-                        .abort_intent(
-                            &entry.intent_id,
-                            "expired".to_string(),
-                            None,
-                            current_ms,
-                        )
+                        .abort_intent(&entry.intent_id, "expired".to_string(), None, current_ms)
                         .await;
                     if let Ok(r) = result {
                         results.push(r);
@@ -723,10 +718,7 @@ impl IntentRouter {
 
     // ========== Internal helpers ==========
 
-    fn get_executor(
-        &self,
-        hub: L2HubId,
-    ) -> Result<&Arc<dyn HubIntentExecutor>, IntentRouterError> {
+    fn get_executor(&self, hub: L2HubId) -> Result<&Arc<dyn HubIntentExecutor>, IntentRouterError> {
         self.executors
             .get(&hub)
             .ok_or_else(|| IntentRouterError::HubExecution {
@@ -770,15 +762,23 @@ impl IntentStatus {
         };
 
         let details = match state {
-            IntentState::Created { expires_ms, .. } => {
-                Some(format!("expires at {}", expires_ms))
-            }
-            IntentState::Prepared { prepared_ms, prep_receipts } => {
-                Some(format!("prepared at {} with {} receipts", prepared_ms, prep_receipts.len()))
-            }
-            IntentState::Committed { committed_ms, commit_receipts } => {
-                Some(format!("committed at {} with {} receipts", committed_ms, commit_receipts.len()))
-            }
+            IntentState::Created { expires_ms, .. } => Some(format!("expires at {}", expires_ms)),
+            IntentState::Prepared {
+                prepared_ms,
+                prep_receipts,
+            } => Some(format!(
+                "prepared at {} with {} receipts",
+                prepared_ms,
+                prep_receipts.len()
+            )),
+            IntentState::Committed {
+                committed_ms,
+                commit_receipts,
+            } => Some(format!(
+                "committed at {} with {} receipts",
+                committed_ms,
+                commit_receipts.len()
+            )),
             IntentState::Aborted { aborted_ms, reason } => {
                 Some(format!("aborted at {}: {}", aborted_ms, reason))
             }
@@ -827,10 +827,16 @@ mod tests {
 
         // Register mock executors
         router.register_executor(L2HubId::Fin, Arc::new(MockHubExecutor::new(L2HubId::Fin)));
-        router.register_executor(L2HubId::World, Arc::new(MockHubExecutor::new(L2HubId::World)));
+        router.register_executor(
+            L2HubId::World,
+            Arc::new(MockHubExecutor::new(L2HubId::World)),
+        );
         router.register_executor(L2HubId::Data, Arc::new(MockHubExecutor::new(L2HubId::Data)));
         router.register_executor(L2HubId::M2m, Arc::new(MockHubExecutor::new(L2HubId::M2m)));
-        router.register_executor(L2HubId::Bridge, Arc::new(MockHubExecutor::new(L2HubId::Bridge)));
+        router.register_executor(
+            L2HubId::Bridge,
+            Arc::new(MockHubExecutor::new(L2HubId::Bridge)),
+        );
 
         let intent = test_intent();
         (router, intent)
@@ -945,11 +951,16 @@ mod tests {
         };
 
         // Use mock that says NOT finalised
-        let finality_checker = Arc::new(MockFinalityChecker { is_finalised: false });
+        let finality_checker = Arc::new(MockFinalityChecker {
+            is_finalised: false,
+        });
 
         let mut router = IntentRouter::new(storage, policy, finality_checker);
         router.register_executor(L2HubId::Fin, Arc::new(MockHubExecutor::new(L2HubId::Fin)));
-        router.register_executor(L2HubId::World, Arc::new(MockHubExecutor::new(L2HubId::World)));
+        router.register_executor(
+            L2HubId::World,
+            Arc::new(MockHubExecutor::new(L2HubId::World)),
+        );
 
         let intent = test_intent();
         let current_ms = 1_700_000_100_000;
@@ -965,7 +976,10 @@ mod tests {
             .commit_intent(&create_result.intent_id, &intent, current_ms)
             .await;
 
-        assert!(matches!(result, Err(IntentRouterError::PrepareNotFinalised)));
+        assert!(matches!(
+            result,
+            Err(IntentRouterError::PrepareNotFinalised)
+        ));
     }
 
     #[tokio::test]
@@ -1045,7 +1059,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(IntentRouterError::AlreadyInState { .. })));
+        assert!(matches!(
+            result,
+            Err(IntentRouterError::AlreadyInState { .. })
+        ));
     }
 
     #[test]

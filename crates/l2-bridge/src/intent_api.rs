@@ -98,7 +98,10 @@ impl IntentApi {
         })?;
 
         // Prepare via router
-        let result = self.router.prepare_intent(&intent_id, &intent, current_ms).await?;
+        let result = self
+            .router
+            .prepare_intent(&intent_id, &intent, current_ms)
+            .await?;
 
         // Record the batch association (in real impl, this would be the batch hash)
         // For now, we use a placeholder since we're not actually batching
@@ -158,7 +161,10 @@ impl IntentApi {
         })?;
 
         // Commit via router
-        let result = self.router.commit_intent(&intent_id, &intent, current_ms).await?;
+        let result = self
+            .router
+            .commit_intent(&intent_id, &intent, current_ms)
+            .await?;
 
         // Clean up cache
         {
@@ -202,7 +208,12 @@ impl IntentApi {
         // Abort via router
         let result = self
             .router
-            .abort_intent(&intent_id, request.reason.clone(), intent.as_ref(), current_ms)
+            .abort_intent(
+                &intent_id,
+                request.reason.clone(),
+                intent.as_ref(),
+                current_ms,
+            )
             .await?;
 
         // Clean up cache
@@ -324,7 +335,10 @@ impl CreateIntentRequest {
 
         let payload = base64_decode(&self.payload)?;
 
-        let expires_ms = current_ms + self.expires_in_ms.unwrap_or(crate::DEFAULT_INTENT_EXPIRES_MS);
+        let expires_ms = current_ms
+            + self
+                .expires_in_ms
+                .unwrap_or(crate::DEFAULT_INTENT_EXPIRES_MS);
 
         Ok(Intent {
             kind,
@@ -489,7 +503,9 @@ impl IntentApiError {
             IntentApiError::Router(IntentRouterError::Expired { .. }) => "expired",
             IntentApiError::Router(IntentRouterError::AlreadyInState { .. }) => "already_in_state",
             IntentApiError::Router(IntentRouterError::WrongState { .. }) => "wrong_state",
-            IntentApiError::Router(IntentRouterError::PrepareNotFinalised) => "prepare_not_finalised",
+            IntentApiError::Router(IntentRouterError::PrepareNotFinalised) => {
+                "prepare_not_finalised"
+            }
             IntentApiError::Router(IntentRouterError::PolicyViolation(_)) => "policy_violation",
             IntentApiError::Router(_) => "router_error",
             IntentApiError::Internal(_) => "internal_error",
@@ -519,8 +535,8 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, IntentApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use crate::intents::{MockFinalityChecker, MockHubExecutor};
+    use base64::Engine as _;
     use l2_storage::IntentStorage;
     use tempfile::tempdir;
 
@@ -537,10 +553,16 @@ mod tests {
 
         let mut router = IntentRouter::new(storage, policy, finality_checker);
         router.register_executor(L2HubId::Fin, Arc::new(MockHubExecutor::new(L2HubId::Fin)));
-        router.register_executor(L2HubId::World, Arc::new(MockHubExecutor::new(L2HubId::World)));
+        router.register_executor(
+            L2HubId::World,
+            Arc::new(MockHubExecutor::new(L2HubId::World)),
+        );
         router.register_executor(L2HubId::Data, Arc::new(MockHubExecutor::new(L2HubId::Data)));
         router.register_executor(L2HubId::M2m, Arc::new(MockHubExecutor::new(L2HubId::M2m)));
-        router.register_executor(L2HubId::Bridge, Arc::new(MockHubExecutor::new(L2HubId::Bridge)));
+        router.register_executor(
+            L2HubId::Bridge,
+            Arc::new(MockHubExecutor::new(L2HubId::Bridge)),
+        );
 
         let batch_tracker = Arc::new(tokio::sync::Mutex::new(IntentBatchTracker::new()));
 
@@ -636,13 +658,13 @@ mod tests {
         let api = setup_api();
 
         // Create several intents
-        for i in 0..3 {
+        for i in 0u8..3 {
             let request = CreateIntentRequest {
                 kind: "cross_hub_transfer".to_string(),
                 from_hub: "fin".to_string(),
                 to_hub: "world".to_string(),
                 initiator: format!("user_{}", i),
-                payload: base64::engine::general_purpose::STANDARD.encode(&[i as u8]),
+                payload: base64::engine::general_purpose::STANDARD.encode([i]),
                 expires_in_ms: Some(600_000),
             };
             api.create_intent(request).await.unwrap();
