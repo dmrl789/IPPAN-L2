@@ -12,6 +12,7 @@
 //! This crate provides persistent storage for batches, transactions, and
 //! settlement state. All operations are crash-safe and atomic.
 
+pub mod external;
 pub mod intents;
 pub mod m2m;
 pub mod m2m_ops;
@@ -31,6 +32,10 @@ pub use settlement::{
     SettlementTransitionError,
 };
 
+pub use external::{
+    ExternalProofCounts, ExternalProofEntry, ExternalProofStorage, ExternalProofStorageError,
+    ProofIntentBinding,
+};
 pub use intents::{
     validate_intent_transition, IntentState, IntentStateCounts, IntentStateEntry, IntentStorage,
     IntentStorageError, IntentTransitionError,

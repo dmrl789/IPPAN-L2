@@ -11,7 +11,15 @@
 //!
 //! This module handles deposits (L1 → L2), withdrawals (L2 → L1),
 //! and cross-hub intent coordination for atomic operations.
+//!
+//! ## External Chain Proofs
+//!
+//! The `eth_adapter` module provides verification of external chain events
+//! (Ethereum, etc.) via signed attestations or Merkle proofs.
 
+pub mod eth_adapter;
+pub mod external_proof_api;
+pub mod external_proof_reconciler;
 pub mod intent_api;
 pub mod intent_metrics;
 pub mod intent_reconciler;
@@ -31,10 +39,27 @@ pub use intent_reconciler::{
     IntentReconcileCycleResult, IntentReconcilerConfig, IntentReconcilerHandle,
     IntentReconcilerMetrics, SettlementFinalityChecker,
 };
+pub use eth_adapter::{
+    CompositeVerifier, EthAttestationVerifier, EthAttestationVerifierConfig, ExpectedEventBinding,
+    ExternalVerifier, ExternalVerifyError, MockVerifier, VerifiedEvent,
+    DEFAULT_MIN_CONFIRMATIONS_MAINNET, DEFAULT_MIN_CONFIRMATIONS_TESTNET,
+};
+pub use external_proof_api::{
+    BindProofResponse, ExternalProofApi, ExternalProofApiError, IntentProofsVerifiedResponse,
+    ListProofsQuery, ListProofsResponse, ProofCountsResponse, ProofListItem, ProofStatusResponse,
+    SubmitProofRequest, SubmitProofResponse,
+};
+pub use external_proof_reconciler::{
+    spawn_external_proof_reconciler, ExternalProofReconcileCycleResult,
+    ExternalProofReconcilerConfig, ExternalProofReconcilerHandle,
+    ExternalProofReconcilerMetrics, ExternalProofReconcilerMetricsSnapshot,
+    StorageExternalProofChecker,
+};
 pub use intents::{
-    AbortIntentResult, CommitIntentResult, CreateIntentResult, FinalityChecker, HubIntentExecutor,
-    IntentPolicy, IntentRouter, IntentRouterError, IntentStatus, MockFinalityChecker,
-    MockHubExecutor, PrepareFinality, PrepareIntentResult, DEFAULT_INTENT_EXPIRES_MS,
+    AbortIntentResult, CommitIntentResult, CreateIntentResult, ExternalProofChecker,
+    FinalityChecker, HubIntentExecutor, IntentPolicy, IntentRouter, IntentRouterError,
+    IntentStatus, MockExternalProofChecker, MockFinalityChecker, MockHubExecutor,
+    NoopExternalProofChecker, PrepareFinality, PrepareIntentResult, DEFAULT_INTENT_EXPIRES_MS,
 };
 
 use std::sync::Arc;
