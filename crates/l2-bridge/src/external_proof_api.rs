@@ -10,7 +10,8 @@
 //! - `POST /bridge/proofs/:proof_id/bind/:intent_id` - Bind proof to intent
 
 use l2_core::{
-    EthReceiptAttestationV1, ExternalChainId, ExternalEventProofV1, ExternalProofId, IntentId,
+    EthReceiptAttestationV1, EthReceiptMerkleProofV1, ExternalChainId, ExternalEventProofV1,
+    ExternalProofId, IntentId,
 };
 use l2_storage::ExternalProofStorage;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,7 @@ impl ExternalProofApi {
             was_new,
             chain: proof.chain().to_string(),
             proof_type: proof.proof_type().to_string(),
+            verification_mode: proof.verification_mode().name().to_string(),
             block_number: proof.block_number(),
         })
     }
@@ -82,6 +84,7 @@ impl ExternalProofApi {
             proof_id: proof_id_hex.to_string(),
             chain: entry.proof.chain().to_string(),
             proof_type: entry.proof.proof_type().to_string(),
+            verification_mode: entry.verification_mode.name().to_string(),
             block_number: entry.proof.block_number(),
             tx_hash: hex::encode(entry.proof.tx_hash()),
             state: entry.state.name().to_string(),
@@ -272,7 +275,7 @@ pub struct SubmitProofRequest {
     /// Block hash (hex, 32 bytes).
     pub block_hash: String,
 
-    /// Number of confirmations (attestation only).
+    /// Number of confirmations (attestation only, optional for merkle).
     #[serde(default)]
     pub confirmations: Option<u32>,
 
@@ -283,6 +286,28 @@ pub struct SubmitProofRequest {
     /// Attestor signature (hex, 64 bytes, attestation only).
     #[serde(default)]
     pub signature: Option<String>,
+
+    // ========== Merkle proof fields ==========
+
+    /// Transaction index in block (merkle proof only).
+    #[serde(default)]
+    pub tx_index: Option<u32>,
+
+    /// RLP-encoded block header (hex, merkle proof only).
+    #[serde(default)]
+    pub header_rlp: Option<String>,
+
+    /// RLP-encoded receipt (hex, merkle proof only).
+    #[serde(default)]
+    pub receipt_rlp: Option<String>,
+
+    /// Merkle proof nodes (array of hex strings, merkle proof only).
+    #[serde(default)]
+    pub proof_nodes: Option<Vec<String>>,
+
+    /// Tip block number at proof creation time (optional, for RPC-assisted confirmations).
+    #[serde(default)]
+    pub tip_block_number: Option<u64>,
 }
 
 impl SubmitProofRequest {
@@ -332,9 +357,65 @@ impl SubmitProofRequest {
                     },
                 ))
             }
-            "eth_receipt_merkle_v1" => Err(ExternalProofApiError::InvalidRequest(
-                "merkle proofs not yet supported for submission".to_string(),
-            )),
+            "eth_receipt_merkle_v1" => {
+                let chain = self.parse_chain()?;
+                let tx_hash = parse_hex_32(&self.tx_hash, "tx_hash")?;
+                let contract = parse_hex_20(&self.contract, "contract")?;
+                let topic0 = parse_hex_32(&self.topic0, "topic0")?;
+                let data_hash = parse_hex_32(&self.data_hash, "data_hash")?;
+                let block_hash = parse_hex_32(&self.block_hash, "block_hash")?;
+
+                let tx_index = self.tx_index.ok_or_else(|| {
+                    ExternalProofApiError::InvalidRequest(
+                        "tx_index required for merkle proof".to_string(),
+                    )
+                })?;
+
+                let header_rlp = self.header_rlp.as_ref().ok_or_else(|| {
+                    ExternalProofApiError::InvalidRequest(
+                        "header_rlp required for merkle proof".to_string(),
+                    )
+                })?;
+                let header_rlp = parse_hex_vec(header_rlp, "header_rlp")?;
+
+                let receipt_rlp = self.receipt_rlp.as_ref().ok_or_else(|| {
+                    ExternalProofApiError::InvalidRequest(
+                        "receipt_rlp required for merkle proof".to_string(),
+                    )
+                })?;
+                let receipt_rlp = parse_hex_vec(receipt_rlp, "receipt_rlp")?;
+
+                let proof_nodes = self.proof_nodes.as_ref().ok_or_else(|| {
+                    ExternalProofApiError::InvalidRequest(
+                        "proof_nodes required for merkle proof".to_string(),
+                    )
+                })?;
+                let proof_nodes: Result<Vec<Vec<u8>>, ExternalProofApiError> = proof_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| parse_hex_vec(s, &format!("proof_nodes[{}]", i)))
+                    .collect();
+                let proof_nodes = proof_nodes?;
+
+                Ok(ExternalEventProofV1::EthReceiptMerkleProofV1(
+                    EthReceiptMerkleProofV1 {
+                        chain,
+                        tx_hash,
+                        block_number: self.block_number,
+                        block_hash,
+                        header_rlp,
+                        receipt_rlp,
+                        proof_nodes,
+                        tx_index,
+                        log_index: self.log_index,
+                        contract,
+                        topic0,
+                        data_hash,
+                        confirmations: self.confirmations,
+                        tip_block_number: self.tip_block_number,
+                    },
+                ))
+            }
             other => Err(ExternalProofApiError::InvalidRequest(format!(
                 "unknown proof_type: {}",
                 other
@@ -378,6 +459,7 @@ pub struct SubmitProofResponse {
     pub was_new: bool,
     pub chain: String,
     pub proof_type: String,
+    pub verification_mode: String,
     pub block_number: u64,
 }
 
@@ -387,6 +469,7 @@ pub struct ProofStatusResponse {
     pub proof_id: String,
     pub chain: String,
     pub proof_type: String,
+    pub verification_mode: String,
     pub block_number: u64,
     pub tx_hash: String,
     pub state: String,
@@ -560,6 +643,13 @@ fn parse_hex_64(s: &str, field: &str) -> Result<[u8; 64], ExternalProofApiError>
     Ok(arr)
 }
 
+fn parse_hex_vec(s: &str, field: &str) -> Result<Vec<u8>, ExternalProofApiError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).map_err(|e| {
+        ExternalProofApiError::InvalidRequest(format!("invalid {} hex: {}", field, e))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +680,12 @@ mod tests {
             confirmations: Some(12),
             attestor_pubkey: Some(hex::encode([0x11; 32])),
             signature: Some(hex::encode([0x22; 64])),
+            // Merkle proof fields (not used for attestations)
+            tx_index: None,
+            header_rlp: None,
+            receipt_rlp: None,
+            proof_nodes: None,
+            tip_block_number: None,
         }
     }
 
@@ -604,6 +700,7 @@ mod tests {
         assert!(response.was_new);
         assert_eq!(response.chain, "ethereum:1");
         assert_eq!(response.proof_type, "eth_receipt_attestation_v1");
+        assert_eq!(response.verification_mode, "attestation");
         assert_eq!(response.block_number, 18_000_000);
     }
 
@@ -629,6 +726,7 @@ mod tests {
         let status = api.get_proof(&submit_response.proof_id).unwrap();
 
         assert_eq!(status.proof_id, submit_response.proof_id);
+        assert_eq!(status.verification_mode, "attestation");
         assert_eq!(status.state, "unverified");
         assert!(!status.is_verified);
         assert!(!status.is_rejected);
@@ -750,6 +848,11 @@ mod tests {
             confirmations: Some(12),
             attestor_pubkey: Some(hex::encode([0x11; 32])),
             signature: Some(hex::encode([0x22; 64])),
+            tx_index: None,
+            header_rlp: None,
+            receipt_rlp: None,
+            proof_nodes: None,
+            tip_block_number: None,
         };
 
         assert!(matches!(
