@@ -1392,18 +1392,28 @@ pub struct MultiHubBatcherSnapshot {
 /// Per-hub snapshot for /status endpoint.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HubQueueSnapshot {
+    /// Hub identifier.
+    pub hub: String,
     /// Queue depth.
     pub queue_depth: u32,
     /// Forced queue depth.
     pub forced_queue_depth: u32,
     /// In-flight batches.
     pub in_flight_batches: u32,
-    /// Last batch hash (hex).
+    /// Last submitted batch hash (hex).
+    pub last_submitted_hash: Option<String>,
+    /// Last included batch hash (hex).
+    pub last_included_hash: Option<String>,
+    /// Last finalised batch hash (hex).
+    pub last_finalised_hash: Option<String>,
+    /// Last batch hash (for chaining, hex).
     pub last_batch_hash: Option<String>,
     /// Batch number.
     pub batch_number: u64,
     /// Total fees finalised (M2M hub only).
     pub total_fees_finalised_scaled: Option<u64>,
+    /// Last batch creation timestamp (ms).
+    pub last_batch_created_ms: Option<u64>,
 }
 
 impl From<&MultiHubBatcherState> for MultiHubBatcherSnapshot {
@@ -1411,9 +1421,13 @@ impl From<&MultiHubBatcherState> for MultiHubBatcherSnapshot {
         let mut per_hub = BTreeMap::new();
         for (hub, hub_state) in &state.per_hub {
             let snapshot = HubQueueSnapshot {
+                hub: hub.as_str().to_string(),
                 queue_depth: hub_state.queue_depth,
                 forced_queue_depth: hub_state.forced_queue_depth,
                 in_flight_batches: hub_state.in_flight_batches,
+                last_submitted_hash: None, // Populated from storage
+                last_included_hash: None,  // Populated from storage
+                last_finalised_hash: None, // Populated from storage
                 last_batch_hash: hub_state.last_batch_hash.map(|h| h.to_hex()),
                 batch_number: hub_state.batch_number,
                 total_fees_finalised_scaled: if hub.uses_m2m_fees() {
@@ -1421,6 +1435,7 @@ impl From<&MultiHubBatcherState> for MultiHubBatcherSnapshot {
                 } else {
                     None
                 },
+                last_batch_created_ms: hub_state.last_batch_created_ms,
             };
             per_hub.insert(hub.as_str().to_string(), snapshot);
         }
@@ -1433,6 +1448,30 @@ impl From<&MultiHubBatcherState> for MultiHubBatcherSnapshot {
             last_v2_decision: state.last_v2_decision.clone(),
             organiser_enabled: state.organiser_enabled,
             organiser_version: state.organiser_version.to_string(),
+        }
+    }
+}
+
+impl MultiHubBatcherSnapshot {
+    /// Enrich snapshot with data from storage (last finalised batch hashes, etc.).
+    pub fn enrich_from_storage(&mut self, storage: &Storage, chain_id: u64) {
+        for (hub_str, snapshot) in &mut self.per_hub {
+            // Get last finalised batch hash from storage
+            if let Ok(Some((hash, _at_ms))) = storage.get_last_finalised_batch(hub_str, chain_id) {
+                snapshot.last_finalised_hash = Some(hash.to_hex());
+            }
+
+            // Get fee totals from storage for M2M hub
+            if hub_str == "m2m" {
+                if let Ok(total_fees) = storage.get_hub_total_fees(hub_str, chain_id) {
+                    snapshot.total_fees_finalised_scaled = Some(total_fees);
+                }
+            }
+
+            // Get in-flight count from storage
+            if let Ok(in_flight) = storage.get_hub_in_flight_count(hub_str, chain_id) {
+                snapshot.in_flight_batches = in_flight;
+            }
         }
     }
 }
