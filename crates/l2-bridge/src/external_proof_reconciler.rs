@@ -425,8 +425,15 @@ pub async fn run_reconcile_cycle(
     // Process each unverified proof
     for entry in &unverified {
         #[cfg(feature = "eth-headers")]
-        let result =
-            verify_and_update(config, storage, verifier, &entry.proof_id, &entry.proof, header_ctx).await;
+        let result = verify_and_update(
+            config,
+            storage,
+            verifier,
+            &entry.proof_id,
+            &entry.proof,
+            header_ctx,
+        )
+        .await;
         #[cfg(not(feature = "eth-headers"))]
         let result =
             verify_and_update(config, storage, verifier, &entry.proof_id, &entry.proof).await;
@@ -819,10 +826,7 @@ fn verify_merkle_proof_with_header_store(
         }
         Err(e) => {
             // Determine if error is permanent or transient
-            let is_transient = matches!(
-                &e,
-                crate::eth_merkle::HeaderAwareMerkleError::Header(_)
-            );
+            let is_transient = matches!(&e, crate::eth_merkle::HeaderAwareMerkleError::Header(_));
 
             if is_transient {
                 Err(VerifyModeError::Transient(format!(

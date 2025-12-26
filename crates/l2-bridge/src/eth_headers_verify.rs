@@ -30,7 +30,7 @@
 //! - `ETH_BOOTSTRAP_CHECKPOINTS` env var (comma-separated hash:number pairs)
 //! - Programmatic configuration at startup
 
-use l2_core::eth_header::{EthereumHeaderV1, HeaderId, Hash256};
+use l2_core::eth_header::{EthereumHeaderV1, Hash256, HeaderId};
 use l2_storage::eth_headers::{EthHeaderStorage, EthHeaderStorageError};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,7 +109,10 @@ impl HeaderVerifierConfig {
                 // Format: chain_id:hash:number
                 let parts: Vec<&str> = entry.split(':').collect();
                 if parts.len() != 3 {
-                    warn!(entry = entry, "invalid checkpoint format, expected chain_id:hash:number");
+                    warn!(
+                        entry = entry,
+                        "invalid checkpoint format, expected chain_id:hash:number"
+                    );
                     continue;
                 }
 
@@ -264,8 +267,9 @@ impl HeaderVerifier {
             let header_hash = header.header_hash();
 
             // Check if this is a configured checkpoint
-            let is_checkpoint = self.config.checkpoints.get(chain_id).map_or(false, |cps| {
-                cps.iter().any(|(hash, num)| *hash == header_hash && *num == header.number)
+            let is_checkpoint = self.config.checkpoints.get(chain_id).is_some_and(|cps| {
+                cps.iter()
+                    .any(|(hash, num)| *hash == header_hash && *num == header.number)
             });
 
             if !is_checkpoint && !self.config.allow_uncheckpointed {
@@ -316,9 +320,9 @@ impl HeaderVerifier {
         let was_new = storage.put_header(header, now_ms)?;
 
         // Get the stored header to check verification state
-        let stored = storage
-            .get_header(&header_id)?
-            .ok_or_else(|| HeaderVerifyError::Storage(EthHeaderStorageError::NotFound(hex::encode(header_hash))))?;
+        let stored = storage.get_header(&header_id)?.ok_or_else(|| {
+            HeaderVerifyError::Storage(EthHeaderStorageError::NotFound(hex::encode(header_hash)))
+        })?;
 
         // Get confirmations if verified
         let confirmations = if stored.state.is_verified() {
@@ -367,9 +371,7 @@ impl HeaderVerifier {
 
         let confirmations = storage
             .confirmations(block_hash)?
-            .ok_or_else(|| {
-                HeaderVerifyError::NotOnVerifiedChain(hex::encode(block_hash))
-            })?;
+            .ok_or_else(|| HeaderVerifyError::NotOnVerifiedChain(hex::encode(block_hash)))?;
 
         if confirmations < min_confirmations {
             return Err(HeaderVerifyError::InsufficientConfirmations {
@@ -408,7 +410,9 @@ impl HeaderVerifier {
             .ok_or_else(|| HeaderVerifyError::NotOnVerifiedChain(hex::encode(block_hash)))?;
 
         if !stored.state.is_verified() {
-            return Err(HeaderVerifyError::NotOnVerifiedChain(hex::encode(block_hash)));
+            return Err(HeaderVerifyError::NotOnVerifiedChain(hex::encode(
+                block_hash,
+            )));
         }
 
         Ok(*stored.header.receipts_root())
@@ -494,11 +498,15 @@ impl MultiChainHeaderVerifier {
             .get(&chain_id)
             .ok_or(HeaderVerifyError::NoCheckpoint(chain_id))?;
 
-        self.verifier.get_verified_receipts_root(storage, block_hash)
+        self.verifier
+            .get_verified_receipts_root(storage, block_hash)
     }
 
     /// Get best tip for a chain.
-    pub fn get_best_tip(&self, chain_id: u64) -> Result<Option<l2_storage::BestTip>, HeaderVerifyError> {
+    pub fn get_best_tip(
+        &self,
+        chain_id: u64,
+    ) -> Result<Option<l2_storage::BestTip>, HeaderVerifyError> {
         let storage = self
             .storages
             .get(&chain_id)
@@ -585,15 +593,19 @@ mod tests {
         let storage = EthHeaderStorage::new(&db, 1).expect("storage");
 
         // Create verifier with devnet mode (allow uncheckpointed)
-        let mut config = HeaderVerifierConfig::default();
-        config.allow_uncheckpointed = true;
+        let config = HeaderVerifierConfig {
+            allow_uncheckpointed: true,
+            ..Default::default()
+        };
         let verifier = HeaderVerifier::new(config);
 
         // Create and store a checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
 
         let now_ms = 1_700_000_000_000u64;
-        let cp_id = storage.add_checkpoint(&checkpoint, now_ms).expect("add checkpoint");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, now_ms)
+            .expect("add checkpoint");
 
         // Verify and store a child header
         let child = test_header(101, cp_id.0);
@@ -610,8 +622,10 @@ mod tests {
         let db = test_db();
         let storage = EthHeaderStorage::new(&db, 1).expect("storage");
 
-        let mut config = HeaderVerifierConfig::default();
-        config.allow_uncheckpointed = true;
+        let config = HeaderVerifierConfig {
+            allow_uncheckpointed: true,
+            ..Default::default()
+        };
         let verifier = HeaderVerifier::new(config);
 
         // Create a header and encode to RLP
@@ -620,7 +634,9 @@ mod tests {
         let expected_hash = header.header_hash();
 
         // Add as checkpoint first
-        storage.add_checkpoint(&header, 1_700_000_000_000).expect("add");
+        storage
+            .add_checkpoint(&header, 1_700_000_000_000)
+            .expect("add");
 
         // Verify from RLP
         let result = verifier
@@ -660,7 +676,9 @@ mod tests {
 
         // Build a chain: checkpoint -> h1 -> h2 -> h3 (tip)
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let h1 = test_header(101, cp_id.0);
         let h1_hash = h1.header_hash();
@@ -679,11 +697,15 @@ mod tests {
         assert_eq!(tip.number, 103, "best tip should be h3");
 
         // h1 has 3 confirmations (tip is 103, h1 is 101) - meets threshold
-        let confs = verifier.check_confirmations(&storage, &h1_hash).expect("check h1");
+        let confs = verifier
+            .check_confirmations(&storage, &h1_hash)
+            .expect("check h1");
         assert_eq!(confs, 3);
 
-        // checkpoint has 4 confirmations - meets threshold  
-        let cp_confs = verifier.check_confirmations(&storage, &cp_id.0).expect("check cp");
+        // checkpoint has 4 confirmations - meets threshold
+        let cp_confs = verifier
+            .check_confirmations(&storage, &cp_id.0)
+            .expect("check cp");
         assert_eq!(cp_confs, 4);
 
         // h2 has 2 confirmations - insufficient (need 3)
@@ -706,13 +728,17 @@ mod tests {
         let db = test_db();
         let storage = EthHeaderStorage::new(&db, 1).expect("storage");
 
-        let mut config = HeaderVerifierConfig::default();
-        config.allow_uncheckpointed = true;
+        let config = HeaderVerifierConfig {
+            allow_uncheckpointed: true,
+            ..Default::default()
+        };
         let verifier = HeaderVerifier::new(config);
 
         let header = test_header(100, [0x00; 32]);
         let hash = header.header_hash();
-        storage.add_checkpoint(&header, 1_700_000_000_000).expect("add");
+        storage
+            .add_checkpoint(&header, 1_700_000_000_000)
+            .expect("add");
 
         let receipts_root = verifier
             .get_verified_receipts_root(&storage, &hash)
@@ -735,7 +761,10 @@ mod tests {
         storage.put_header(&header, 1_700_000_000_000).expect("put");
 
         let result = verifier.get_verified_receipts_root(&storage, &hash);
-        assert!(matches!(result, Err(HeaderVerifyError::NotOnVerifiedChain(_))));
+        assert!(matches!(
+            result,
+            Err(HeaderVerifyError::NotOnVerifiedChain(_))
+        ));
     }
 
     #[test]
@@ -744,8 +773,10 @@ mod tests {
         let storage_mainnet = Arc::new(EthHeaderStorage::new(&db, 1).expect("storage"));
         let storage_sepolia = Arc::new(EthHeaderStorage::new(&db, 11155111).expect("storage"));
 
-        let mut config = HeaderVerifierConfig::default();
-        config.allow_uncheckpointed = true;
+        let config = HeaderVerifierConfig {
+            allow_uncheckpointed: true,
+            ..Default::default()
+        };
 
         let mut verifier = MultiChainHeaderVerifier::new(config);
         verifier.add_chain(1, storage_mainnet.clone());
@@ -753,25 +784,36 @@ mod tests {
 
         // Add checkpoints to both
         let mainnet_cp = test_header(18_000_000, [0x00; 32]);
-        let mainnet_cp_id = storage_mainnet.add_checkpoint(&mainnet_cp, 1_700_000_000_000).expect("add");
+        let mainnet_cp_id = storage_mainnet
+            .add_checkpoint(&mainnet_cp, 1_700_000_000_000)
+            .expect("add");
 
         let sepolia_cp = test_header(5_000_000, [0x00; 32]);
-        let sepolia_cp_id = storage_sepolia.add_checkpoint(&sepolia_cp, 1_700_000_000_000).expect("add");
+        let sepolia_cp_id = storage_sepolia
+            .add_checkpoint(&sepolia_cp, 1_700_000_000_000)
+            .expect("add");
 
         // Verify headers on both chains
         let mainnet_child = test_header(18_000_001, mainnet_cp_id.0);
-        let result = verifier.verify_and_store(1, &mainnet_child).expect("verify");
+        let result = verifier
+            .verify_and_store(1, &mainnet_child)
+            .expect("verify");
         assert!(result.verified);
 
         let sepolia_child = test_header(5_000_001, sepolia_cp_id.0);
-        let result = verifier.verify_and_store(11155111, &sepolia_child).expect("verify");
+        let result = verifier
+            .verify_and_store(11155111, &sepolia_child)
+            .expect("verify");
         assert!(result.verified);
 
         // Query best tips
         let mainnet_tip = verifier.get_best_tip(1).expect("tip").expect("present");
         assert_eq!(mainnet_tip.number, 18_000_001);
 
-        let sepolia_tip = verifier.get_best_tip(11155111).expect("tip").expect("present");
+        let sepolia_tip = verifier
+            .get_best_tip(11155111)
+            .expect("tip")
+            .expect("present");
         assert_eq!(sepolia_tip.number, 5_000_001);
     }
 }

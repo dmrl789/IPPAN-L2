@@ -217,14 +217,19 @@ impl EthHeaderApi {
     ) -> Result<HeaderVerifyResult, EthHeaderApiError> {
         // If RLP provided, use that
         if let Some(rlp_hex) = &input.rlp {
-            let rlp_bytes = hex::decode(rlp_hex.strip_prefix("0x").unwrap_or(rlp_hex))
-                .map_err(|e| EthHeaderApiError::InvalidRequest(format!("invalid RLP hex: {}", e)))?;
+            let rlp_bytes =
+                hex::decode(rlp_hex.strip_prefix("0x").unwrap_or(rlp_hex)).map_err(|e| {
+                    EthHeaderApiError::InvalidRequest(format!("invalid RLP hex: {}", e))
+                })?;
 
             let expected_hash = if let Some(h) = &input.expected_hash {
-                let hash_bytes = hex::decode(h.strip_prefix("0x").unwrap_or(h))
-                    .map_err(|e| EthHeaderApiError::InvalidRequest(format!("invalid hash hex: {}", e)))?;
+                let hash_bytes = hex::decode(h.strip_prefix("0x").unwrap_or(h)).map_err(|e| {
+                    EthHeaderApiError::InvalidRequest(format!("invalid hash hex: {}", e))
+                })?;
                 if hash_bytes.len() != 32 {
-                    return Err(EthHeaderApiError::InvalidRequest("hash must be 32 bytes".into()));
+                    return Err(EthHeaderApiError::InvalidRequest(
+                        "hash must be 32 bytes".into(),
+                    ));
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&hash_bytes);
@@ -233,11 +238,9 @@ impl EthHeaderApi {
                 None
             };
 
-            let result = self.verifier.verify_from_rlp(
-                &self.storage,
-                &rlp_bytes,
-                expected_hash.as_ref(),
-            )?;
+            let result =
+                self.verifier
+                    .verify_from_rlp(&self.storage, &rlp_bytes, expected_hash.as_ref())?;
 
             return Ok(result);
         }
@@ -273,7 +276,9 @@ impl EthHeaderApi {
             .map_err(|e| EthHeaderApiError::InvalidRequest(format!("invalid hash hex: {}", e)))?;
 
         if hash_bytes.len() != 32 {
-            return Err(EthHeaderApiError::InvalidRequest("hash must be 32 bytes".into()));
+            return Err(EthHeaderApiError::InvalidRequest(
+                "hash must be 32 bytes".into(),
+            ));
         }
 
         let mut hash = [0u8; 32];
@@ -291,12 +296,19 @@ impl EthHeaderApi {
     /// Get confirmations for a block.
     ///
     /// GET /bridge/eth/confirmations/:block_hash
-    pub fn get_confirmations(&self, block_hash_hex: &str) -> Result<ConfirmationsResponse, EthHeaderApiError> {
+    pub fn get_confirmations(
+        &self,
+        block_hash_hex: &str,
+    ) -> Result<ConfirmationsResponse, EthHeaderApiError> {
         let hash_bytes = hex::decode(block_hash_hex.strip_prefix("0x").unwrap_or(block_hash_hex))
-            .map_err(|e| EthHeaderApiError::InvalidRequest(format!("invalid hash hex: {}", e)))?;
+            .map_err(|e| {
+            EthHeaderApiError::InvalidRequest(format!("invalid hash hex: {}", e))
+        })?;
 
         if hash_bytes.len() != 32 {
-            return Err(EthHeaderApiError::InvalidRequest("hash must be 32 bytes".into()));
+            return Err(EthHeaderApiError::InvalidRequest(
+                "hash must be 32 bytes".into(),
+            ));
         }
 
         let mut hash = [0u8; 32];
@@ -306,20 +318,28 @@ impl EthHeaderApi {
 
         // Check if header exists and is verified
         let stored = self.storage.get_header(&id)?;
-        let is_verified = stored.as_ref().map(|s| s.state.is_verified()).unwrap_or(false);
+        let is_verified = stored
+            .as_ref()
+            .map(|s| s.state.is_verified())
+            .unwrap_or(false);
 
         // Get confirmations
         let confirmations = self.storage.confirmations(&hash)?;
 
         // Get min confirmations requirement
-        let min_confirmations = self.verifier.config().min_confirmations(self.config.chain_id);
+        let min_confirmations = self
+            .verifier
+            .config()
+            .min_confirmations(self.config.chain_id);
 
         Ok(ConfirmationsResponse {
             block_hash: block_hash_hex.to_string(),
             confirmations,
             is_verified,
             min_required: min_confirmations,
-            meets_threshold: confirmations.map(|c| c >= min_confirmations).unwrap_or(false),
+            meets_threshold: confirmations
+                .map(|c| c >= min_confirmations)
+                .unwrap_or(false),
         })
     }
 
@@ -349,15 +369,22 @@ impl EthHeaderApi {
     ///
     /// This is used by other components to verify blocks before accepting proofs.
     pub fn check_confirmations(&self, block_hash: &Hash256) -> Result<u64, EthHeaderApiError> {
-        let confirmations = self.verifier.check_confirmations(&self.storage, block_hash)?;
+        let confirmations = self
+            .verifier
+            .check_confirmations(&self.storage, block_hash)?;
         Ok(confirmations)
     }
 
     /// Get the receipts root for a verified block.
     ///
     /// This is used to anchor Merkle receipt proofs to verified headers.
-    pub fn get_verified_receipts_root(&self, block_hash: &Hash256) -> Result<Hash256, EthHeaderApiError> {
-        let receipts_root = self.verifier.get_verified_receipts_root(&self.storage, block_hash)?;
+    pub fn get_verified_receipts_root(
+        &self,
+        block_hash: &Hash256,
+    ) -> Result<Hash256, EthHeaderApiError> {
+        let receipts_root = self
+            .verifier
+            .get_verified_receipts_root(&self.storage, block_hash)?;
         Ok(receipts_root)
     }
 }
@@ -574,9 +601,11 @@ mod tests {
         let db = test_db();
         let storage = Arc::new(EthHeaderStorage::new(&db, 1).expect("storage"));
 
-        let mut verifier_config = crate::eth_headers_verify::HeaderVerifierConfig::default();
-        verifier_config.allow_uncheckpointed = true;
-        verifier_config.min_confirmations_mainnet = 3;
+        let verifier_config = crate::eth_headers_verify::HeaderVerifierConfig {
+            allow_uncheckpointed: true,
+            min_confirmations_mainnet: 3,
+            ..Default::default()
+        };
         let verifier = Arc::new(HeaderVerifier::new(verifier_config));
 
         let api_config = EthHeaderApiConfig {
@@ -611,7 +640,10 @@ mod tests {
 
         // First add a checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = api.storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = api
+            .storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Submit child header
         let request = SubmitHeadersRequest {
@@ -635,7 +667,10 @@ mod tests {
 
         // First add a checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = api.storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = api
+            .storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Create child and encode to RLP
         let child = test_header(101, cp_id.0);
@@ -665,7 +700,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        api.storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        api.storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Now we have a tip
         let tip = api.get_best_tip().expect("get").expect("tip");
@@ -677,7 +714,10 @@ mod tests {
         let (api, _db) = create_test_api(true);
 
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = api.storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = api
+            .storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let hash_hex = hex::encode(cp_id.0);
         let response = api.get_header(&hash_hex).expect("get");
@@ -693,7 +733,10 @@ mod tests {
 
         // Add chain: checkpoint -> h1 -> h2
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = api.storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = api
+            .storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let h1 = test_header(101, cp_id.0);
         api.storage.put_header(&h1, 1_700_000_001_000).expect("put");
@@ -724,7 +767,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        api.storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        api.storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let stats = api.get_stats().expect("stats");
         assert_eq!(stats.total_headers, 1);

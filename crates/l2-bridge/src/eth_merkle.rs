@@ -746,7 +746,8 @@ mod header_aware {
         let confirmations = verifier.check_confirmations(storage, &proof.block_hash)?;
 
         // Step 2: Get the stored header's receipts root
-        let stored_receipts_root = verifier.get_verified_receipts_root(storage, &proof.block_hash)?;
+        let stored_receipts_root =
+            verifier.get_verified_receipts_root(storage, &proof.block_hash)?;
 
         // Step 3: Verify the proof's header RLP produces the expected block hash
         // (This is already done in the basic verify function, but we do it explicitly here
@@ -754,10 +755,12 @@ mod header_aware {
         use alloy_primitives::keccak256;
         let computed_hash = keccak256(&proof.header_rlp);
         if computed_hash.as_slice() != proof.block_hash {
-            return Err(HeaderAwareMerkleError::Merkle(EthMerkleVerifyError::BlockHashMismatch {
-                expected: hex::encode(proof.block_hash),
-                got: hex::encode(computed_hash),
-            }));
+            return Err(HeaderAwareMerkleError::Merkle(
+                EthMerkleVerifyError::BlockHashMismatch {
+                    expected: hex::encode(proof.block_hash),
+                    got: hex::encode(computed_hash),
+                },
+            ));
         }
 
         // Step 4: Extract receipts_root from the proof's header and compare with stored
@@ -804,7 +807,9 @@ mod header_aware {
                     Ok(Some(confs)) => {
                         let min_required = verifier.config().min_confirmations(storage.chain_id());
                         if confs >= min_required {
-                            ProofReadiness::Ready { confirmations: confs }
+                            ProofReadiness::Ready {
+                                confirmations: confs,
+                            }
                         } else {
                             ProofReadiness::InsufficientConfirmations {
                                 got: confs,

@@ -235,8 +235,8 @@ impl HeaderId {
     /// Parse from hex string.
     pub fn from_hex(s: &str) -> Result<Self, EthHeaderError> {
         let s = s.strip_prefix("0x").unwrap_or(s);
-        let bytes = hex::decode(s)
-            .map_err(|e| EthHeaderError::RlpDecode(format!("invalid hex: {}", e)))?;
+        let bytes =
+            hex::decode(s).map_err(|e| EthHeaderError::RlpDecode(format!("invalid hex: {}", e)))?;
         if bytes.len() != 32 {
             return Err(EthHeaderError::RlpDecode(format!(
                 "expected 32 bytes, got {}",

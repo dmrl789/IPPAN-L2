@@ -99,9 +99,9 @@ pub use eth_headers_verify::{
 
 #[cfg(feature = "eth-headers")]
 pub use eth_headers_api::{
-    BestTipResponse, ConfirmationsResponse, EthHeaderApi, EthHeaderApiConfig,
-    EthHeaderApiError, HeaderInput, HeaderResponse, HeaderStatsResponse,
-    HeaderSubmitResult, SubmitHeadersRequest, SubmitHeadersResponse,
+    BestTipResponse, ConfirmationsResponse, EthHeaderApi, EthHeaderApiConfig, EthHeaderApiError,
+    HeaderInput, HeaderResponse, HeaderStatsResponse, HeaderSubmitResult, SubmitHeadersRequest,
+    SubmitHeadersResponse,
 };
 
 use std::sync::Arc;

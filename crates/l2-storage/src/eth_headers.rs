@@ -22,7 +22,7 @@
 //! 1. Highest block number wins
 //! 2. Tie-break by lexicographically smaller hash (deterministic)
 
-use l2_core::eth_header::{EthereumHeaderV1, HeaderId, Hash256};
+use l2_core::eth_header::{EthereumHeaderV1, Hash256, HeaderId};
 use sled::Tree;
 use std::cmp::Ordering;
 use thiserror::Error;
@@ -357,7 +357,10 @@ impl EthHeaderStorage {
     }
 
     /// Get a header by hash (hex string key).
-    fn get_header_internal(&self, key: &str) -> Result<Option<StoredHeader>, EthHeaderStorageError> {
+    fn get_header_internal(
+        &self,
+        key: &str,
+    ) -> Result<Option<StoredHeader>, EthHeaderStorageError> {
         match self.headers.get(key.as_bytes())? {
             Some(bytes) => {
                 let stored: StoredHeader = json_decode(&bytes)?;
@@ -407,7 +410,10 @@ impl EthHeaderStorage {
     ///
     /// Returns `None` if the block is not on the best verified chain.
     /// Returns `Some(1)` for the tip itself.
-    pub fn confirmations(&self, block_hash: &Hash256) -> Result<Option<u64>, EthHeaderStorageError> {
+    pub fn confirmations(
+        &self,
+        block_hash: &Hash256,
+    ) -> Result<Option<u64>, EthHeaderStorageError> {
         // Get the header
         let id = HeaderId(*block_hash);
         let stored = match self.get_header(&id)? {
@@ -615,7 +621,11 @@ impl EthHeaderStorage {
                             .unwrap_or_default()
                             .as_millis();
                         let now_ms = u64::try_from(now_ms).unwrap_or(u64::MAX);
-                        self.maybe_update_best_tip(&stored.header_hash, stored.header.number, now_ms)?;
+                        self.maybe_update_best_tip(
+                            &stored.header_hash,
+                            stored.header.number,
+                            now_ms,
+                        )?;
 
                         break;
                     }
@@ -793,7 +803,9 @@ mod tests {
         let storage = EthHeaderStorage::new(&db, 1).expect("create");
 
         let header = test_header(18_000_000, [0x11; 32]);
-        let id = storage.add_checkpoint(&header, 1_700_000_000_000).expect("add");
+        let id = storage
+            .add_checkpoint(&header, 1_700_000_000_000)
+            .expect("add");
 
         // Verify it's stored
         let stored = storage.get_header(&id).expect("get").expect("present");
@@ -826,7 +838,10 @@ mod tests {
 
         // Verify child is verified (inherits from checkpoint)
         let child_id = HeaderId(child.header_hash());
-        let stored = storage.get_header(&child_id).expect("get").expect("present");
+        let stored = storage
+            .get_header(&child_id)
+            .expect("get")
+            .expect("present");
         assert_eq!(stored.state, HeaderVerificationState::Verified);
 
         // Verify best tip is updated
@@ -859,7 +874,9 @@ mod tests {
         let storage = EthHeaderStorage::new(&db, 1).expect("create");
 
         let header = test_header(18_000_000, [0x11; 32]);
-        storage.add_checkpoint(&header, 1_700_000_000_000).expect("add");
+        storage
+            .add_checkpoint(&header, 1_700_000_000_000)
+            .expect("add");
 
         // Try to add again
         let was_new = storage.put_header(&header, 1_700_000_001_000).expect("put");
@@ -873,7 +890,9 @@ mod tests {
 
         // Add chain: checkpoint -> h1 -> h2 -> h3 (tip)
         let checkpoint = test_header(100, [0x00; 32]);
-        let checkpoint_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let checkpoint_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let h1 = test_header(101, checkpoint_id.0);
         storage.put_header(&h1, 1_700_000_001_000).expect("put h1");
@@ -891,7 +910,10 @@ mod tests {
         assert_eq!(storage.confirmations(&h3_hash).expect("conf"), Some(1)); // tip
         assert_eq!(storage.confirmations(&h2_hash).expect("conf"), Some(2));
         assert_eq!(storage.confirmations(&h1_hash).expect("conf"), Some(3));
-        assert_eq!(storage.confirmations(&checkpoint_id.0).expect("conf"), Some(4));
+        assert_eq!(
+            storage.confirmations(&checkpoint_id.0).expect("conf"),
+            Some(4)
+        );
     }
 
     #[test]
@@ -925,13 +947,19 @@ mod tests {
         let h3_hash = h3.header_hash();
 
         // h1 is ancestor of h3
-        assert!(storage.is_ancestor_of(&h1_id.0, &h3_hash, 100).expect("check"));
+        assert!(storage
+            .is_ancestor_of(&h1_id.0, &h3_hash, 100)
+            .expect("check"));
 
         // h3 is NOT ancestor of h1
-        assert!(!storage.is_ancestor_of(&h3_hash, &h1_id.0, 100).expect("check"));
+        assert!(!storage
+            .is_ancestor_of(&h3_hash, &h1_id.0, 100)
+            .expect("check"));
 
         // Same block is ancestor of itself
-        assert!(storage.is_ancestor_of(&h2_hash, &h2_hash, 100).expect("check"));
+        assert!(storage
+            .is_ancestor_of(&h2_hash, &h2_hash, 100)
+            .expect("check"));
     }
 
     #[test]
@@ -941,7 +969,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Add two forks from checkpoint
         let fork_a = test_header(101, cp_id.0);
@@ -951,14 +981,20 @@ mod tests {
         let mut fork_b = fork_b;
         fork_b.extra_data = vec![0x01];
 
-        storage.put_header(&fork_a, 1_700_000_001_000).expect("put a");
+        storage
+            .put_header(&fork_a, 1_700_000_001_000)
+            .expect("put a");
         let fork_a_hash = fork_a.header_hash();
 
-        storage.put_header(&fork_b, 1_700_000_001_000).expect("put b");
+        storage
+            .put_header(&fork_b, 1_700_000_001_000)
+            .expect("put b");
 
         // Extend fork_a to height 102
         let fork_a_child = test_header(102, fork_a_hash);
-        storage.put_header(&fork_a_child, 1_700_000_002_000).expect("put a_child");
+        storage
+            .put_header(&fork_a_child, 1_700_000_002_000)
+            .expect("put a_child");
 
         // Best tip should be fork_a_child (higher number)
         let tip = storage.get_best_tip().expect("tip").expect("present");
@@ -972,17 +1008,23 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Add two forks at same height with different hashes
         let fork_a = test_header(101, cp_id.0);
         let mut fork_b = test_header(101, cp_id.0);
         fork_b.extra_data = vec![0x01]; // Different hash
 
-        storage.put_header(&fork_a, 1_700_000_001_000).expect("put a");
+        storage
+            .put_header(&fork_a, 1_700_000_001_000)
+            .expect("put a");
         let fork_a_hash = fork_a.header_hash();
 
-        storage.put_header(&fork_b, 1_700_000_001_000).expect("put b");
+        storage
+            .put_header(&fork_b, 1_700_000_001_000)
+            .expect("put b");
         let fork_b_hash = fork_b.header_hash();
 
         // Best tip should be the one with smaller hash
@@ -1002,7 +1044,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Add two blocks at height 101
         let h1 = test_header(101, cp_id.0);
@@ -1032,7 +1076,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Add verified child
         let h1 = test_header(101, cp_id.0);
@@ -1055,7 +1101,9 @@ mod tests {
         let storage = EthHeaderStorage::new(&db, 1).expect("create");
 
         let header = test_header(100, [0x00; 32]);
-        let id = storage.add_checkpoint(&header, 1_700_000_000_000).expect("add");
+        let id = storage
+            .add_checkpoint(&header, 1_700_000_000_000)
+            .expect("add");
 
         assert!(storage.header_exists(&id).expect("exists"));
 
@@ -1076,7 +1124,9 @@ mod tests {
 
         // Add checkpoint at 100
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Try to add header claiming to be at 102 but with parent at 100
         let bad_header = test_header(102, cp_id.0); // Should be 101
@@ -1095,7 +1145,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Try to add header with earlier timestamp
         let mut bad_header = test_header(101, cp_id.0);
@@ -1117,7 +1169,9 @@ mod tests {
 
         // Build initial chain: checkpoint -> A1 -> A2
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let a1 = test_header(101, cp_id.0);
         let a1_hash = a1.header_hash();
@@ -1167,7 +1221,9 @@ mod tests {
 
         // Build chain: checkpoint -> H1 -> H2 -> H3
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let h1 = test_header(101, cp_id.0);
         let h1_hash = h1.header_hash();
@@ -1187,21 +1243,29 @@ mod tests {
         let mut fork_h1 = test_header(101, cp_id.0);
         fork_h1.extra_data = vec![0xF0];
         let fork_h1_hash = fork_h1.header_hash();
-        storage.put_header(&fork_h1, 1_700_000_004_000).expect("put");
+        storage
+            .put_header(&fork_h1, 1_700_000_004_000)
+            .expect("put");
 
         let mut fork_h2 = test_header(102, fork_h1_hash);
         fork_h2.extra_data = vec![0xF0];
         let fork_h2_hash = fork_h2.header_hash();
-        storage.put_header(&fork_h2, 1_700_000_005_000).expect("put");
+        storage
+            .put_header(&fork_h2, 1_700_000_005_000)
+            .expect("put");
 
         let mut fork_h3 = test_header(103, fork_h2_hash);
         fork_h3.extra_data = vec![0xF0];
         let fork_h3_hash = fork_h3.header_hash();
-        storage.put_header(&fork_h3, 1_700_000_006_000).expect("put");
+        storage
+            .put_header(&fork_h3, 1_700_000_006_000)
+            .expect("put");
 
         let mut fork_h4 = test_header(104, fork_h3_hash);
         fork_h4.extra_data = vec![0xF0];
-        storage.put_header(&fork_h4, 1_700_000_007_000).expect("put");
+        storage
+            .put_header(&fork_h4, 1_700_000_007_000)
+            .expect("put");
 
         // Now fork is longer (104 vs 103)
         let tip = storage.get_best_tip().expect("tip").expect("present");
@@ -1222,7 +1286,9 @@ mod tests {
 
         // Checkpoint at 100
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Create 3 forks from checkpoint
         let mut fork_a = test_header(101, cp_id.0);
@@ -1241,9 +1307,18 @@ mod tests {
         storage.put_header(&fork_c, 1_700_000_003_000).expect("put");
 
         // All forks are verified (descend from checkpoint)
-        let stored_a = storage.get_header(&HeaderId(fork_a_hash)).expect("get").expect("a");
-        let stored_b = storage.get_header(&HeaderId(fork_b_hash)).expect("get").expect("b");
-        let stored_c = storage.get_header(&HeaderId(fork_c_hash)).expect("get").expect("c");
+        let stored_a = storage
+            .get_header(&HeaderId(fork_a_hash))
+            .expect("get")
+            .expect("a");
+        let stored_b = storage
+            .get_header(&HeaderId(fork_b_hash))
+            .expect("get")
+            .expect("b");
+        let stored_c = storage
+            .get_header(&HeaderId(fork_c_hash))
+            .expect("get")
+            .expect("c");
 
         assert!(stored_a.state.is_verified());
         assert!(stored_b.state.is_verified());
@@ -1267,20 +1342,32 @@ mod tests {
 
         // Add checkpoint at 100
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         // Add orphan chain starting from unknown parent
         let orphan1 = test_header(200, [0xFF; 32]); // Unknown parent
         let orphan1_hash = orphan1.header_hash();
-        storage.put_header(&orphan1, 1_700_000_001_000).expect("put");
+        storage
+            .put_header(&orphan1, 1_700_000_001_000)
+            .expect("put");
 
         let orphan2 = test_header(201, orphan1_hash);
         let orphan2_hash = orphan2.header_hash();
-        storage.put_header(&orphan2, 1_700_000_002_000).expect("put");
+        storage
+            .put_header(&orphan2, 1_700_000_002_000)
+            .expect("put");
 
         // Orphans should be Unverified
-        let stored_orphan1 = storage.get_header(&HeaderId(orphan1_hash)).expect("get").expect("o1");
-        let stored_orphan2 = storage.get_header(&HeaderId(orphan2_hash)).expect("get").expect("o2");
+        let stored_orphan1 = storage
+            .get_header(&HeaderId(orphan1_hash))
+            .expect("get")
+            .expect("o1");
+        let stored_orphan2 = storage
+            .get_header(&HeaderId(orphan2_hash))
+            .expect("get")
+            .expect("o2");
 
         assert!(!stored_orphan1.state.is_verified());
         assert!(!stored_orphan2.state.is_verified());
@@ -1306,7 +1393,9 @@ mod tests {
 
         // Add checkpoint
         let checkpoint = test_header(100, [0x00; 32]);
-        let cp_id = storage.add_checkpoint(&checkpoint, 1_700_000_000_000).expect("add");
+        let cp_id = storage
+            .add_checkpoint(&checkpoint, 1_700_000_000_000)
+            .expect("add");
 
         let counts = storage.count_headers().expect("count");
         assert_eq!(counts.total(), 1);

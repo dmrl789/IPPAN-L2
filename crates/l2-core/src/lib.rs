@@ -36,6 +36,11 @@ pub use canonical::{
     canonical_decode, canonical_encode, canonical_hash, canonical_hash_bytes, Batch,
     CanonicalError, ChainId, Hash32, Receipt, Tx,
 };
+#[cfg(feature = "keccak-headers")]
+pub use eth_header::{header_hash_from_rlp, header_id_from_rlp};
+pub use eth_header::{
+    Address, EthHeaderError, EthereumHeaderV1, Hash256, HeaderId, MAX_EXTRA_DATA_SIZE,
+};
 pub use external_proof::{
     AttestationData, EthReceiptAttestationV1, EthReceiptMerkleProofV1, ExternalChainId,
     ExternalEventProofV1, ExternalProofId, ExternalProofState, ExternalProofValidationError,
@@ -51,12 +56,6 @@ pub use organiser::{
     NoopOrganiser, Organiser, OrganiserDecision, OrganiserInputs, OrganiserPolicyBounds,
     OrganiserStatus, OrganiserVersion,
 };
-pub use eth_header::{
-    EthereumHeaderV1, EthHeaderError, HeaderId, Hash256, Address,
-    MAX_EXTRA_DATA_SIZE,
-};
-#[cfg(feature = "keccak-headers")]
-pub use eth_header::{header_hash_from_rlp, header_id_from_rlp};
 
 #[cfg(feature = "signed-envelopes")]
 pub mod signing;
