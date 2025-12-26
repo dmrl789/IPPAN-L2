@@ -226,7 +226,7 @@ mod implementation {
                 ));
             }
 
-            let logs_end = buf.len() - (buf.len() - logs_header.payload_length);
+            let logs_end = buf.len() - logs_header.payload_length;
             let mut logs = Vec::new();
 
             while buf.len() > logs_end {
