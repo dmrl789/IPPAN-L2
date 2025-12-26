@@ -2513,9 +2513,11 @@ dependencies = [
 name = "l2-storage"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "hex",
  "l2-core",
  "serde",
+ "serde_json",
  "sled",
  "tempfile",
  "thiserror 1.0.69",
