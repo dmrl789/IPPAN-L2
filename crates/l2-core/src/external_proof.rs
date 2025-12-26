@@ -132,6 +132,15 @@ impl ExternalChainId {
                 | ExternalChainId::EthereumHolesky
         )
     }
+
+    /// Check if this is a mainnet chain (vs testnet).
+    ///
+    /// Returns true for Ethereum Mainnet and any Other chain with chain_id 1.
+    /// Used to determine confirmation thresholds.
+    pub fn is_mainnet(&self) -> bool {
+        matches!(self, ExternalChainId::EthereumMainnet)
+            || matches!(self, ExternalChainId::Other { chain_id, .. } if *chain_id == 1)
+    }
 }
 
 impl fmt::Display for ExternalChainId {
