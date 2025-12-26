@@ -24,11 +24,19 @@
 //! - In-flight batches are rediscovered from storage
 //! - L1 state is authoritative for inclusion/finality
 //! - No duplicate submissions are possible (idempotency keys)
+//!
+//! ## Multi-Hub Support
+//!
+//! For multi-hub mode, the reconciler tracks per-hub settlement state:
+//! - Per-hub in-flight counts
+//! - Per-hub last finalised batch
+//! - Per-hub fee totals (M2M hub only)
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use l2_core::Hash32;
+use l2_core::{Hash32, L2HubId, ALL_HUBS};
 use l2_storage::m2m::M2mStorage;
 use l2_storage::{SettlementState, SettlementStateCounts, Storage};
 use tokio::sync::watch;
@@ -609,6 +617,452 @@ pub fn get_in_flight_summary_with_fees(
     summary
 }
 
+// ============== Multi-Hub Reconciler ==============
+
+/// Configuration for multi-hub settlement reconciler.
+#[derive(Debug, Clone)]
+pub struct MultiHubReconcilerConfig {
+    /// Interval between reconciliation cycles (ms).
+    pub interval_ms: u64,
+    /// Maximum batches to reconcile per cycle per hub.
+    pub batch_limit: usize,
+    /// Timeout for considering a submitted batch as stale (ms).
+    pub stale_threshold_ms: u64,
+    /// Maximum retries before marking as failed.
+    pub max_retries: u32,
+    /// Number of confirmations required for finality.
+    pub finality_confirmations: u64,
+    /// Chain ID.
+    pub chain_id: u64,
+}
+
+impl Default for MultiHubReconcilerConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: 10_000, // 10 seconds
+            batch_limit: 100,
+            stale_threshold_ms: 300_000, // 5 minutes
+            max_retries: 3,
+            finality_confirmations: 6, // 6 blocks for finality
+            chain_id: 1,
+        }
+    }
+}
+
+impl MultiHubReconcilerConfig {
+    /// Create configuration from environment variables.
+    pub fn from_env() -> Self {
+        let interval_ms = std::env::var("L2_RECONCILE_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        let batch_limit = std::env::var("L2_RECONCILE_BATCH_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let stale_threshold_ms = std::env::var("L2_RECONCILE_STALE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300_000);
+        let max_retries = std::env::var("L2_RECONCILE_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let finality_confirmations = std::env::var("L2_FINALITY_CONFIRMATIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let chain_id = std::env::var("L2_CHAIN_ID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+
+        Self {
+            interval_ms,
+            batch_limit,
+            stale_threshold_ms,
+            max_retries,
+            finality_confirmations,
+            chain_id,
+        }
+    }
+
+    /// Convert to single-hub config for a specific hub.
+    pub fn to_single_hub_config(&self, hub: L2HubId) -> SettlementReconcilerConfig {
+        SettlementReconcilerConfig {
+            interval_ms: self.interval_ms,
+            batch_limit: self.batch_limit,
+            stale_threshold_ms: self.stale_threshold_ms,
+            max_retries: self.max_retries,
+            finality_confirmations: self.finality_confirmations,
+            hub: hub.as_str().to_string(),
+            chain_id: self.chain_id,
+        }
+    }
+}
+
+/// Per-hub settlement summary for observability.
+#[derive(Debug, Clone)]
+pub struct HubSettlementSummary {
+    /// Hub identifier.
+    pub hub: L2HubId,
+    /// Number of batches awaiting inclusion.
+    pub submitted_count: u32,
+    /// Number of batches awaiting finality.
+    pub included_count: u32,
+    /// In-flight batch count total.
+    pub in_flight_count: u32,
+    /// Last submitted batch hash.
+    pub last_submitted_hash: Option<Hash32>,
+    /// Last included batch hash.
+    pub last_included_hash: Option<Hash32>,
+    /// Last finalised batch hash.
+    pub last_finalised_hash: Option<Hash32>,
+    /// Last finalised timestamp (ms).
+    pub last_finalised_at_ms: Option<u64>,
+    /// Total fees finalised (M2M hub only, scaled).
+    pub total_fees_finalised_scaled: u64,
+}
+
+impl Default for HubSettlementSummary {
+    fn default() -> Self {
+        Self::new(L2HubId::Fin)
+    }
+}
+
+impl HubSettlementSummary {
+    /// Create a new hub settlement summary.
+    pub fn new(hub: L2HubId) -> Self {
+        Self {
+            hub,
+            submitted_count: 0,
+            included_count: 0,
+            in_flight_count: 0,
+            last_submitted_hash: None,
+            last_included_hash: None,
+            last_finalised_hash: None,
+            last_finalised_at_ms: None,
+            total_fees_finalised_scaled: 0,
+        }
+    }
+}
+
+/// Multi-hub settlement summary.
+#[derive(Debug, Clone, Default)]
+pub struct MultiHubSettlementSummary {
+    /// Per-hub summaries (BTreeMap for deterministic ordering).
+    pub per_hub: BTreeMap<L2HubId, HubSettlementSummary>,
+    /// Global submitted count.
+    pub total_submitted: u32,
+    /// Global included count.
+    pub total_included: u32,
+    /// Global in-flight count.
+    pub total_in_flight: u32,
+    /// Global finalised count (since startup).
+    pub total_finalised: u64,
+}
+
+impl MultiHubSettlementSummary {
+    /// Create a new multi-hub settlement summary.
+    pub fn new() -> Self {
+        let mut per_hub = BTreeMap::new();
+        for hub in ALL_HUBS {
+            per_hub.insert(hub, HubSettlementSummary::new(hub));
+        }
+        Self {
+            per_hub,
+            ..Default::default()
+        }
+    }
+
+    /// Get summary for a specific hub.
+    pub fn hub(&self, hub: L2HubId) -> Option<&HubSettlementSummary> {
+        self.per_hub.get(&hub)
+    }
+
+    /// Update summary for a specific hub.
+    pub fn update_hub(&mut self, summary: HubSettlementSummary) {
+        self.per_hub.insert(summary.hub, summary);
+        self.recompute_totals();
+    }
+
+    /// Recompute global totals from per-hub data.
+    fn recompute_totals(&mut self) {
+        self.total_submitted = 0;
+        self.total_included = 0;
+        self.total_in_flight = 0;
+
+        for summary in self.per_hub.values() {
+            self.total_submitted = self.total_submitted.saturating_add(summary.submitted_count);
+            self.total_included = self.total_included.saturating_add(summary.included_count);
+            self.total_in_flight = self.total_in_flight.saturating_add(summary.in_flight_count);
+        }
+    }
+}
+
+/// Result of a single multi-hub reconciliation cycle.
+#[derive(Debug, Clone, Default)]
+pub struct MultiHubReconcileCycleResult {
+    /// Per-hub results (BTreeMap for deterministic ordering).
+    pub per_hub: BTreeMap<L2HubId, ReconcileCycleResult>,
+    /// Global totals.
+    pub total_included: u32,
+    pub total_finalised: u32,
+    pub total_failed: u32,
+    pub total_in_flight: u32,
+}
+
+impl MultiHubReconcileCycleResult {
+    /// Create a new result.
+    pub fn new() -> Self {
+        let mut per_hub = BTreeMap::new();
+        for hub in ALL_HUBS {
+            per_hub.insert(hub, ReconcileCycleResult::default());
+        }
+        Self {
+            per_hub,
+            ..Default::default()
+        }
+    }
+
+    /// Update result for a specific hub.
+    pub fn set_hub_result(&mut self, hub: L2HubId, result: ReconcileCycleResult) {
+        self.per_hub.insert(hub, result);
+        self.recompute_totals();
+    }
+
+    /// Recompute global totals.
+    fn recompute_totals(&mut self) {
+        self.total_included = 0;
+        self.total_finalised = 0;
+        self.total_failed = 0;
+        self.total_in_flight = 0;
+
+        for result in self.per_hub.values() {
+            self.total_included = self.total_included.saturating_add(result.included);
+            self.total_finalised = self.total_finalised.saturating_add(result.finalised);
+            self.total_failed = self.total_failed.saturating_add(result.failed);
+            self.total_in_flight = self.total_in_flight.saturating_add(result.in_flight);
+        }
+    }
+}
+
+/// Handle for controlling the multi-hub reconciler background task.
+#[derive(Clone)]
+pub struct MultiHubReconcilerHandle {
+    /// Channel to signal shutdown.
+    _cancel: Arc<watch::Sender<bool>>,
+}
+
+/// Spawn the multi-hub settlement reconciler background task.
+///
+/// This reconciler handles settlement for all hubs in deterministic order:
+/// Fin, Data, M2m, World, Bridge
+///
+/// # Arguments
+///
+/// * `config` - Reconciler configuration
+/// * `storage` - Storage for settlement state persistence
+/// * `l1_client` - L1 client for querying inclusion/finality
+///
+/// # Returns
+///
+/// A handle that keeps the reconciler running. Drop to stop.
+pub fn spawn_multi_hub_reconciler<C>(
+    config: MultiHubReconcilerConfig,
+    storage: Arc<Storage>,
+    l1_client: Option<C>,
+) -> MultiHubReconcilerHandle
+where
+    C: crate::async_l1_client::AsyncL1Client + Send + Sync + 'static,
+{
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+
+    tokio::spawn(async move {
+        run_multi_hub_reconciler(config, storage, l1_client, cancel_rx).await;
+    });
+
+    MultiHubReconcilerHandle {
+        _cancel: Arc::new(cancel_tx),
+    }
+}
+
+/// Main multi-hub reconciler loop.
+async fn run_multi_hub_reconciler<C>(
+    config: MultiHubReconcilerConfig,
+    storage: Arc<Storage>,
+    l1_client: Option<C>,
+    mut cancel_rx: watch::Receiver<bool>,
+) where
+    C: crate::async_l1_client::AsyncL1Client + Send + Sync,
+{
+    info!(
+        interval_ms = config.interval_ms,
+        batch_limit = config.batch_limit,
+        finality_confirmations = config.finality_confirmations,
+        "starting multi-hub settlement reconciler"
+    );
+
+    // Run once immediately on startup (crash recovery)
+    if let Err(e) = run_multi_hub_reconcile_cycle(&config, &storage, &l1_client).await {
+        warn!(error = %e, "initial multi-hub reconciliation failed");
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_millis(config.interval_ms));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = run_multi_hub_reconcile_cycle(&config, &storage, &l1_client).await {
+                    warn!(error = %e, "multi-hub reconciliation cycle failed");
+                }
+            }
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    info!("multi-hub settlement reconciler shutting down");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Execute a single multi-hub reconciliation cycle.
+async fn run_multi_hub_reconcile_cycle<C>(
+    config: &MultiHubReconcilerConfig,
+    storage: &Storage,
+    l1_client: &Option<C>,
+) -> Result<MultiHubReconcileCycleResult, crate::BatcherError>
+where
+    C: crate::async_l1_client::AsyncL1Client + Send + Sync,
+{
+    let mut result = MultiHubReconcileCycleResult::new();
+
+    // Process each hub in deterministic order
+    for hub in ALL_HUBS {
+        let hub_config = config.to_single_hub_config(hub);
+        let hub_result = run_reconcile_cycle(&hub_config, storage, l1_client).await?;
+
+        // Update in-flight count for this hub after reconciliation
+        let hub_str = hub.as_str();
+        let chain_id = config.chain_id;
+
+        // Decrease in-flight count for finalised batches
+        for _ in 0..hub_result.finalised {
+            if let Err(e) = storage.dec_hub_in_flight(hub_str, chain_id) {
+                debug!(hub = hub_str, error = %e, "failed to decrement in-flight count");
+            }
+        }
+
+        // Also decrease for failed batches
+        for _ in 0..hub_result.failed {
+            if let Err(e) = storage.dec_hub_in_flight(hub_str, chain_id) {
+                debug!(hub = hub_str, error = %e, "failed to decrement in-flight count for failed batch");
+            }
+        }
+
+        if hub_result.included > 0 || hub_result.finalised > 0 || hub_result.failed > 0 {
+            debug!(
+                hub = hub_str,
+                included = hub_result.included,
+                finalised = hub_result.finalised,
+                failed = hub_result.failed,
+                in_flight = hub_result.in_flight,
+                "hub reconciliation complete"
+            );
+        }
+
+        result.set_hub_result(hub, hub_result);
+    }
+
+    if result.total_included > 0 || result.total_finalised > 0 || result.total_failed > 0 {
+        info!(
+            total_included = result.total_included,
+            total_finalised = result.total_finalised,
+            total_failed = result.total_failed,
+            total_in_flight = result.total_in_flight,
+            "multi-hub reconciliation cycle complete"
+        );
+    }
+
+    Ok(result)
+}
+
+/// Get multi-hub settlement summary.
+pub fn get_multi_hub_settlement_summary(
+    storage: &Storage,
+    chain_id: u64,
+) -> MultiHubSettlementSummary {
+    let mut summary = MultiHubSettlementSummary::new();
+
+    for hub in ALL_HUBS {
+        let hub_str = hub.as_str();
+        let mut hub_summary = HubSettlementSummary::new(hub);
+
+        // Get in-flight count
+        hub_summary.in_flight_count = storage
+            .get_hub_in_flight_count(hub_str, chain_id)
+            .unwrap_or(0);
+
+        // Get last finalised batch
+        if let Ok(Some((hash, at_ms))) = storage.get_last_finalised_batch(hub_str, chain_id) {
+            hub_summary.last_finalised_hash = Some(hash);
+            hub_summary.last_finalised_at_ms = Some(at_ms);
+        }
+
+        // Get total fees for this hub (if applicable)
+        if hub.uses_m2m_fees() {
+            hub_summary.total_fees_finalised_scaled = storage
+                .get_hub_total_fees(hub_str, chain_id)
+                .unwrap_or(0);
+        }
+
+        summary.update_hub(hub_summary);
+    }
+
+    summary
+}
+
+/// Get per-hub in-flight summary.
+pub fn get_per_hub_in_flight_summary(
+    storage: &Storage,
+    chain_id: u64,
+    limit: usize,
+) -> BTreeMap<L2HubId, InFlightSummary> {
+    let mut result = BTreeMap::new();
+
+    // Get global in-flight summary (for now, we don't have per-hub batch lists)
+    let global_summary = get_in_flight_summary(storage, limit);
+
+    // Distribute to each hub with basic info
+    for hub in ALL_HUBS {
+        let hub_str = hub.as_str();
+        let _in_flight_count = storage
+            .get_hub_in_flight_count(hub_str, chain_id)
+            .unwrap_or(0);
+
+        // For now, we create a summary per hub with the in-flight count
+        // A more sophisticated implementation would track batch-hub associations
+        let summary = InFlightSummary {
+            submitted_count: 0, // Would need per-hub batch tracking
+            included_count: 0,  // Would need per-hub batch tracking
+            oldest_submitted_ms: None,
+            oldest_included_ms: None,
+            in_flight_fee_total_scaled: None,
+            last_finalised_batch_fee_total_scaled: None,
+        };
+
+        result.insert(hub, summary);
+    }
+
+    // Add the global counts to the first hub (Fin) for backward compatibility
+    if let Some(fin_summary) = result.get_mut(&L2HubId::Fin) {
+        *fin_summary = global_summary;
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1472,176 @@ mod tests {
         // State should remain Created (poster will handle it)
         let state = storage.get_settlement_state(&hash).unwrap().unwrap();
         assert!(state.is_created());
+    }
+
+    // ========== Multi-Hub Reconciler Tests ==========
+
+    #[test]
+    fn multi_hub_config_defaults() {
+        let config = MultiHubReconcilerConfig::default();
+        assert_eq!(config.interval_ms, 10_000);
+        assert_eq!(config.batch_limit, 100);
+        assert_eq!(config.finality_confirmations, 6);
+        assert_eq!(config.chain_id, 1);
+    }
+
+    #[test]
+    fn multi_hub_config_to_single_hub() {
+        let config = MultiHubReconcilerConfig {
+            interval_ms: 5_000,
+            batch_limit: 50,
+            stale_threshold_ms: 100_000,
+            max_retries: 5,
+            finality_confirmations: 12,
+            chain_id: 42,
+        };
+
+        let single = config.to_single_hub_config(L2HubId::M2m);
+        assert_eq!(single.interval_ms, 5_000);
+        assert_eq!(single.batch_limit, 50);
+        assert_eq!(single.hub, "m2m");
+        assert_eq!(single.chain_id, 42);
+    }
+
+    #[test]
+    fn hub_settlement_summary_creation() {
+        let summary = HubSettlementSummary::new(L2HubId::Data);
+        assert_eq!(summary.hub, L2HubId::Data);
+        assert_eq!(summary.submitted_count, 0);
+        assert_eq!(summary.in_flight_count, 0);
+        assert!(summary.last_finalised_hash.is_none());
+    }
+
+    #[test]
+    fn multi_hub_settlement_summary_creation() {
+        let summary = MultiHubSettlementSummary::new();
+        
+        // Should have all 5 hubs
+        assert_eq!(summary.per_hub.len(), 5);
+        assert!(summary.per_hub.contains_key(&L2HubId::Fin));
+        assert!(summary.per_hub.contains_key(&L2HubId::Data));
+        assert!(summary.per_hub.contains_key(&L2HubId::M2m));
+        assert!(summary.per_hub.contains_key(&L2HubId::World));
+        assert!(summary.per_hub.contains_key(&L2HubId::Bridge));
+        
+        assert_eq!(summary.total_submitted, 0);
+        assert_eq!(summary.total_in_flight, 0);
+    }
+
+    #[test]
+    fn multi_hub_settlement_summary_update() {
+        let mut summary = MultiHubSettlementSummary::new();
+        
+        let mut fin_summary = HubSettlementSummary::new(L2HubId::Fin);
+        fin_summary.submitted_count = 5;
+        fin_summary.in_flight_count = 10;
+        summary.update_hub(fin_summary);
+        
+        let mut m2m_summary = HubSettlementSummary::new(L2HubId::M2m);
+        m2m_summary.submitted_count = 3;
+        m2m_summary.in_flight_count = 7;
+        summary.update_hub(m2m_summary);
+        
+        assert_eq!(summary.total_submitted, 8);
+        assert_eq!(summary.total_in_flight, 17);
+    }
+
+    #[test]
+    fn multi_hub_reconcile_cycle_result_creation() {
+        let result = MultiHubReconcileCycleResult::new();
+        assert_eq!(result.per_hub.len(), 5);
+        assert_eq!(result.total_included, 0);
+        assert_eq!(result.total_finalised, 0);
+    }
+
+    #[test]
+    fn multi_hub_reconcile_cycle_result_update() {
+        let mut result = MultiHubReconcileCycleResult::new();
+        
+        let fin_result = ReconcileCycleResult {
+            included: 2,
+            finalised: 1,
+            failed: 0,
+            in_flight: 3,
+        };
+        result.set_hub_result(L2HubId::Fin, fin_result);
+        
+        let data_result = ReconcileCycleResult {
+            included: 1,
+            finalised: 2,
+            failed: 1,
+            in_flight: 2,
+        };
+        result.set_hub_result(L2HubId::Data, data_result);
+        
+        assert_eq!(result.total_included, 3);
+        assert_eq!(result.total_finalised, 3);
+        assert_eq!(result.total_failed, 1);
+        assert_eq!(result.total_in_flight, 5);
+    }
+
+    #[tokio::test]
+    async fn multi_hub_reconcile_cycle_empty() {
+        let storage = test_storage();
+        let config = MultiHubReconcilerConfig::default();
+        let l1_client: Option<TestL1Client> = None;
+
+        let result = run_multi_hub_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total_included, 0);
+        assert_eq!(result.total_finalised, 0);
+        assert_eq!(result.total_failed, 0);
+        assert_eq!(result.total_in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn multi_hub_reconcile_cycle_with_batch() {
+        let storage = test_storage();
+        let config = MultiHubReconcilerConfig::default();
+        let l1_client: Option<TestL1Client> = None;
+
+        // Add a submitted batch
+        let hash = Hash32([0xAA; 32]);
+        let submitted = SettlementState::submitted("l1tx".to_string(), now_ms(), "key".to_string());
+        storage
+            .set_settlement_state_unchecked(&hash, &submitted)
+            .unwrap();
+
+        // Run multi-hub reconciliation
+        let result = run_multi_hub_reconcile_cycle(&config, &storage, &l1_client)
+            .await
+            .unwrap();
+
+        // In best-effort mode, batch should be included and finalised
+        assert!(result.total_included >= 1 || result.total_finalised >= 1);
+    }
+
+    #[test]
+    fn get_multi_hub_settlement_summary_empty() {
+        let storage = test_storage();
+        let summary = get_multi_hub_settlement_summary(&storage, 1);
+
+        assert_eq!(summary.per_hub.len(), 5);
+        assert_eq!(summary.total_in_flight, 0);
+
+        // Each hub should have an entry
+        for hub in ALL_HUBS {
+            let hub_summary = summary.hub(hub).unwrap();
+            assert_eq!(hub_summary.hub, hub);
+            assert_eq!(hub_summary.in_flight_count, 0);
+        }
+    }
+
+    #[test]
+    fn get_per_hub_in_flight_summary_empty() {
+        let storage = test_storage();
+        let summaries = get_per_hub_in_flight_summary(&storage, 1, 10);
+
+        assert_eq!(summaries.len(), 5);
+        for hub in ALL_HUBS {
+            assert!(summaries.contains_key(&hub));
+        }
     }
 }
