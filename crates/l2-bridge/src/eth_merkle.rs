@@ -316,21 +316,22 @@ mod implementation {
     }
 
     /// RLP-encode a transaction index as the MPT key.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn rlp_encode_tx_index(index: u32) -> Vec<u8> {
         if index == 0 {
             // RLP for 0 is 0x80
             vec![0x80]
         } else if index < 0x80 {
-            // Single byte
+            // Single byte - safe: index < 128 fits in u8
             vec![index as u8]
         } else if index < 0x100 {
-            // 1 byte + length prefix
+            // 1 byte + length prefix - safe: index < 256 fits in u8
             vec![0x81, index as u8]
         } else if index < 0x10000 {
-            // 2 bytes + length prefix
+            // 2 bytes + length prefix - safe: masked to u8 range
             vec![0x82, (index >> 8) as u8, (index & 0xff) as u8]
         } else if index < 0x1000000 {
-            // 3 bytes + length prefix
+            // 3 bytes + length prefix - safe: masked to u8 range
             vec![
                 0x83,
                 (index >> 16) as u8,
@@ -338,7 +339,7 @@ mod implementation {
                 (index & 0xff) as u8,
             ]
         } else {
-            // 4 bytes + length prefix
+            // 4 bytes + length prefix - safe: masked to u8 range
             vec![
                 0x84,
                 (index >> 24) as u8,
