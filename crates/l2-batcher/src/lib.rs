@@ -1120,30 +1120,47 @@ async fn run_loop(
                         let maybe_ledger = m2m.get_ledger_entry_by_hash(&tx_hash.0);
 
                         // Determine if we should finalize and with what parameters
-                        let finalize_params: Option<(String, u64)> = match (&maybe_reservation, &maybe_ledger) {
-                            (Ok(Some(res)), _) => {
-                                // Has reservation - use its params
-                                Some((res.machine_id.clone(), res.breakdown.total_fee.scaled()))
-                            }
-                            (_, Ok(Some(l2_storage::m2m::LedgerEntry::Reserved { machine_id, reserved_scaled, .. }))) => {
-                                // Ledger has reserved entry
-                                Some((machine_id.clone(), *reserved_scaled))
-                            }
-                            (_, Ok(Some(l2_storage::m2m::LedgerEntry::Finalised { charged_scaled, refunded_scaled, .. }))) => {
-                                // Already finalised - idempotent, just add to totals
-                                batch_total_fee_scaled = batch_total_fee_scaled.saturating_add(*charged_scaled);
-                                batch_total_refunds_scaled = batch_total_refunds_scaled.saturating_add(*refunded_scaled);
-                                m2m_tx_count = m2m_tx_count.saturating_add(1);
-                                debug!(
-                                    tx_hash = %tx_hash.to_hex(),
-                                    charged = charged_scaled,
-                                    refunded = refunded_scaled,
-                                    "fee already finalized (idempotent)"
-                                );
-                                continue;
-                            }
-                            _ => None,
-                        };
+                        let finalize_params: Option<(String, u64)> =
+                            match (&maybe_reservation, &maybe_ledger) {
+                                (Ok(Some(res)), _) => {
+                                    // Has reservation - use its params
+                                    Some((res.machine_id.clone(), res.breakdown.total_fee.scaled()))
+                                }
+                                (
+                                    _,
+                                    Ok(Some(l2_storage::m2m::LedgerEntry::Reserved {
+                                        machine_id,
+                                        reserved_scaled,
+                                        ..
+                                    })),
+                                ) => {
+                                    // Ledger has reserved entry
+                                    Some((machine_id.clone(), *reserved_scaled))
+                                }
+                                (
+                                    _,
+                                    Ok(Some(l2_storage::m2m::LedgerEntry::Finalised {
+                                        charged_scaled,
+                                        refunded_scaled,
+                                        ..
+                                    })),
+                                ) => {
+                                    // Already finalised - idempotent, just add to totals
+                                    batch_total_fee_scaled =
+                                        batch_total_fee_scaled.saturating_add(*charged_scaled);
+                                    batch_total_refunds_scaled =
+                                        batch_total_refunds_scaled.saturating_add(*refunded_scaled);
+                                    m2m_tx_count = m2m_tx_count.saturating_add(1);
+                                    debug!(
+                                        tx_hash = %tx_hash.to_hex(),
+                                        charged = charged_scaled,
+                                        refunded = refunded_scaled,
+                                        "fee already finalized (idempotent)"
+                                    );
+                                    continue;
+                                }
+                                _ => None,
+                            };
 
                         if let Some((machine_id, final_fee)) = finalize_params {
                             // Finalize the fee using the idempotent ledger-based method
@@ -1156,10 +1173,14 @@ async fn run_loop(
                             ) {
                                 Ok(result) => {
                                     let (charged, refund) = match &result {
-                                        l2_storage::m2m::FinaliseFeeResult::Finalised { charged_scaled, refunded_scaled } => {
-                                            (*charged_scaled, *refunded_scaled)
-                                        }
-                                        l2_storage::m2m::FinaliseFeeResult::AlreadyFinalised { charged_scaled, refunded_scaled } => {
+                                        l2_storage::m2m::FinaliseFeeResult::Finalised {
+                                            charged_scaled,
+                                            refunded_scaled,
+                                        } => (*charged_scaled, *refunded_scaled),
+                                        l2_storage::m2m::FinaliseFeeResult::AlreadyFinalised {
+                                            charged_scaled,
+                                            refunded_scaled,
+                                        } => {
                                             debug!(
                                                 tx_hash = %tx_hash.to_hex(),
                                                 "finalise_fee returned AlreadyFinalised"
@@ -1171,8 +1192,10 @@ async fn run_loop(
                                     // Only add to totals if this was a new finalization
                                     // to avoid double-counting on crash recovery
                                     if result.is_new() {
-                                        batch_total_fee_scaled = batch_total_fee_scaled.saturating_add(charged);
-                                        batch_total_refunds_scaled = batch_total_refunds_scaled.saturating_add(refund);
+                                        batch_total_fee_scaled =
+                                            batch_total_fee_scaled.saturating_add(charged);
+                                        batch_total_refunds_scaled =
+                                            batch_total_refunds_scaled.saturating_add(refund);
                                         m2m_tx_count = m2m_tx_count.saturating_add(1);
                                     }
 

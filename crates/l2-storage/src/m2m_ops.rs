@@ -135,11 +135,13 @@ impl<'a> M2mOpsApi<'a> {
     }
 
     /// Get batch fees by batch hash (hex string).
-    pub fn get_batch_fees(&self, batch_hash_hex: &str) -> Result<BatchFeesResponse, M2mStorageError> {
-        let batch_hash = hex::decode(batch_hash_hex)
-            .map_err(|e| M2mStorageError::InvalidTxId {
-                reason: format!("invalid hex: {}", e),
-            })?;
+    pub fn get_batch_fees(
+        &self,
+        batch_hash_hex: &str,
+    ) -> Result<BatchFeesResponse, M2mStorageError> {
+        let batch_hash = hex::decode(batch_hash_hex).map_err(|e| M2mStorageError::InvalidTxId {
+            reason: format!("invalid hex: {}", e),
+        })?;
 
         if batch_hash.len() != 32 {
             return Err(M2mStorageError::InvalidTxId {

@@ -10,7 +10,9 @@
 //! 6. Crash-safety: no double-charge or double-refund on restart
 
 use l2_core::fees::{FeeAmount, FeeSchedule, M2mFeeBreakdown};
-use l2_storage::m2m::{ForcedClass, ForcedInclusionLimits, LedgerEntry, M2mStorage, M2mStorageError};
+use l2_storage::m2m::{
+    ForcedClass, ForcedInclusionLimits, LedgerEntry, M2mStorage, M2mStorageError,
+};
 use tempfile::tempdir;
 
 fn test_storage() -> (sled::Db, M2mStorage) {
@@ -35,14 +37,28 @@ fn invariant_total_balance_non_negative() {
     let breakdown = M2mFeeBreakdown::new(100, 50, 1, FeeAmount::from_scaled(50_000));
 
     storage
-        .reserve_fee("machine-a", [0x01; 32], 50_000, breakdown.clone(), false, 2000)
+        .reserve_fee(
+            "machine-a",
+            [0x01; 32],
+            50_000,
+            breakdown.clone(),
+            false,
+            2000,
+        )
         .unwrap();
     storage
         .finalise_fee("machine-a", [0x01; 32], 30_000, 3000)
         .unwrap();
 
     storage
-        .reserve_fee("machine-b", [0x02; 32], 100_000, breakdown.clone(), false, 2000)
+        .reserve_fee(
+            "machine-b",
+            [0x02; 32],
+            100_000,
+            breakdown.clone(),
+            false,
+            2000,
+        )
         .unwrap();
     storage
         .finalise_fee("machine-b", [0x02; 32], 80_000, 3000)
@@ -71,17 +87,37 @@ fn invariant_reserved_cannot_exceed_balance() {
     let breakdown = M2mFeeBreakdown::new(100, 50, 1, FeeAmount::from_scaled(100_000));
 
     // Try to reserve more than balance
-    let result = storage.reserve_fee("device-001", [0x01; 32], 150_000, breakdown.clone(), false, 2000);
-    assert!(matches!(result, Err(M2mStorageError::InsufficientBalance { .. })));
+    let result = storage.reserve_fee(
+        "device-001",
+        [0x01; 32],
+        150_000,
+        breakdown.clone(),
+        false,
+        2000,
+    );
+    assert!(matches!(
+        result,
+        Err(M2mStorageError::InsufficientBalance { .. })
+    ));
 
     // Exactly equal should work
     storage
-        .reserve_fee("device-001", [0x02; 32], 100_000, breakdown.clone(), false, 2000)
+        .reserve_fee(
+            "device-001",
+            [0x02; 32],
+            100_000,
+            breakdown.clone(),
+            false,
+            2000,
+        )
         .unwrap();
 
     // Now trying to reserve more should fail
     let result = storage.reserve_fee("device-001", [0x03; 32], 1, breakdown, false, 2000);
-    assert!(matches!(result, Err(M2mStorageError::InsufficientBalance { .. })));
+    assert!(matches!(
+        result,
+        Err(M2mStorageError::InsufficientBalance { .. })
+    ));
 
     // Verify account state
     let account = storage.get_account("device-001").unwrap().unwrap();
@@ -103,7 +139,14 @@ fn invariant_finalised_entries_immutable() {
 
     // Reserve and finalize
     storage
-        .reserve_fee("device-002", tx_hash, 50_000, breakdown.clone(), false, 2000)
+        .reserve_fee(
+            "device-002",
+            tx_hash,
+            50_000,
+            breakdown.clone(),
+            false,
+            2000,
+        )
         .unwrap();
     storage
         .finalise_fee_with_batch("device-002", tx_hash, 30_000, 3000, "batch1")
@@ -115,7 +158,10 @@ fn invariant_finalised_entries_immutable() {
 
     // Try to reserve again - should fail with LedgerConflict
     let result = storage.reserve_fee("device-002", tx_hash, 50_000, breakdown, false, 4000);
-    assert!(matches!(result, Err(M2mStorageError::LedgerConflict { .. })));
+    assert!(matches!(
+        result,
+        Err(M2mStorageError::LedgerConflict { .. })
+    ));
 
     // Finalize again should be idempotent (not error)
     let result = storage.finalise_fee_with_batch("device-002", tx_hash, 30_000, 5000, "batch2");
@@ -229,10 +275,24 @@ fn invariant_reserve_idempotent() {
 
     // Reserve multiple times with same params
     storage
-        .reserve_fee("device-idem", tx_hash, 50_000, breakdown.clone(), false, 2000)
+        .reserve_fee(
+            "device-idem",
+            tx_hash,
+            50_000,
+            breakdown.clone(),
+            false,
+            2000,
+        )
         .unwrap();
     storage
-        .reserve_fee("device-idem", tx_hash, 50_000, breakdown.clone(), false, 3000)
+        .reserve_fee(
+            "device-idem",
+            tx_hash,
+            50_000,
+            breakdown.clone(),
+            false,
+            3000,
+        )
         .unwrap();
     storage
         .reserve_fee("device-idem", tx_hash, 50_000, breakdown, false, 4000)
@@ -258,9 +318,15 @@ fn invariant_finalise_idempotent() {
         .unwrap();
 
     // Finalize multiple times
-    let r1 = storage.finalise_fee("device-fin", tx_hash, 30_000, 3000).unwrap();
-    let r2 = storage.finalise_fee("device-fin", tx_hash, 30_000, 4000).unwrap();
-    let r3 = storage.finalise_fee("device-fin", tx_hash, 30_000, 5000).unwrap();
+    let r1 = storage
+        .finalise_fee("device-fin", tx_hash, 30_000, 3000)
+        .unwrap();
+    let r2 = storage
+        .finalise_fee("device-fin", tx_hash, 30_000, 4000)
+        .unwrap();
+    let r3 = storage
+        .finalise_fee("device-fin", tx_hash, 30_000, 5000)
+        .unwrap();
 
     // First should have a refund, subsequent should return same value
     assert_eq!(r1, 20_000);
@@ -364,8 +430,12 @@ fn invariant_forced_caps_unbypassable() {
     storage.set_forced_limits("forced-device", limits).unwrap();
 
     // Use up tx limit
-    storage.apply_forced_usage("forced-device", 100, 1000).unwrap();
-    storage.apply_forced_usage("forced-device", 100, 2000).unwrap();
+    storage
+        .apply_forced_usage("forced-device", 100, 1000)
+        .unwrap();
+    storage
+        .apply_forced_usage("forced-device", 100, 2000)
+        .unwrap();
 
     // Third should fail (tx limit)
     let result = storage.apply_forced_usage("forced-device", 100, 3000);
@@ -381,8 +451,10 @@ fn invariant_forced_caps_unbypassable() {
     };
     storage.set_forced_limits("forced-device", limits2).unwrap();
 
-    storage.apply_forced_usage("forced-device", 400, 1000).unwrap();
-    
+    storage
+        .apply_forced_usage("forced-device", 400, 1000)
+        .unwrap();
+
     // Next 200 bytes would exceed 500 limit
     let result = storage.apply_forced_usage("forced-device", 200, 2000);
     assert!(matches!(result, Err(M2mStorageError::QuotaExceeded { .. })));
@@ -412,7 +484,9 @@ fn invariant_stats_consistent() {
     storage
         .reserve_fee("m1", [0x02; 32], 80_000, breakdown.clone(), false, 2000)
         .unwrap();
-    storage.finalise_fee("m1", [0x02; 32], 60_000, 3000).unwrap();
+    storage
+        .finalise_fee("m1", [0x02; 32], 60_000, 3000)
+        .unwrap();
 
     // m2: reserve 200k
     storage

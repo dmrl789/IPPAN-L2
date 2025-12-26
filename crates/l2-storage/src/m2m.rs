@@ -137,8 +137,12 @@ impl FinaliseFeeResult {
     /// Get the refund amount regardless of whether this was a new finalization.
     pub fn refund_scaled(&self) -> u64 {
         match self {
-            Self::Finalised { refunded_scaled, .. } => *refunded_scaled,
-            Self::AlreadyFinalised { refunded_scaled, .. } => *refunded_scaled,
+            Self::Finalised {
+                refunded_scaled, ..
+            } => *refunded_scaled,
+            Self::AlreadyFinalised {
+                refunded_scaled, ..
+            } => *refunded_scaled,
         }
     }
 
@@ -688,12 +692,21 @@ impl M2mStorage {
         now_ms: u64,
     ) -> Result<(), M2mStorageError> {
         let tx_id = hex::encode(tx_hash);
-        self.reserve_fee_by_tx_id(machine_id, &tx_id, tx_hash, amount_scaled, breakdown, forced, now_ms)
+        self.reserve_fee_by_tx_id(
+            machine_id,
+            &tx_id,
+            tx_hash,
+            amount_scaled,
+            breakdown,
+            forced,
+            now_ms,
+        )
     }
 
     /// Reserve fee for a transaction by tx_id (idempotent via ledger).
     ///
     /// This is the primary reservation method that uses the ledger for idempotency.
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_fee_by_tx_id(
         &self,
         machine_id: &str,
@@ -713,7 +726,11 @@ impl M2mStorage {
         if let Some(entry) = self.ledger.get(ledger_key)? {
             let existing: LedgerEntry = canonical_decode(&entry)?;
             match &existing {
-                LedgerEntry::Reserved { machine_id: existing_mid, reserved_scaled: existing_amt, .. } => {
+                LedgerEntry::Reserved {
+                    machine_id: existing_mid,
+                    reserved_scaled: existing_amt,
+                    ..
+                } => {
                     // Already reserved - idempotent success if same machine/amount
                     if existing_mid == machine_id && *existing_amt == amount_scaled {
                         debug!(
@@ -841,7 +858,14 @@ impl M2mStorage {
         batch_hash_hex: &str,
     ) -> Result<FinaliseFeeResult, M2mStorageError> {
         let tx_id = hex::encode(tx_hash);
-        self.finalise_fee_by_tx_id(machine_id, &tx_id, tx_hash, final_amount_scaled, now_ms, batch_hash_hex)
+        self.finalise_fee_by_tx_id(
+            machine_id,
+            &tx_id,
+            tx_hash,
+            final_amount_scaled,
+            now_ms,
+            batch_hash_hex,
+        )
     }
 
     /// Finalise fee by tx_id (idempotent via ledger).
@@ -863,7 +887,11 @@ impl M2mStorage {
         if let Some(entry) = self.ledger.get(ledger_key)? {
             let existing: LedgerEntry = canonical_decode(&entry)?;
             match &existing {
-                LedgerEntry::Finalised { charged_scaled, refunded_scaled, .. } => {
+                LedgerEntry::Finalised {
+                    charged_scaled,
+                    refunded_scaled,
+                    ..
+                } => {
                     // Already finalised - idempotent success
                     debug!(
                         tx_id = %tx_id,
@@ -875,7 +903,11 @@ impl M2mStorage {
                         refunded_scaled: *refunded_scaled,
                     });
                 }
-                LedgerEntry::Reserved { machine_id: reserved_mid, reserved_scaled, .. } => {
+                LedgerEntry::Reserved {
+                    machine_id: reserved_mid,
+                    reserved_scaled,
+                    ..
+                } => {
                     // Verify machine ID matches
                     if reserved_mid != machine_id {
                         return Err(M2mStorageError::InvalidMachineId {
@@ -898,19 +930,19 @@ impl M2mStorage {
                     let refund = reserved_scaled.saturating_sub(final_amount_scaled);
 
                     // Get account
-                    let mut account =
-                        self.get_account(machine_id)?
-                            .ok_or_else(|| M2mStorageError::MachineNotFound {
-                                machine_id: machine_id.to_string(),
-                            })?;
+                    let mut account = self.get_account(machine_id)?.ok_or_else(|| {
+                        M2mStorageError::MachineNotFound {
+                            machine_id: machine_id.to_string(),
+                        }
+                    })?;
 
                     // Update account:
                     // - Deduct final fee from balance
                     // - Release reservation
-                    account.balance_scaled = account.balance_scaled.saturating_sub(final_amount_scaled);
-                    account.reserved_scaled = account
-                        .reserved_scaled
-                        .saturating_sub(*reserved_scaled);
+                    account.balance_scaled =
+                        account.balance_scaled.saturating_sub(final_amount_scaled);
+                    account.reserved_scaled =
+                        account.reserved_scaled.saturating_sub(*reserved_scaled);
                     account.total_fees_paid_scaled = account
                         .total_fees_paid_scaled
                         .saturating_add(final_amount_scaled);
@@ -1075,7 +1107,11 @@ impl M2mStorage {
                     );
                     return Ok(0);
                 }
-                LedgerEntry::Reserved { machine_id: reserved_mid, reserved_scaled, .. } => {
+                LedgerEntry::Reserved {
+                    machine_id: reserved_mid,
+                    reserved_scaled,
+                    ..
+                } => {
                     // Verify machine ID matches (or allow release by any machine?)
                     // For safety, we require matching machine_id
                     if reserved_mid != machine_id {
@@ -1094,9 +1130,8 @@ impl M2mStorage {
                     };
 
                     // Release reserved amount
-                    account.reserved_scaled = account
-                        .reserved_scaled
-                        .saturating_sub(*reserved_scaled);
+                    account.reserved_scaled =
+                        account.reserved_scaled.saturating_sub(*reserved_scaled);
                     account.updated_at_ms = now_ms;
 
                     // Persist - remove both ledger entry and reservation
@@ -1486,7 +1521,8 @@ impl M2mStorage {
 
         // Store a side record linking batch to settlement state
         let state_key = format!("batch_state:{}", hex::encode(totals.batch_hash));
-        self.batch_fees.insert(state_key.as_bytes(), settlement_state.as_bytes())?;
+        self.batch_fees
+            .insert(state_key.as_bytes(), settlement_state.as_bytes())?;
 
         Ok(())
     }
@@ -1498,7 +1534,8 @@ impl M2mStorage {
         settlement_state: &str,
     ) -> Result<(), M2mStorageError> {
         let state_key = format!("batch_state:{}", hex::encode(batch_hash));
-        self.batch_fees.insert(state_key.as_bytes(), settlement_state.as_bytes())?;
+        self.batch_fees
+            .insert(state_key.as_bytes(), settlement_state.as_bytes())?;
         Ok(())
     }
 
@@ -1896,7 +1933,10 @@ mod tests {
 
         // Try to reserve again - should fail
         let result = storage.reserve_fee(machine_id, tx_hash, 50_000, breakdown, false, 4000);
-        assert!(matches!(result, Err(M2mStorageError::LedgerConflict { .. })));
+        assert!(matches!(
+            result,
+            Err(M2mStorageError::LedgerConflict { .. })
+        ));
     }
 
     #[test]
@@ -1913,10 +1953,14 @@ mod tests {
             .unwrap();
 
         // Finalise
-        storage.finalise_fee(machine_id, tx_hash, 30_000, 3000).unwrap();
+        storage
+            .finalise_fee(machine_id, tx_hash, 30_000, 3000)
+            .unwrap();
 
         // Release should return 0 (cannot release after finalise)
-        let released = storage.release_reservation(machine_id, tx_hash, 4000).unwrap();
+        let released = storage
+            .release_reservation(machine_id, tx_hash, 4000)
+            .unwrap();
         assert_eq!(released, 0);
     }
 
@@ -2036,7 +2080,9 @@ mod tests {
 
         // Next day (86_400_001 ms later)
         let next_day = 86_400_001;
-        storage.apply_forced_usage(machine_id, 100, next_day).unwrap();
+        storage
+            .apply_forced_usage(machine_id, 100, next_day)
+            .unwrap();
     }
 
     #[test]
@@ -2079,7 +2125,14 @@ mod tests {
 
         // Create a reserved entry
         storage
-            .reserve_fee("device-stats-1", [0x01; 32], 50_000, breakdown.clone(), false, 2000)
+            .reserve_fee(
+                "device-stats-1",
+                [0x01; 32],
+                50_000,
+                breakdown.clone(),
+                false,
+                2000,
+            )
             .unwrap();
 
         // Create a finalised entry
