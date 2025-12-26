@@ -35,12 +35,26 @@ pub mod intent_metrics;
 pub mod intent_reconciler;
 pub mod intents;
 
+/// Ethereum header chain verification (requires `eth-headers` feature).
+#[cfg(feature = "eth-headers")]
+pub mod eth_headers_verify;
+
+/// Ethereum header chain API (requires `eth-headers` feature).
+#[cfg(feature = "eth-headers")]
+pub mod eth_headers_api;
+
 pub use eth_adapter::{
     CompositeVerifier, EthAttestationVerifier, EthAttestationVerifierConfig, ExpectedEventBinding,
     ExternalVerifier, ExternalVerifyError, MockVerifier, VerifiedEvent,
     DEFAULT_MIN_CONFIRMATIONS_MAINNET, DEFAULT_MIN_CONFIRMATIONS_TESTNET,
 };
 pub use eth_merkle::{verify_eth_receipt_merkle_proof, EthMerkleVerifyError, MerkleVerifiedEvent};
+
+#[cfg(all(feature = "merkle-proofs", feature = "eth-headers"))]
+pub use eth_merkle::{
+    can_verify_proof, verify_merkle_proof_with_headers, HeaderAwareMerkleError,
+    HeaderAwareVerifiedEvent, ProofReadiness,
+};
 pub use external_proof_api::{
     BindProofResponse, ExternalProofApi, ExternalProofApiError, IntentProofsVerifiedResponse,
     ListProofsQuery, ListProofsResponse, ProofCountsResponse, ProofListItem, ProofStatusResponse,
@@ -50,6 +64,11 @@ pub use external_proof_reconciler::{
     spawn_external_proof_reconciler, ExternalProofReconcileCycleResult,
     ExternalProofReconcilerConfig, ExternalProofReconcilerHandle, ExternalProofReconcilerMetrics,
     ExternalProofReconcilerMetricsSnapshot, StorageExternalProofChecker,
+};
+
+#[cfg(feature = "eth-headers")]
+pub use external_proof_reconciler::{
+    spawn_external_proof_reconciler_with_headers, HeaderVerificationContext,
 };
 pub use intent_api::{
     AbortIntentRequest, AbortIntentResponse, CommitIntentResponse, CreateIntentRequest,
@@ -70,6 +89,19 @@ pub use intents::{
     FinalityChecker, HubIntentExecutor, IntentPolicy, IntentRouter, IntentRouterError,
     IntentStatus, MockExternalProofChecker, MockFinalityChecker, MockHubExecutor,
     NoopExternalProofChecker, PrepareFinality, PrepareIntentResult, DEFAULT_INTENT_EXPIRES_MS,
+};
+
+#[cfg(feature = "eth-headers")]
+pub use eth_headers_verify::{
+    HeaderVerifier, HeaderVerifierConfig, HeaderVerifyError, HeaderVerifyResult,
+    MultiChainHeaderVerifier,
+};
+
+#[cfg(feature = "eth-headers")]
+pub use eth_headers_api::{
+    BestTipResponse, ConfirmationsResponse, EthHeaderApi, EthHeaderApiConfig, EthHeaderApiError,
+    HeaderInput, HeaderResponse, HeaderStatsResponse, HeaderSubmitResult, SubmitHeadersRequest,
+    SubmitHeadersResponse,
 };
 
 use std::sync::Arc;

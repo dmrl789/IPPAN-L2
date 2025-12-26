@@ -88,14 +88,14 @@ mod implementation {
 
     /// Ethereum block header (minimal fields needed for verification).
     #[derive(Debug)]
-    struct BlockHeader {
-        receipts_root: [u8; 32],
+    pub(crate) struct BlockHeader {
+        pub(crate) receipts_root: [u8; 32],
     }
 
     impl BlockHeader {
         /// Decode a block header from RLP.
         /// We only need the receipts_root (field index 5 in the header).
-        fn from_rlp(data: &[u8]) -> Result<Self, EthMerkleVerifyError> {
+        pub(crate) fn from_rlp(data: &[u8]) -> Result<Self, EthMerkleVerifyError> {
             let mut buf = data;
 
             // Decode the outer list header
@@ -678,6 +678,206 @@ mod implementation {
 
 #[cfg(feature = "merkle-proofs")]
 pub use implementation::*;
+
+/// Header-aware Merkle proof verification (requires `eth-headers` feature).
+///
+/// This module extends the basic Merkle proof verification with header chain awareness,
+/// requiring that proofs reference blocks that are:
+/// 1. Known in the header store
+/// 2. On a verified chain (descend from checkpoints)
+/// 3. Have sufficient confirmations
+#[cfg(all(feature = "merkle-proofs", feature = "eth-headers"))]
+mod header_aware {
+    use super::implementation::*;
+    use crate::eth_headers_verify::{HeaderVerifier, HeaderVerifyError};
+    use l2_core::EthReceiptMerkleProofV1;
+    use l2_storage::eth_headers::EthHeaderStorage;
+    use thiserror::Error;
+
+    /// Errors from header-aware Merkle proof verification.
+    #[derive(Debug, Error)]
+    pub enum HeaderAwareMerkleError {
+        #[error("merkle proof error: {0}")]
+        Merkle(#[from] EthMerkleVerifyError),
+
+        #[error("header verification error: {0}")]
+        Header(#[from] HeaderVerifyError),
+
+        #[error("block not found in header store: {0}")]
+        BlockNotFound(String),
+
+        #[error("block not on verified chain: {0}")]
+        BlockNotVerified(String),
+
+        #[error("receipts root mismatch: proof has {proof}, header has {stored}")]
+        ReceiptsRootMismatch { proof: String, stored: String },
+
+        #[error("insufficient confirmations: got {got}, need {need}")]
+        InsufficientConfirmations { got: u64, need: u64 },
+    }
+
+    /// Result of header-aware Merkle proof verification.
+    #[derive(Debug, Clone)]
+    pub struct HeaderAwareVerifiedEvent {
+        /// The verified event from Merkle proof.
+        pub event: MerkleVerifiedEvent,
+
+        /// Number of confirmations for this block.
+        pub confirmations: u64,
+
+        /// Whether the block is on the best verified chain.
+        pub on_verified_chain: bool,
+    }
+
+    /// Verify a Merkle receipt proof with header chain awareness.
+    ///
+    /// This function:
+    /// 1. Checks that the block exists in the header store
+    /// 2. Verifies the block is on a verified chain (descends from checkpoint)
+    /// 3. Uses the stored header's receipts_root (not from proof) as source of truth
+    /// 4. Verifies sufficient confirmations
+    /// 5. Performs the MPT proof verification
+    pub fn verify_merkle_proof_with_headers(
+        proof: &EthReceiptMerkleProofV1,
+        storage: &EthHeaderStorage,
+        verifier: &HeaderVerifier,
+    ) -> Result<HeaderAwareVerifiedEvent, HeaderAwareMerkleError> {
+        // Step 1: Check confirmations (also verifies block is known and verified)
+        let confirmations = verifier.check_confirmations(storage, &proof.block_hash)?;
+
+        // Step 2: Get the stored header's receipts root
+        let stored_receipts_root =
+            verifier.get_verified_receipts_root(storage, &proof.block_hash)?;
+
+        // Step 3: Verify the proof's header RLP produces the expected block hash
+        // (This is already done in the basic verify function, but we do it explicitly here
+        // to be extra safe before we use the receipts_root)
+        use alloy_primitives::keccak256;
+        let computed_hash = keccak256(&proof.header_rlp);
+        if computed_hash.as_slice() != proof.block_hash {
+            return Err(HeaderAwareMerkleError::Merkle(
+                EthMerkleVerifyError::BlockHashMismatch {
+                    expected: hex::encode(proof.block_hash),
+                    got: hex::encode(computed_hash),
+                },
+            ));
+        }
+
+        // Step 4: Extract receipts_root from the proof's header and compare with stored
+        // (We could skip this if we fully trust our stored headers, but this is a sanity check)
+        let header_from_proof = super::implementation::BlockHeader::from_rlp(&proof.header_rlp)?;
+        if header_from_proof.receipts_root != stored_receipts_root {
+            return Err(HeaderAwareMerkleError::ReceiptsRootMismatch {
+                proof: hex::encode(header_from_proof.receipts_root),
+                stored: hex::encode(stored_receipts_root),
+            });
+        }
+
+        // Step 5: Perform the full Merkle proof verification
+        let event = verify_eth_receipt_merkle_proof(proof)?;
+
+        Ok(HeaderAwareVerifiedEvent {
+            event,
+            confirmations,
+            on_verified_chain: true,
+        })
+    }
+
+    /// Check if a proof can be verified (block is known with sufficient confirmations).
+    ///
+    /// This is useful for the reconciler to determine if a proof is ready for verification
+    /// or should remain pending waiting for headers.
+    pub fn can_verify_proof(
+        proof: &EthReceiptMerkleProofV1,
+        storage: &EthHeaderStorage,
+        verifier: &HeaderVerifier,
+    ) -> ProofReadiness {
+        use l2_core::eth_header::HeaderId;
+
+        // Check if header exists
+        let header_id = HeaderId(proof.block_hash);
+        match storage.get_header(&header_id) {
+            Ok(Some(stored)) => {
+                if !stored.state.is_verified() {
+                    return ProofReadiness::BlockNotVerified;
+                }
+
+                // Check confirmations
+                match storage.confirmations(&proof.block_hash) {
+                    Ok(Some(confs)) => {
+                        let min_required = verifier.config().min_confirmations(storage.chain_id());
+                        if confs >= min_required {
+                            ProofReadiness::Ready {
+                                confirmations: confs,
+                            }
+                        } else {
+                            ProofReadiness::InsufficientConfirmations {
+                                got: confs,
+                                need: min_required,
+                            }
+                        }
+                    }
+                    Ok(None) => ProofReadiness::BlockNotOnBestChain,
+                    Err(_) => ProofReadiness::StorageError,
+                }
+            }
+            Ok(None) => ProofReadiness::BlockNotFound,
+            Err(_) => ProofReadiness::StorageError,
+        }
+    }
+
+    /// Proof readiness status.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProofReadiness {
+        /// Proof is ready for verification.
+        Ready { confirmations: u64 },
+        /// Block not found in header store.
+        BlockNotFound,
+        /// Block exists but is not on a verified chain.
+        BlockNotVerified,
+        /// Block is verified but not on best chain (may be a fork).
+        BlockNotOnBestChain,
+        /// Insufficient confirmations.
+        InsufficientConfirmations { got: u64, need: u64 },
+        /// Storage error.
+        StorageError,
+    }
+
+    impl ProofReadiness {
+        /// Check if the proof is ready.
+        pub fn is_ready(&self) -> bool {
+            matches!(self, Self::Ready { .. })
+        }
+
+        /// Check if the proof is pending (might become ready later).
+        pub fn is_pending(&self) -> bool {
+            matches!(
+                self,
+                Self::BlockNotFound
+                    | Self::BlockNotVerified
+                    | Self::BlockNotOnBestChain
+                    | Self::InsufficientConfirmations { .. }
+            )
+        }
+
+        /// Get a human-readable reason for not being ready.
+        pub fn reason(&self) -> Option<String> {
+            match self {
+                Self::Ready { .. } => None,
+                Self::BlockNotFound => Some("block not found in header store".to_string()),
+                Self::BlockNotVerified => Some("block not on verified chain".to_string()),
+                Self::BlockNotOnBestChain => Some("block not on best chain".to_string()),
+                Self::InsufficientConfirmations { got, need } => {
+                    Some(format!("insufficient confirmations: {} < {}", got, need))
+                }
+                Self::StorageError => Some("storage error".to_string()),
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "merkle-proofs", feature = "eth-headers"))]
+pub use header_aware::*;
 
 // Stub exports when feature is not enabled
 #[cfg(not(feature = "merkle-proofs"))]

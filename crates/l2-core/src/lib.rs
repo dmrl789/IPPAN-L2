@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod batch_envelope;
 pub mod canonical;
+pub mod eth_header;
 pub mod external_proof;
 pub mod fees;
 pub mod finality;
@@ -34,6 +35,11 @@ pub use batch_envelope::{
 pub use canonical::{
     canonical_decode, canonical_encode, canonical_hash, canonical_hash_bytes, Batch,
     CanonicalError, ChainId, Hash32, Receipt, Tx,
+};
+#[cfg(feature = "keccak-headers")]
+pub use eth_header::{header_hash_from_rlp, header_id_from_rlp};
+pub use eth_header::{
+    Address, EthHeaderError, EthereumHeaderV1, Hash256, HeaderId, MAX_EXTRA_DATA_SIZE,
 };
 pub use external_proof::{
     AttestationData, EthReceiptAttestationV1, EthReceiptMerkleProofV1, ExternalChainId,

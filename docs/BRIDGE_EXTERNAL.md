@@ -69,12 +69,13 @@ pub enum ExternalChainId {
 
 #### Verification Modes
 
-The bridge supports two verification modes with different trust assumptions:
+The bridge supports multiple verification modes with different trust assumptions:
 
 | Mode | Trust Assumption | Speed | Use Case |
 |------|------------------|-------|----------|
 | `attestation` | Trust in allowlisted attestors | Fast | Production MVP, trusted operators |
 | `eth_merkle_receipt_proof` | Trust in Ethereum consensus | Slower | Fully decentralized, trustless |
+| `merkle_with_headers` | Verified header chain | Moderate | Deterministic confirmations (MVP light client) |
 
 ```rust
 pub enum VerificationMode {
@@ -84,6 +85,20 @@ pub enum VerificationMode {
     EthMerkleReceiptProof,
 }
 ```
+
+#### Header Chain Verification (Light Client MVP)
+
+When the `eth-headers` feature is enabled, Merkle proofs can be verified against a locally
+stored and validated Ethereum header chain. This provides:
+
+1. **Deterministic confirmations**: Computed from verified header depth, not external RPC claims
+2. **Block hash validation**: Proofs are anchored to known, verified headers
+3. **Receipt root verification**: Uses stored header's receipts_root as source of truth
+
+Trust model:
+- **Checkpoints**: Explicitly trusted header hashes serve as roots of trust
+- **Chain validation**: Headers must descend from checkpoints to be verified
+- **Fork choice**: Highest block number wins; ties broken by lexicographically smallest hash
 
 #### ExternalEventProofV1
 
@@ -274,7 +289,80 @@ pub struct ExternalProofReconcilerConfig {
 }
 ```
 
-### 6. External Proof API (`l2-bridge/src/external_proof_api.rs`)
+### 6. Ethereum Header Chain (Light Client MVP)
+
+The header chain subsystem (`eth-headers` feature) provides trust-minimized confirmation
+counting without relying on external RPCs.
+
+#### Components
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| `EthereumHeaderV1` | `l2-core/src/eth_header.rs` | Canonical header struct with RLP encoding |
+| `EthHeaderStorage` | `l2-storage/src/eth_headers.rs` | Persistent header store with fork choice |
+| `HeaderVerifier` | `l2-bridge/src/eth_headers_verify.rs` | Checkpoint-based verification |
+| `EthHeaderApi` | `l2-bridge/src/eth_headers_api.rs` | HTTP API for header submission/query |
+
+#### Trust Model
+
+The MVP light client uses **explicit checkpoints** as trust anchors:
+
+```
+                    Checkpoint (trusted)
+                         │
+                         ▼
+                    Block N (verified)
+                         │
+                    ┌────┴────┐
+                    ▼         ▼
+              Block N+1   Block N+1' (fork)
+              (verified)  (verified)
+                    │
+                    ▼
+              Block N+2 (best tip)
+```
+
+1. **Checkpoints**: Trusted header hashes that serve as roots of trust
+2. **Verification**: Headers descending from checkpoints are "verified"
+3. **Confirmations**: Computed as `best_tip_number - block_number + 1`
+4. **Fork choice**: Deterministic (highest number, then smallest hash)
+
+#### Configuration
+
+```bash
+# Bootstrap checkpoints (chain_id:hash:number,...)
+ETH_BOOTSTRAP_CHECKPOINTS="1:0xabc123...:18000000"
+
+# Confirmation thresholds
+ETH_MIN_CONFIRMATIONS_MAINNET=12
+ETH_MIN_CONFIRMATIONS_TESTNET=6
+
+# Allow uncheckpointed headers (devnet mode)
+ETH_HEADER_ALLOW_UNCHECKPOINTED=false
+```
+
+#### API Endpoints (devnet mode)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/bridge/eth/headers` | POST | Submit headers (requires `DEVNET=1`) |
+| `/bridge/eth/headers/best_tip` | GET | Get current best tip |
+| `/bridge/eth/headers/:hash` | GET | Get header by hash |
+| `/bridge/eth/confirmations/:hash` | GET | Get confirmations for block |
+| `/bridge/eth/headers/stats` | GET | Header chain statistics |
+
+#### Header-Aware Merkle Proofs
+
+When header verification is required (`REQUIRE_HEADER_VERIFICATION=1`), Merkle proofs:
+
+1. Must reference blocks known in the header store
+2. Must be on a verified chain (descend from checkpoint)
+3. Have confirmations computed from header depth (not from proof payload)
+4. Use stored header's receipts_root (not from proof)
+
+If the block is not yet known, the proof remains **pending** (not rejected).
+
+### 7. External Proof API (`l2-bridge/src/external_proof_api.rs`)
 
 HTTP API endpoints for proof management:
 
@@ -543,18 +631,36 @@ MERKLE_PROOF_MIN_CONFIRMATIONS_MAINNET=12
 MERKLE_PROOF_MIN_CONFIRMATIONS_TESTNET=6
 ```
 
+#### Header-Aware Merkle Proof Mode (requires `eth-headers` feature)
+
+Trust assumptions:
+1. **Bootstrap checkpoints**: Explicitly configured trusted header hashes
+2. **Header chain validity**: Headers structurally valid and linked
+3. **No sync committee verification** (MVP limitation)
+
+Verification checks:
+1. **Block known**: Block hash must exist in header store
+2. **Verified chain**: Block must descend from a checkpoint
+3. **Confirmations from headers**: Computed from header depth, not proof claims
+4. **Receipt root from store**: Uses stored header's receipts_root
+5. **Full MPT verification**: Same as basic Merkle proof mode
+
+Best for: Deterministic, local confirmation counting without external RPC.
+
 ### Choosing a Verification Mode
 
-| Consideration | Attestation | Merkle Proof |
-|---------------|-------------|--------------|
-| Trust requirement | Trusted attestor | Ethereum consensus only |
-| Verification speed | Fast | Slower (RLP parsing, MPT) |
-| Proof size | Small (signature) | Larger (header + proof nodes) |
-| External dependencies | Attestor daemon | Ethereum full node (for proof generation) |
-| Decentralization | Semi-centralized | Fully decentralized |
+| Consideration | Attestation | Merkle Proof | Merkle + Headers |
+|---------------|-------------|--------------|------------------|
+| Trust requirement | Trusted attestor | Ethereum consensus | Bootstrap checkpoints |
+| Confirmation source | Proof payload | Proof payload | Header chain depth |
+| External RPC needed | No | For proof gen | For header submission |
+| Verification speed | Fast | Moderate | Moderate |
+| Decentralization | Semi-centralized | Decentralized | Deterministic |
 
-For production, consider starting with attestation mode for speed and operational simplicity,
-then migrating to Merkle proofs for higher-value or higher-security use cases.
+For production:
+1. **Start**: Attestation mode for speed and simplicity
+2. **Upgrade**: Merkle proofs for trustless verification
+3. **Best**: Merkle + Headers for deterministic confirmations
 
 ## Configuration
 
@@ -574,6 +680,14 @@ MERKLE_PROOF_MIN_CONFIRMATIONS_TESTNET=6
 EXTERNAL_PROOF_RECONCILER_ENABLED=true
 EXTERNAL_PROOF_POLL_MS=5000
 EXTERNAL_PROOF_MAX_PER_CYCLE=100
+
+# Header chain configuration (eth-headers feature)
+ETH_BOOTSTRAP_CHECKPOINTS="1:0xabc123...:18000000"  # chain_id:hash:number
+ETH_HEADER_ALLOW_UNCHECKPOINTED=false               # Allow headers without checkpoints (devnet)
+REQUIRE_HEADER_VERIFICATION=false                   # Require header store for Merkle proofs
+ETH_CHAIN_ID=1                                       # Default chain ID for API
+DEVNET=0                                             # Enable devnet mode (header submission)
+ETH_MAX_HEADERS_PER_REQUEST=100                      # Max headers per submission
 ```
 
 ### Feature Flags
@@ -585,6 +699,18 @@ cargo build -p l2-bridge --features merkle-proofs
 ```
 
 Without this feature, Merkle proofs will be rejected with "feature not enabled".
+
+Header chain verification requires the `eth-headers` feature:
+
+```bash
+cargo build -p l2-bridge --features eth-headers
+```
+
+The `eth-headers` feature implies `merkle-proofs` and enables:
+- Ethereum header storage and verification
+- Deterministic confirmation counting from headers
+- Header submission API (devnet mode)
+- Header-aware Merkle proof verification
 
 ### Running the Reconciler
 
@@ -657,3 +783,9 @@ The Merkle proof test suite (`eth_merkle_vectors.rs`) includes:
 - **Reconciler**: Background process that verifies external proofs
 - **Binding**: Association between a proof and an intent
 - **Confirmation Policy**: Minimum block confirmations required for proof acceptance
+- **Header Chain**: A sequence of Ethereum block headers with parent links
+- **Checkpoint**: An explicitly trusted header hash used as a root of trust
+- **Verified Chain**: Headers that descend from a checkpoint
+- **Best Tip**: The highest-numbered verified block (with hash tie-breaking)
+- **Fork Choice**: Algorithm for selecting the canonical chain among competing forks
+- **Light Client**: A system that validates block headers without full state

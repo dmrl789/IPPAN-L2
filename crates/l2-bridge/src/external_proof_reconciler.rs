@@ -10,6 +10,17 @@
 //!
 //! The reconciler should only run on the leader node to avoid duplicate
 //! verification work. Use HA leader election to coordinate.
+//!
+//! ## Header-Aware Mode (eth-headers feature)
+//!
+//! When the `eth-headers` feature is enabled, the reconciler can optionally
+//! verify Merkle proofs against the header store. This provides:
+//! - Deterministic confirmation counting from verified headers
+//! - Block hash validation against known headers
+//! - Receipt root verification from stored headers
+//!
+//! If a block is not yet in the header store, the proof remains pending
+//! and will be retried when headers become available.
 
 use crate::eth_adapter::{ExternalVerifier, ExternalVerifyError};
 use crate::eth_merkle::verify_eth_receipt_merkle_proof;
@@ -20,6 +31,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
+
+#[cfg(feature = "eth-headers")]
+use crate::eth_headers_verify::HeaderVerifier;
+#[cfg(feature = "eth-headers")]
+use l2_storage::eth_headers::EthHeaderStorage;
 
 /// Configuration for the external proof reconciler.
 #[derive(Debug, Clone)]
@@ -38,6 +54,16 @@ pub struct ExternalProofReconcilerConfig {
 
     /// Minimum confirmations required for testnet Merkle proofs.
     pub min_confirmations_testnet: u32,
+
+    /// Whether to require header verification for Merkle proofs.
+    ///
+    /// When enabled (with `eth-headers` feature), proofs are only verified if:
+    /// - The block exists in the header store
+    /// - The block is on a verified chain
+    /// - The block has sufficient confirmations from header depth
+    ///
+    /// If the block is not yet known, the proof remains pending.
+    pub require_header_verification: bool,
 }
 
 impl Default for ExternalProofReconcilerConfig {
@@ -48,6 +74,7 @@ impl Default for ExternalProofReconcilerConfig {
             enabled: true,
             min_confirmations_mainnet: 12,
             min_confirmations_testnet: 6,
+            require_header_verification: false, // Default to legacy behavior
         }
     }
 }
@@ -80,12 +107,18 @@ impl ExternalProofReconcilerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(6);
 
+        let require_header_verification = std::env::var("REQUIRE_HEADER_VERIFICATION")
+            .ok()
+            .map(|s| s.to_lowercase() == "true" || s == "1")
+            .unwrap_or(false);
+
         Self {
             poll_interval_ms,
             max_proofs_per_cycle,
             enabled,
             min_confirmations_mainnet,
             min_confirmations_testnet,
+            require_header_verification,
         }
     }
 }
@@ -213,6 +246,8 @@ impl Clone for ExternalProofReconcilerHandle {
 /// Spawn the external proof reconciler background loop.
 ///
 /// Returns a handle that can be used to get metrics and request shutdown.
+///
+/// Note: For header-aware verification, use `spawn_external_proof_reconciler_with_headers`.
 pub fn spawn_external_proof_reconciler(
     config: ExternalProofReconcilerConfig,
     storage: Arc<ExternalProofStorage>,
@@ -228,8 +263,51 @@ pub fn spawn_external_proof_reconciler(
     };
 
     if config.enabled {
+        #[cfg(feature = "eth-headers")]
+        tokio::spawn(reconciler_loop(
+            config, storage, verifier, is_leader, metrics, shutdown, None,
+        ));
+        #[cfg(not(feature = "eth-headers"))]
         tokio::spawn(reconciler_loop(
             config, storage, verifier, is_leader, metrics, shutdown,
+        ));
+    } else {
+        info!("external proof reconciler disabled by config");
+    }
+
+    handle
+}
+
+/// Spawn the external proof reconciler with header-aware verification.
+///
+/// When `header_ctx` is provided and `config.require_header_verification` is true,
+/// Merkle proofs will be verified against the header store with deterministic
+/// confirmation counting.
+#[cfg(feature = "eth-headers")]
+pub fn spawn_external_proof_reconciler_with_headers(
+    config: ExternalProofReconcilerConfig,
+    storage: Arc<ExternalProofStorage>,
+    verifier: Arc<dyn ExternalVerifier>,
+    is_leader: Arc<AtomicBool>,
+    header_ctx: Option<Arc<HeaderVerificationContext>>,
+) -> ExternalProofReconcilerHandle {
+    let metrics = Arc::new(ExternalProofReconcilerMetrics::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let handle = ExternalProofReconcilerHandle {
+        metrics: Arc::clone(&metrics),
+        shutdown: Arc::clone(&shutdown),
+    };
+
+    if config.enabled {
+        if header_ctx.is_some() {
+            info!(
+                require_header_verification = config.require_header_verification,
+                "spawning header-aware proof reconciler"
+            );
+        }
+        tokio::spawn(reconciler_loop(
+            config, storage, verifier, is_leader, metrics, shutdown, header_ctx,
         ));
     } else {
         info!("external proof reconciler disabled by config");
@@ -246,12 +324,14 @@ async fn reconciler_loop(
     is_leader: Arc<AtomicBool>,
     metrics: Arc<ExternalProofReconcilerMetrics>,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "eth-headers")] header_ctx: Option<Arc<HeaderVerificationContext>>,
 ) {
     let mut ticker = interval(Duration::from_millis(config.poll_interval_ms));
 
     info!(
         poll_interval_ms = config.poll_interval_ms,
         max_per_cycle = config.max_proofs_per_cycle,
+        require_header_verification = config.require_header_verification,
         "external proof reconciler started"
     );
 
@@ -271,6 +351,17 @@ async fn reconciler_loop(
         }
 
         // Run one reconciliation cycle
+        #[cfg(feature = "eth-headers")]
+        let result = run_reconcile_cycle(
+            &config,
+            &storage,
+            verifier.as_ref(),
+            &metrics,
+            header_ctx.as_ref().map(|c| c.as_ref()),
+        )
+        .await;
+
+        #[cfg(not(feature = "eth-headers"))]
         let result = run_reconcile_cycle(&config, &storage, verifier.as_ref(), &metrics).await;
 
         // Update metrics
@@ -299,11 +390,12 @@ async fn reconciler_loop(
 }
 
 /// Run a single reconciliation cycle.
-async fn run_reconcile_cycle(
+pub async fn run_reconcile_cycle(
     config: &ExternalProofReconcilerConfig,
     storage: &ExternalProofStorage,
     verifier: &dyn ExternalVerifier,
     metrics: &ExternalProofReconcilerMetrics,
+    #[cfg(feature = "eth-headers")] header_ctx: Option<&HeaderVerificationContext>,
 ) -> ExternalProofReconcileCycleResult {
     let mut verified = 0u32;
     let mut rejected = 0u32;
@@ -332,8 +424,20 @@ async fn run_reconcile_cycle(
 
     // Process each unverified proof
     for entry in &unverified {
+        #[cfg(feature = "eth-headers")]
+        let result = verify_and_update(
+            config,
+            storage,
+            verifier,
+            &entry.proof_id,
+            &entry.proof,
+            header_ctx,
+        )
+        .await;
+        #[cfg(not(feature = "eth-headers"))]
         let result =
             verify_and_update(config, storage, verifier, &entry.proof_id, &entry.proof).await;
+
         match result {
             VerifyUpdateResult::Verified => {
                 verified += 1;
@@ -385,6 +489,7 @@ async fn verify_and_update(
     verifier: &dyn ExternalVerifier,
     proof_id: &ExternalProofId,
     proof: &ExternalEventProofV1,
+    #[cfg(feature = "eth-headers")] header_ctx: Option<&HeaderVerificationContext>,
 ) -> VerifyUpdateResult {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -393,6 +498,9 @@ async fn verify_and_update(
     let now_ms = u64::try_from(now_ms).unwrap_or(u64::MAX);
 
     // Verify based on mode
+    #[cfg(feature = "eth-headers")]
+    let verification_result = verify_by_mode(config, verifier, proof, header_ctx);
+    #[cfg(not(feature = "eth-headers"))]
     let verification_result = verify_by_mode(config, verifier, proof);
 
     match verification_result {
@@ -467,6 +575,7 @@ fn verify_by_mode(
     config: &ExternalProofReconcilerConfig,
     verifier: &dyn ExternalVerifier,
     proof: &ExternalEventProofV1,
+    #[cfg(feature = "eth-headers")] header_ctx: Option<&HeaderVerificationContext>,
 ) -> Result<VerificationSuccess, VerifyModeError> {
     match proof.verification_mode() {
         VerificationMode::Attestation => {
@@ -475,8 +584,59 @@ fn verify_by_mode(
         }
         VerificationMode::EthMerkleReceiptProof => {
             // Use the Merkle proof verifier
-            verify_merkle_proof(config, proof)
+            #[cfg(feature = "eth-headers")]
+            {
+                verify_merkle_proof(config, proof, header_ctx)
+            }
+            #[cfg(not(feature = "eth-headers"))]
+            {
+                verify_merkle_proof_legacy_only(config, proof)
+            }
         }
+    }
+}
+
+/// Legacy Merkle proof verification (non-feature-gated version).
+#[cfg(not(feature = "eth-headers"))]
+fn verify_merkle_proof_legacy_only(
+    config: &ExternalProofReconcilerConfig,
+    proof: &ExternalEventProofV1,
+) -> Result<VerificationSuccess, VerifyModeError> {
+    let merkle_proof = match proof {
+        ExternalEventProofV1::EthReceiptMerkleProofV1(p) => p,
+        _ => {
+            return Err(VerifyModeError::Permanent(
+                "expected EthReceiptMerkleProofV1 for Merkle verification mode".to_string(),
+            ));
+        }
+    };
+
+    let min_confirmations = if merkle_proof.chain.is_mainnet() {
+        config.min_confirmations_mainnet
+    } else {
+        config.min_confirmations_testnet
+    };
+
+    if let Some(confirmations) = merkle_proof.confirmations {
+        if confirmations < min_confirmations {
+            return Err(VerifyModeError::Transient(format!(
+                "insufficient confirmations: {} < {} required",
+                confirmations, min_confirmations
+            )));
+        }
+    }
+
+    match verify_eth_receipt_merkle_proof(merkle_proof) {
+        Ok(verified) => Ok(VerificationSuccess {
+            mode: VerificationMode::EthMerkleReceiptProof,
+            block_number: verified.block_number,
+            log_index: verified.log_index,
+            data_hash: verified.data_hash,
+        }),
+        Err(e) => Err(VerifyModeError::Permanent(format!(
+            "merkle proof verification failed: {}",
+            e
+        ))),
     }
 }
 
@@ -511,10 +671,28 @@ fn verify_attestation(
     }
 }
 
+/// Optional context for header-aware Merkle proof verification.
+#[cfg(feature = "eth-headers")]
+pub struct HeaderVerificationContext {
+    /// Header storage.
+    pub storage: Arc<EthHeaderStorage>,
+    /// Header verifier.
+    pub verifier: Arc<HeaderVerifier>,
+}
+
+#[cfg(feature = "eth-headers")]
+impl HeaderVerificationContext {
+    /// Create a new context.
+    pub fn new(storage: Arc<EthHeaderStorage>, verifier: Arc<HeaderVerifier>) -> Self {
+        Self { storage, verifier }
+    }
+}
+
 /// Verify a Merkle proof using the eth_merkle verifier.
 fn verify_merkle_proof(
     config: &ExternalProofReconcilerConfig,
     proof: &ExternalEventProofV1,
+    #[cfg(feature = "eth-headers")] header_ctx: Option<&HeaderVerificationContext>,
 ) -> Result<VerificationSuccess, VerifyModeError> {
     // Extract the Merkle proof variant
     let merkle_proof = match proof {
@@ -526,6 +704,27 @@ fn verify_merkle_proof(
         }
     };
 
+    // Header-aware verification when enabled
+    #[cfg(feature = "eth-headers")]
+    if config.require_header_verification {
+        if let Some(ctx) = header_ctx {
+            return verify_merkle_proof_with_header_store(merkle_proof, ctx);
+        } else {
+            return Err(VerifyModeError::Transient(
+                "header verification required but no header context available".to_string(),
+            ));
+        }
+    }
+
+    // Legacy verification (without header store)
+    verify_merkle_proof_legacy(config, merkle_proof)
+}
+
+/// Legacy Merkle proof verification (without header store).
+fn verify_merkle_proof_legacy(
+    config: &ExternalProofReconcilerConfig,
+    merkle_proof: &l2_core::EthReceiptMerkleProofV1,
+) -> Result<VerificationSuccess, VerifyModeError> {
     // Check confirmation policy
     let min_confirmations = if merkle_proof.chain.is_mainnet() {
         config.min_confirmations_mainnet
@@ -560,6 +759,86 @@ fn verify_merkle_proof(
                 "merkle proof verification failed: {}",
                 e
             )))
+        }
+    }
+}
+
+/// Header-aware Merkle proof verification.
+#[cfg(feature = "eth-headers")]
+fn verify_merkle_proof_with_header_store(
+    merkle_proof: &l2_core::EthReceiptMerkleProofV1,
+    ctx: &HeaderVerificationContext,
+) -> Result<VerificationSuccess, VerifyModeError> {
+    use crate::eth_merkle::{can_verify_proof, verify_merkle_proof_with_headers, ProofReadiness};
+
+    // First check if the proof can be verified (block is known with sufficient confirmations)
+    match can_verify_proof(merkle_proof, &ctx.storage, &ctx.verifier) {
+        ProofReadiness::Ready { confirmations } => {
+            debug!(
+                block_hash = %hex::encode(merkle_proof.block_hash),
+                confirmations = confirmations,
+                "block ready for header-aware verification"
+            );
+        }
+        ProofReadiness::BlockNotFound => {
+            return Err(VerifyModeError::Transient(
+                "block not found in header store (waiting for headers)".to_string(),
+            ));
+        }
+        ProofReadiness::BlockNotVerified => {
+            return Err(VerifyModeError::Transient(
+                "block exists but not on verified chain (waiting for verification)".to_string(),
+            ));
+        }
+        ProofReadiness::BlockNotOnBestChain => {
+            return Err(VerifyModeError::Transient(
+                "block not on best chain (possible reorg)".to_string(),
+            ));
+        }
+        ProofReadiness::InsufficientConfirmations { got, need } => {
+            return Err(VerifyModeError::Transient(format!(
+                "insufficient confirmations from header store: {} < {} required",
+                got, need
+            )));
+        }
+        ProofReadiness::StorageError => {
+            return Err(VerifyModeError::Transient(
+                "header storage error".to_string(),
+            ));
+        }
+    }
+
+    // Verify the proof with header-awareness
+    match verify_merkle_proof_with_headers(merkle_proof, &ctx.storage, &ctx.verifier) {
+        Ok(verified) => {
+            info!(
+                block_hash = %hex::encode(merkle_proof.block_hash),
+                block_number = verified.event.block_number,
+                confirmations = verified.confirmations,
+                "merkle proof verified with header store"
+            );
+            Ok(VerificationSuccess {
+                mode: VerificationMode::EthMerkleReceiptProof,
+                block_number: verified.event.block_number,
+                log_index: verified.event.log_index,
+                data_hash: verified.event.data_hash,
+            })
+        }
+        Err(e) => {
+            // Determine if error is permanent or transient
+            let is_transient = matches!(&e, crate::eth_merkle::HeaderAwareMerkleError::Header(_));
+
+            if is_transient {
+                Err(VerifyModeError::Transient(format!(
+                    "header-aware verification error: {}",
+                    e
+                )))
+            } else {
+                Err(VerifyModeError::Permanent(format!(
+                    "merkle proof verification failed: {}",
+                    e
+                )))
+            }
         }
     }
 }
@@ -681,6 +960,9 @@ mod tests {
 
         let config = ExternalProofReconcilerConfig::default();
 
+        #[cfg(feature = "eth-headers")]
+        let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics, None).await;
+        #[cfg(not(feature = "eth-headers"))]
         let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics).await;
 
         assert_eq!(result.verified, 2);
@@ -721,6 +1003,9 @@ mod tests {
 
         let config = ExternalProofReconcilerConfig::default();
 
+        #[cfg(feature = "eth-headers")]
+        let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics, None).await;
+        #[cfg(not(feature = "eth-headers"))]
         let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics).await;
 
         assert_eq!(result.verified, 0);
@@ -757,6 +1042,9 @@ mod tests {
             ..Default::default()
         };
 
+        #[cfg(feature = "eth-headers")]
+        let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics, None).await;
+        #[cfg(not(feature = "eth-headers"))]
         let result = run_reconcile_cycle(&config, &storage, &verifier, &metrics).await;
 
         // Should only process 3 proofs
