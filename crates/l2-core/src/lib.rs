@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod batch_envelope;
 pub mod canonical;
+pub mod eth_header;
 pub mod external_proof;
 pub mod fees;
 pub mod finality;
@@ -50,6 +51,12 @@ pub use organiser::{
     NoopOrganiser, Organiser, OrganiserDecision, OrganiserInputs, OrganiserPolicyBounds,
     OrganiserStatus, OrganiserVersion,
 };
+pub use eth_header::{
+    EthereumHeaderV1, EthHeaderError, HeaderId, Hash256, Address,
+    MAX_EXTRA_DATA_SIZE,
+};
+#[cfg(feature = "keccak-headers")]
+pub use eth_header::{header_hash_from_rlp, header_id_from_rlp};
 
 #[cfg(feature = "signed-envelopes")]
 pub mod signing;

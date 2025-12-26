@@ -2842,6 +2842,8 @@ dependencies = [
 name = "l2-core"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
  "base64 0.22.1",
  "bincode",
  "blake3",

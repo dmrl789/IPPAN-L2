@@ -35,6 +35,8 @@ default = []
 signed-envelopes = ["dep:ed25519-dalek", "l2-core/signed-envelopes"]
 ## Enable Ethereum Merkle Patricia Trie receipt proof verification.
 merkle-proofs = ["dep:alloy-rlp", "dep:alloy-primitives", "dep:sha3", "dep:blake3"]
+## Enable Ethereum header chain verification (light client MVP).
+eth-headers = ["l2-core/keccak-headers", "l2-storage/eth-headers", "merkle-proofs"]
 
 [dev-dependencies]
 tempfile = "3"
