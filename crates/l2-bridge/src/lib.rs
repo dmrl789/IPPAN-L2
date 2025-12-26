@@ -16,8 +16,18 @@
 //!
 //! The `eth_adapter` module provides verification of external chain events
 //! (Ethereum, etc.) via signed attestations or Merkle proofs.
+//!
+//! ## Verification Modes
+//!
+//! The bridge supports multiple verification modes with different trust assumptions:
+//!
+//! - **Attestation**: Fastest, requires trust in allowlisted attestors
+//! - **EthMerkleReceiptProof**: Cryptographic verification using Merkle Patricia Trie proofs
+//!   (requires `merkle-proofs` feature)
+//! - **Future**: Light client verification for fully trust-minimized bridging
 
 pub mod eth_adapter;
+pub mod eth_merkle;
 pub mod external_proof_api;
 pub mod external_proof_reconciler;
 pub mod intent_api;
@@ -30,6 +40,7 @@ pub use eth_adapter::{
     ExternalVerifier, ExternalVerifyError, MockVerifier, VerifiedEvent,
     DEFAULT_MIN_CONFIRMATIONS_MAINNET, DEFAULT_MIN_CONFIRMATIONS_TESTNET,
 };
+pub use eth_merkle::{verify_eth_receipt_merkle_proof, EthMerkleVerifyError, MerkleVerifiedEvent};
 pub use external_proof_api::{
     BindProofResponse, ExternalProofApi, ExternalProofApiError, IntentProofsVerifiedResponse,
     ListProofsQuery, ListProofsResponse, ProofCountsResponse, ProofListItem, ProofStatusResponse,

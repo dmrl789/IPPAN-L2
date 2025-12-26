@@ -23,11 +23,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 ed25519-dalek = { version = "2", optional = true }
+# Ethereum RLP and Merkle Patricia Trie verification
+alloy-rlp = { version = "0.3", optional = true }
+alloy-primitives = { version = "0.8", optional = true }
+sha3 = { version = "0.10", optional = true }
+blake3 = { version = "1", optional = true }
 
 [features]
 default = []
 ## Enable Ed25519 signature verification for external proof attestations.
 signed-envelopes = ["dep:ed25519-dalek", "l2-core/signed-envelopes"]
+## Enable Ethereum Merkle Patricia Trie receipt proof verification.
+merkle-proofs = ["dep:alloy-rlp", "dep:alloy-primitives", "dep:sha3", "dep:blake3"]
 
 [dev-dependencies]
 tempfile = "3"

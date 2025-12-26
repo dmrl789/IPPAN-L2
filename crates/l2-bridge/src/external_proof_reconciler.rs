@@ -12,8 +12,9 @@
 //! verification work. Use HA leader election to coordinate.
 
 use crate::eth_adapter::{ExternalVerifier, ExternalVerifyError};
-use l2_core::{ExternalEventProofV1, ExternalProofId, ExternalProofState};
-use l2_storage::ExternalProofStorage;
+use crate::eth_merkle::verify_eth_receipt_merkle_proof;
+use l2_core::{ExternalEventProofV1, ExternalProofId, ExternalProofState, VerificationMode};
+use l2_storage::{ExternalProofStorage, VerifiedSummary};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,12 @@ pub struct ExternalProofReconcilerConfig {
 
     /// Whether the reconciler is enabled.
     pub enabled: bool,
+
+    /// Minimum confirmations required for mainnet Merkle proofs.
+    pub min_confirmations_mainnet: u32,
+
+    /// Minimum confirmations required for testnet Merkle proofs.
+    pub min_confirmations_testnet: u32,
 }
 
 impl Default for ExternalProofReconcilerConfig {
@@ -39,6 +46,8 @@ impl Default for ExternalProofReconcilerConfig {
             poll_interval_ms: 5_000, // 5 seconds
             max_proofs_per_cycle: 100,
             enabled: true,
+            min_confirmations_mainnet: 12,
+            min_confirmations_testnet: 6,
         }
     }
 }
@@ -61,10 +70,22 @@ impl ExternalProofReconcilerConfig {
             .map(|s| s.to_lowercase() != "false" && s != "0")
             .unwrap_or(true);
 
+        let min_confirmations_mainnet = std::env::var("MERKLE_PROOF_MIN_CONFIRMATIONS_MAINNET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+
+        let min_confirmations_testnet = std::env::var("MERKLE_PROOF_MIN_CONFIRMATIONS_TESTNET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+
         Self {
             poll_interval_ms,
             max_proofs_per_cycle,
             enabled,
+            min_confirmations_mainnet,
+            min_confirmations_testnet,
         }
     }
 }
@@ -311,7 +332,8 @@ async fn run_reconcile_cycle(
 
     // Process each unverified proof
     for entry in &unverified {
-        let result = verify_and_update(storage, verifier, &entry.proof_id, &entry.proof).await;
+        let result =
+            verify_and_update(config, storage, verifier, &entry.proof_id, &entry.proof).await;
         match result {
             VerifyUpdateResult::Verified => {
                 verified += 1;
@@ -346,27 +368,46 @@ enum VerifyUpdateResult {
     Error,
 }
 
+/// Internal result of proof verification.
+struct VerificationSuccess {
+    mode: VerificationMode,
+    block_number: u64,
+    log_index: u32,
+    data_hash: [u8; 32],
+}
+
 /// Verify a proof and update its state.
+///
+/// Handles both attestation and Merkle proof verification modes.
 async fn verify_and_update(
+    config: &ExternalProofReconcilerConfig,
     storage: &ExternalProofStorage,
     verifier: &dyn ExternalVerifier,
     proof_id: &ExternalProofId,
     proof: &ExternalEventProofV1,
 ) -> VerifyUpdateResult {
-    // Run verification (no binding check - that's done at intent prepare time)
-    let result = verifier.verify(proof, None);
-
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let now_ms = u64::try_from(now_ms).unwrap_or(u64::MAX);
 
-    match result {
-        Ok(_verified_event) => {
-            // Update state to Verified
-            let new_state = ExternalProofState::verified(now_ms);
-            if let Err(e) = storage.set_proof_state(proof_id, new_state) {
+    // Verify based on mode
+    let verification_result = verify_by_mode(config, verifier, proof);
+
+    match verification_result {
+        Ok(success) => {
+            // Create verified summary
+            let summary = VerifiedSummary {
+                mode: success.mode,
+                block_number: success.block_number,
+                log_index: success.log_index,
+                event_data_hash: success.data_hash,
+                verified_at_ms: now_ms,
+            };
+
+            // Update state to Verified with summary
+            if let Err(e) = storage.set_proof_verified_with_summary(proof_id, now_ms, summary) {
                 warn!(
                     proof_id = %proof_id,
                     error = %e,
@@ -374,9 +415,83 @@ async fn verify_and_update(
                 );
                 return VerifyUpdateResult::Error;
             }
-            debug!(proof_id = %proof_id, "proof verified");
+
+            debug!(
+                proof_id = %proof_id,
+                mode = %success.mode.name(),
+                block_number = success.block_number,
+                "proof verified"
+            );
             VerifyUpdateResult::Verified
         }
+        Err(VerifyModeError::Permanent(reason)) => {
+            // Permanent rejection - update state
+            let new_state = ExternalProofState::rejected(reason.clone(), now_ms);
+            if let Err(update_err) = storage.set_proof_state(proof_id, new_state) {
+                warn!(
+                    proof_id = %proof_id,
+                    error = %update_err,
+                    "failed to update proof state to rejected"
+                );
+                return VerifyUpdateResult::Error;
+            }
+            warn!(
+                proof_id = %proof_id,
+                reason = %reason,
+                "proof rejected"
+            );
+            VerifyUpdateResult::Rejected
+        }
+        Err(VerifyModeError::Transient(reason)) => {
+            // Transient error - log but don't update state (retry later)
+            warn!(
+                proof_id = %proof_id,
+                error = %reason,
+                "proof verification error (will retry)"
+            );
+            VerifyUpdateResult::Error
+        }
+    }
+}
+
+/// Error from mode-aware verification.
+enum VerifyModeError {
+    /// Permanent failure - proof should be rejected.
+    Permanent(String),
+    /// Transient failure - should retry later.
+    Transient(String),
+}
+
+/// Verify a proof based on its verification mode.
+fn verify_by_mode(
+    config: &ExternalProofReconcilerConfig,
+    verifier: &dyn ExternalVerifier,
+    proof: &ExternalEventProofV1,
+) -> Result<VerificationSuccess, VerifyModeError> {
+    match proof.verification_mode() {
+        VerificationMode::Attestation => {
+            // Use the attestation verifier
+            verify_attestation(verifier, proof)
+        }
+        VerificationMode::EthMerkleReceiptProof => {
+            // Use the Merkle proof verifier
+            verify_merkle_proof(config, proof)
+        }
+    }
+}
+
+/// Verify an attestation proof using the ExternalVerifier.
+fn verify_attestation(
+    verifier: &dyn ExternalVerifier,
+    proof: &ExternalEventProofV1,
+) -> Result<VerificationSuccess, VerifyModeError> {
+    match verifier.verify(proof, None) {
+        Ok(verified_event) => Ok(VerificationSuccess {
+            mode: VerificationMode::Attestation,
+            block_number: verified_event.block_number,
+            log_index: verified_event.log_index,
+            data_hash: verified_event.data_hash,
+        }),
         Err(e) => {
             // Determine if this is a permanent rejection or transient error
             let is_permanent = matches!(
@@ -388,31 +503,63 @@ async fn verify_and_update(
             );
 
             if is_permanent {
-                // Permanent rejection - update state
-                let new_state = ExternalProofState::rejected(e.to_string(), now_ms);
-                if let Err(update_err) = storage.set_proof_state(proof_id, new_state) {
-                    warn!(
-                        proof_id = %proof_id,
-                        error = %update_err,
-                        "failed to update proof state to rejected"
-                    );
-                    return VerifyUpdateResult::Error;
-                }
-                warn!(
-                    proof_id = %proof_id,
-                    reason = %e,
-                    "proof rejected"
-                );
-                VerifyUpdateResult::Rejected
+                Err(VerifyModeError::Permanent(e.to_string()))
             } else {
-                // Transient error - log but don't update state (retry later)
-                warn!(
-                    proof_id = %proof_id,
-                    error = %e,
-                    "proof verification error (will retry)"
-                );
-                VerifyUpdateResult::Error
+                Err(VerifyModeError::Transient(e.to_string()))
             }
+        }
+    }
+}
+
+/// Verify a Merkle proof using the eth_merkle verifier.
+fn verify_merkle_proof(
+    config: &ExternalProofReconcilerConfig,
+    proof: &ExternalEventProofV1,
+) -> Result<VerificationSuccess, VerifyModeError> {
+    // Extract the Merkle proof variant
+    let merkle_proof = match proof {
+        ExternalEventProofV1::EthReceiptMerkleProofV1(p) => p,
+        _ => {
+            return Err(VerifyModeError::Permanent(
+                "expected EthReceiptMerkleProofV1 for Merkle verification mode".to_string(),
+            ));
+        }
+    };
+
+    // Check confirmation policy
+    let min_confirmations = if merkle_proof.chain.is_mainnet() {
+        config.min_confirmations_mainnet
+    } else {
+        config.min_confirmations_testnet
+    };
+
+    // Use confirmations from the proof if provided
+    if let Some(confirmations) = merkle_proof.confirmations {
+        if confirmations < min_confirmations {
+            return Err(VerifyModeError::Transient(format!(
+                "insufficient confirmations: {} < {} required",
+                confirmations, min_confirmations
+            )));
+        }
+    }
+    // Note: If confirmations is None, we proceed without confirmation check.
+    // This allows proofs to be verified cryptographically without RPC-based confirmation tracking.
+    // Policy can be enforced at a higher level (e.g., API or intent binding).
+
+    // Verify the cryptographic proof
+    match verify_eth_receipt_merkle_proof(merkle_proof) {
+        Ok(verified) => Ok(VerificationSuccess {
+            mode: VerificationMode::EthMerkleReceiptProof,
+            block_number: verified.block_number,
+            log_index: verified.log_index,
+            data_hash: verified.data_hash,
+        }),
+        Err(e) => {
+            // All Merkle proof errors are permanent (cryptographic verification failed)
+            Err(VerifyModeError::Permanent(format!(
+                "merkle proof verification failed: {}",
+                e
+            )))
         }
     }
 }
@@ -484,6 +631,8 @@ mod tests {
         assert_eq!(config.poll_interval_ms, 5_000);
         assert_eq!(config.max_proofs_per_cycle, 100);
         assert!(config.enabled);
+        assert_eq!(config.min_confirmations_mainnet, 12);
+        assert_eq!(config.min_confirmations_testnet, 6);
     }
 
     // ========== Metrics Tests ==========

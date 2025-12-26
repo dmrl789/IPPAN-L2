@@ -104,6 +104,11 @@ fn test_submit_request(suffix: u8) -> SubmitProofRequest {
         confirmations: Some(15),
         attestor_pubkey: Some(hex::encode([0x11; 32])),
         signature: Some(hex::encode([0x22; 64])),
+        tx_index: None,
+        header_rlp: None,
+        receipt_rlp: None,
+        proof_nodes: None,
+        tip_block_number: None,
     }
 }
 
