@@ -18,6 +18,10 @@ ignore = [
     # idna 0.4.0 - Punycode label issue, comes from ethers/url dependency chain
     # Waiting for ethers to update their url dependency
     "RUSTSEC-2024-0421",
+    # TEMP: transitive unmaintained advisory for `paste` pulled in via alloy-primitives.
+    # No safe upgrade is currently available in this dependency chain.
+    # TODO: remove once alloy-primitives (or its upstream) stops depending on `paste` or ships a maintained replacement.
+    "RUSTSEC-2024-0436",
     # ring 0.16.20 - AES panic on overflow, comes from ethers/rustls dependency chain
     # ethers uses older rustls which depends on ring 0.16.x
     "RUSTSEC-2025-0009",
@@ -29,6 +33,9 @@ ignore = [
     "RUSTSEC-2024-0384",
     # rustls-pemfile unmaintained - transitive from reqwest/rustls
     "RUSTSEC-2025-0134",
+    # TEMP: transitive advisory with no upstream fix yet (ruint via alloy-primitives).
+    # TODO: remove once alloy-primitives/ruint publishes a fixed release resolving RUSTSEC-2025-0137.
+    "RUSTSEC-2025-0137",
 ]
 
 [licenses]
