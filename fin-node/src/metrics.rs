@@ -469,6 +469,170 @@ pub static BOOTSTRAP_ROLLBACK_BLOCKED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+// ============================================================
+// L2 Multi-Hub Metrics
+// These metrics are registered for future multi-hub batcher integration.
+// ============================================================
+
+#[allow(dead_code)]
+pub static L2_QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new("l2_queue_depth", "L2 transaction queue depth per hub"),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+#[allow(dead_code)]
+pub static L2_FORCED_QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "l2_forced_queue_depth",
+            "L2 forced transaction queue depth per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+#[allow(dead_code)]
+pub static L2_BATCHES_CREATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "l2_batches_created_total",
+            "Total L2 batches created per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+#[allow(dead_code)]
+pub static L2_BATCHES_SUBMITTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "l2_batches_submitted_total",
+            "Total L2 batches submitted per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+#[allow(dead_code)]
+pub static L2_BATCHES_FINALISED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "l2_batches_finalised_total",
+            "Total L2 batches finalised per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+#[allow(dead_code)]
+pub static L2_IN_FLIGHT_BATCHES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "l2_in_flight_batches",
+            "L2 in-flight batches (submitted but not finalised) per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+#[allow(dead_code)]
+pub static L2_M2M_FEE_FINALISED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "l2_m2m_fee_finalised_total",
+            "Total M2M fees finalised (scaled, M2M hub only)",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+#[allow(dead_code)]
+pub static L2_ORGANISER_CHOSEN_HUB: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "l2_organiser_chosen_hub",
+            "Last organiser chosen hub (1 for chosen, 0 otherwise)",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(g.clone())).expect("register");
+    g
+});
+
+#[allow(dead_code)]
+pub static L2_ORGANISER_DECISIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::with_opts(Opts::new(
+        "l2_organiser_decisions_total",
+        "Total organiser V2 decisions made",
+    ))
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+#[allow(dead_code)]
+pub static L2_TXS_RECEIVED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "l2_txs_received_total",
+            "Total L2 transactions received per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+#[allow(dead_code)]
+pub static L2_TXS_BATCHED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "l2_txs_batched_total",
+            "Total L2 transactions batched per hub",
+        ),
+        &["hub"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+/// Update L2 organiser chosen hub metric.
+#[allow(dead_code)]
+pub fn set_l2_chosen_hub(chosen_hub: &str) {
+    // Clear all and set chosen
+    for hub in &["fin", "data", "m2m", "world", "bridge"] {
+        L2_ORGANISER_CHOSEN_HUB
+            .with_label_values(&[hub])
+            .set(if *hub == chosen_hub { 1 } else { 0 });
+    }
+}
+
 pub fn gather_text() -> String {
     PROCESS_UPTIME_SECONDS.set(START.elapsed().as_secs_f64());
     let mf = REGISTRY.gather();
