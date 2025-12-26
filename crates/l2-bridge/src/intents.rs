@@ -129,6 +129,15 @@ pub enum IntentRouterError {
 
     #[error("hub execution error: {hub}: {message}")]
     HubExecution { hub: String, message: String },
+
+    #[error("external proof not verified: {proof_id}")]
+    ExternalProofNotVerified { proof_id: String },
+
+    #[error("external proof storage error: {0}")]
+    ExternalProofStorage(String),
+
+    #[error("external proof required but none bound to intent")]
+    ExternalProofRequired,
 }
 
 /// Result of creating an intent.
@@ -317,6 +326,57 @@ impl FinalityChecker for MockFinalityChecker {
     }
 }
 
+/// Trait for checking external proof verification status.
+pub trait ExternalProofChecker: Send + Sync {
+    /// Check if all proofs bound to an intent are verified.
+    ///
+    /// Returns `Ok(true)` if there are proofs and all are verified.
+    /// Returns `Ok(false)` if no proofs or any are unverified.
+    fn all_proofs_verified(&self, intent_id: &IntentId) -> Result<bool, IntentRouterError>;
+
+    /// Check if an intent requires external proofs.
+    ///
+    /// Returns true if the intent kind requires external proof verification.
+    fn requires_proof(&self, intent: &Intent) -> bool;
+}
+
+/// Mock external proof checker for testing.
+pub struct MockExternalProofChecker {
+    /// Whether to report proofs as verified.
+    pub proofs_verified: bool,
+}
+
+impl Default for MockExternalProofChecker {
+    fn default() -> Self {
+        Self {
+            proofs_verified: true,
+        }
+    }
+}
+
+impl ExternalProofChecker for MockExternalProofChecker {
+    fn all_proofs_verified(&self, _intent_id: &IntentId) -> Result<bool, IntentRouterError> {
+        Ok(self.proofs_verified)
+    }
+
+    fn requires_proof(&self, intent: &Intent) -> bool {
+        intent.kind.requires_external_proof()
+    }
+}
+
+/// No-op external proof checker that never requires proofs.
+pub struct NoopExternalProofChecker;
+
+impl ExternalProofChecker for NoopExternalProofChecker {
+    fn all_proofs_verified(&self, _intent_id: &IntentId) -> Result<bool, IntentRouterError> {
+        Ok(true)
+    }
+
+    fn requires_proof(&self, _intent: &Intent) -> bool {
+        false
+    }
+}
+
 /// The BRIDGE Intent Router.
 ///
 /// Coordinates cross-hub atomic operations using a deterministic 2PC protocol.
@@ -332,6 +392,9 @@ pub struct IntentRouter {
 
     /// Finality checker for prepare phase.
     finality_checker: Arc<dyn FinalityChecker>,
+
+    /// External proof checker for proof-gated intents.
+    external_proof_checker: Arc<dyn ExternalProofChecker>,
 }
 
 impl IntentRouter {
@@ -346,7 +409,29 @@ impl IntentRouter {
             policy,
             executors: std::collections::HashMap::new(),
             finality_checker,
+            external_proof_checker: Arc::new(NoopExternalProofChecker),
         }
+    }
+
+    /// Create a new intent router with external proof checking.
+    pub fn with_external_proof_checker(
+        storage: IntentStorage,
+        policy: IntentPolicy,
+        finality_checker: Arc<dyn FinalityChecker>,
+        external_proof_checker: Arc<dyn ExternalProofChecker>,
+    ) -> Self {
+        Self {
+            storage,
+            policy,
+            executors: std::collections::HashMap::new(),
+            finality_checker,
+            external_proof_checker,
+        }
+    }
+
+    /// Set the external proof checker.
+    pub fn set_external_proof_checker(&mut self, checker: Arc<dyn ExternalProofChecker>) {
+        self.external_proof_checker = checker;
     }
 
     /// Register a hub executor.
@@ -417,6 +502,9 @@ impl IntentRouter {
     /// Prepare an intent.
     ///
     /// Executes the prepare phase on both hubs, acquiring locks/reserves.
+    ///
+    /// For intents requiring external proofs (e.g., `ExternalLockAndMint`),
+    /// all bound proofs must be in `Verified` state before prepare can proceed.
     pub async fn prepare_intent(
         &self,
         intent_id: &IntentId,
@@ -442,6 +530,25 @@ impl IntentRouter {
                     current_ms,
                 });
             }
+        }
+
+        // Check external proof verification for proof-gated intents
+        if self.external_proof_checker.requires_proof(intent) {
+            let proofs_verified = self.external_proof_checker.all_proofs_verified(intent_id)?;
+            if !proofs_verified {
+                info!(
+                    intent_id = %intent_id,
+                    kind = %intent.kind,
+                    "prepare blocked: external proof(s) not verified"
+                );
+                return Err(IntentRouterError::ExternalProofNotVerified {
+                    proof_id: intent_id.to_hex(),
+                });
+            }
+            debug!(
+                intent_id = %intent_id,
+                "external proof(s) verified, proceeding with prepare"
+            );
         }
 
         // Get executors for both hubs

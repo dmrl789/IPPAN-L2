@@ -71,6 +71,23 @@ pub enum IntentKind {
     /// Burn-and-unlock: burn representation in from_hub, unlock original in to_hub.
     /// Example: burn wrapped asset in WORLD, unlock original in FIN
     BurnAndUnlock,
+
+    /// External lock-and-mint: verify external chain lock, mint representation in to_hub.
+    ///
+    /// This intent type requires an external proof to be verified before the
+    /// prepare phase can proceed. The from_hub is set to BRIDGE, and the
+    /// operation is gated on proof verification.
+    ///
+    /// Example: verify ETH lock on Ethereum, mint wETH in FIN
+    ExternalLockAndMint,
+
+    /// External burn-and-unlock: burn representation in from_hub, submit unlock to external chain.
+    ///
+    /// This intent type burns the wrapped asset and produces an unlock attestation
+    /// that can be submitted to the external chain.
+    ///
+    /// Example: burn wETH in FIN, produce unlock attestation for Ethereum
+    ExternalBurnAndUnlock,
 }
 
 impl IntentKind {
@@ -80,6 +97,8 @@ impl IntentKind {
             IntentKind::CrossHubTransfer => "cross_hub_transfer",
             IntentKind::LockAndMint => "lock_and_mint",
             IntentKind::BurnAndUnlock => "burn_and_unlock",
+            IntentKind::ExternalLockAndMint => "external_lock_and_mint",
+            IntentKind::ExternalBurnAndUnlock => "external_burn_and_unlock",
         }
     }
 
@@ -89,8 +108,27 @@ impl IntentKind {
             "cross_hub_transfer" | "crosshubtransfer" => Some(IntentKind::CrossHubTransfer),
             "lock_and_mint" | "lockandmint" => Some(IntentKind::LockAndMint),
             "burn_and_unlock" | "burnandunlock" => Some(IntentKind::BurnAndUnlock),
+            "external_lock_and_mint" | "externallockandmint" => {
+                Some(IntentKind::ExternalLockAndMint)
+            }
+            "external_burn_and_unlock" | "externalburnandunlock" => {
+                Some(IntentKind::ExternalBurnAndUnlock)
+            }
             _ => None,
         }
+    }
+
+    /// Check if this intent kind requires external proof verification.
+    pub fn requires_external_proof(&self) -> bool {
+        matches!(self, IntentKind::ExternalLockAndMint)
+    }
+
+    /// Check if this is an external chain operation.
+    pub fn is_external(&self) -> bool {
+        matches!(
+            self,
+            IntentKind::ExternalLockAndMint | IntentKind::ExternalBurnAndUnlock
+        )
     }
 }
 
@@ -402,6 +440,103 @@ pub struct BurnAndUnlockPayload {
 }
 
 impl BurnAndUnlockPayload {
+    /// Encode to canonical bytes for embedding in Intent.payload.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CanonicalError> {
+        canonical_encode(self)
+    }
+
+    /// Decode from canonical bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalError> {
+        crate::canonical_decode(bytes)
+    }
+}
+
+/// Payload for an external lock-and-mint intent.
+///
+/// This represents a lock event on an external chain (e.g., Ethereum) that
+/// should result in minting a wrapped asset on an IPPAN hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalLockAndMintPayload {
+    /// External chain identifier (e.g., EthereumMainnet).
+    pub external_chain: String,
+
+    /// Asset identifier on the external chain (e.g., contract address).
+    pub external_asset: String,
+
+    /// Amount locked on the external chain (in smallest units).
+    pub amount: u64,
+
+    /// Recipient account on the IPPAN hub.
+    pub recipient: String,
+
+    /// Wrapped/synthetic asset identifier to mint on the IPPAN hub.
+    pub wrapped_asset_id: String,
+
+    /// External proof ID that verifies the lock event.
+    ///
+    /// This proof must be in Verified state before the intent can be prepared.
+    pub proof_id: String,
+
+    /// Optional memo/reference.
+    pub memo: Option<String>,
+}
+
+impl ExternalLockAndMintPayload {
+    /// Encode to canonical bytes for embedding in Intent.payload.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CanonicalError> {
+        canonical_encode(self)
+    }
+
+    /// Decode from canonical bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalError> {
+        crate::canonical_decode(bytes)
+    }
+
+    /// Get the proof ID as bytes (for lookup).
+    pub fn proof_id_bytes(&self) -> Result<[u8; 32], CanonicalError> {
+        let bytes = hex::decode(&self.proof_id)
+            .map_err(|e| CanonicalError::FromHex(format!("invalid proof_id hex: {}", e)))?;
+        if bytes.len() != 32 {
+            return Err(CanonicalError::FromHex(format!(
+                "expected 32-byte proof_id, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+/// Payload for an external burn-and-unlock intent.
+///
+/// This represents burning a wrapped asset on an IPPAN hub to produce
+/// an unlock attestation for the external chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalBurnAndUnlockPayload {
+    /// External chain identifier to unlock on.
+    pub external_chain: String,
+
+    /// Wrapped asset identifier on the IPPAN hub (to burn).
+    pub wrapped_asset_id: String,
+
+    /// Original asset identifier on the external chain.
+    pub external_asset: String,
+
+    /// Amount to burn/unlock (in smallest units).
+    pub amount: u64,
+
+    /// Account burning the wrapped asset on the IPPAN hub.
+    pub burner: String,
+
+    /// Recipient address on the external chain.
+    pub external_recipient: String,
+
+    /// Optional memo/reference.
+    pub memo: Option<String>,
+}
+
+impl ExternalBurnAndUnlockPayload {
     /// Encode to canonical bytes for embedding in Intent.payload.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CanonicalError> {
         canonical_encode(self)

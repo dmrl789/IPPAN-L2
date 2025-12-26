@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod batch_envelope;
 pub mod canonical;
+pub mod external_proof;
 pub mod fees;
 pub mod finality;
 pub mod forced_inclusion;
@@ -34,10 +35,15 @@ pub use canonical::{
     canonical_decode, canonical_encode, canonical_hash, canonical_hash_bytes, Batch,
     CanonicalError, ChainId, Hash32, Receipt, Tx,
 };
+pub use external_proof::{
+    AttestationData, EthReceiptAttestationV1, EthReceiptMerkleProofV1, ExternalChainId,
+    ExternalEventProofV1, ExternalProofId, ExternalProofState, ExternalProofValidationError,
+    EXTERNAL_PROOF_SIGNING_DOMAIN_V1,
+};
 pub use intent::{
-    BurnAndUnlockPayload, CommitReceipt, CrossHubTransferPayload, Intent, IntentHubTx, IntentId,
-    IntentKind, IntentPhase, IntentSettlementTx, IntentValidationError, LockAndMintPayload,
-    PrepareReceipt,
+    BurnAndUnlockPayload, CommitReceipt, CrossHubTransferPayload, ExternalBurnAndUnlockPayload,
+    ExternalLockAndMintPayload, Intent, IntentHubTx, IntentId, IntentKind, IntentPhase,
+    IntentSettlementTx, IntentValidationError, LockAndMintPayload, PrepareReceipt,
 };
 pub use organiser::{
     NoopOrganiser, Organiser, OrganiserDecision, OrganiserInputs, OrganiserPolicyBounds,
