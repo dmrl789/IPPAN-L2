@@ -39,16 +39,84 @@ struct Bucket {
     last_ms: u64,
 }
 
+/// Route categories for differentiated rate limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteCategory {
+    /// General read/write endpoints (default).
+    General,
+    /// Transaction submission endpoints (higher cost).
+    Submit,
+    /// Bridge proof submission (higher cost).
+    BridgeProof,
+    /// Intent operations (higher cost).
+    Intent,
+    /// Health/metrics endpoints (exempt from rate limiting).
+    Health,
+}
+
+impl RouteCategory {
+    /// Get the route category from a path.
+    pub fn from_path(path: &str) -> Self {
+        match path {
+            // Health endpoints exempt from rate limiting
+            "/healthz" | "/readyz" | "/metrics" => Self::Health,
+
+            // Submit endpoints
+            "/fin/actions" | "/data/datasets" | "/data/licenses" | "/data/attestations"
+            | "/data/listings" | "/data/allowlist/licensors" | "/data/allowlist/attestors" => {
+                Self::Submit
+            }
+
+            // Bridge proof endpoints
+            p if p.starts_with("/bridge/proofs") => Self::BridgeProof,
+
+            // Intent endpoints
+            "/linkage/buy-license" => Self::Intent,
+            p if p.starts_with("/bridge/intent") => Self::Intent,
+
+            // All other endpoints
+            _ => Self::General,
+        }
+    }
+
+    /// Get the cost multiplier for this route category.
+    /// Higher cost means fewer allowed requests.
+    pub fn cost_multiplier(&self) -> u32 {
+        match self {
+            Self::Health => 0, // Free (not rate limited)
+            Self::General => 1,
+            Self::Submit => 2,
+            Self::BridgeProof => 3,
+            Self::Intent => 2,
+        }
+    }
+
+    /// Get a label for metrics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Health => "health",
+            Self::General => "general",
+            Self::Submit => "submit",
+            Self::BridgeProof => "bridge_proof",
+            Self::Intent => "intent",
+        }
+    }
+}
+
 /// Simple in-memory token bucket rate limiter (best-effort).
 ///
 /// Notes:
 /// - Per-process only (not distributed).
 /// - Deterministic tests via injected time source.
+/// - Integer-only timers (no jitter or random backoff).
+/// - Route-aware cost multipliers.
 pub struct RateLimiter<T: TimeSource> {
     cfg: RateLimitConfig,
     time: T,
     per_ip: Mutex<HashMap<String, Bucket>>,
     per_actor: Mutex<HashMap<String, Bucket>>,
+    /// Per-route category buckets (for differentiated limits).
+    per_route: Mutex<HashMap<(String, RouteCategory), Bucket>>,
 }
 
 impl<T: TimeSource> RateLimiter<T> {
@@ -58,6 +126,7 @@ impl<T: TimeSource> RateLimiter<T> {
             time,
             per_ip: Mutex::new(HashMap::new()),
             per_actor: Mutex::new(HashMap::new()),
+            per_route: Mutex::new(HashMap::new()),
         }
     }
 
@@ -66,14 +135,41 @@ impl<T: TimeSource> RateLimiter<T> {
     }
 
     pub fn check_ip(&self, ip: &str) -> Decision {
-        self.check(&self.per_ip, ip)
+        self.check(&self.per_ip, ip, 1)
     }
 
     pub fn check_actor(&self, actor: &str) -> Decision {
-        self.check(&self.per_actor, actor)
+        self.check(&self.per_actor, actor, 1)
     }
 
-    fn check(&self, map: &Mutex<HashMap<String, Bucket>>, key: &str) -> Decision {
+    /// Check rate limit for a specific route category.
+    /// Uses the route's cost multiplier for differentiated limiting.
+    pub fn check_route(&self, ip: &str, path: &str) -> Decision {
+        let category = RouteCategory::from_path(path);
+
+        // Health endpoints are never rate limited
+        if category == RouteCategory::Health {
+            return Decision {
+                allowed: true,
+                retry_after_secs: 0,
+            };
+        }
+
+        let cost = category.cost_multiplier();
+        if cost == 0 {
+            return Decision {
+                allowed: true,
+                retry_after_secs: 0,
+            };
+        }
+
+        // Use combined key for route-specific tracking
+        let key = format!("{}:{}", ip, category.label());
+        self.check(&self.per_ip, &key, cost)
+    }
+
+    /// Check with a cost multiplier (1 = standard, 2 = double cost, etc.).
+    fn check(&self, map: &Mutex<HashMap<String, Bucket>>, key: &str, cost: u32) -> Decision {
         if !self.cfg.enabled {
             return Decision {
                 allowed: true,
@@ -88,13 +184,16 @@ impl<T: TimeSource> RateLimiter<T> {
             key
         };
 
-        // Fixed-point token arithmetic.
+        // Fixed-point token arithmetic (deterministic, integer-only).
         const SCALE: u128 = 1_000_000;
         let cap = u128::from(self.cfg.burst.max(1)) * SCALE;
         let rate_per_min = u128::from(self.cfg.requests_per_minute.max(1));
         let rate_per_ms = rate_per_min * SCALE / 60_000;
         // If rate is extremely low, force a minimum so retry calculation doesn't divide by zero.
         let rate_per_ms = rate_per_ms.max(1);
+
+        // Cost multiplier for differentiated routes
+        let token_cost = SCALE * u128::from(cost.max(1));
 
         let now = self.time.now_millis();
         let mut guard = map.lock().expect("rate limiter mutex poisoned");
@@ -103,7 +202,7 @@ impl<T: TimeSource> RateLimiter<T> {
             last_ms: now,
         });
 
-        // Refill.
+        // Refill (deterministic, no jitter).
         let elapsed = now.saturating_sub(b.last_ms);
         if elapsed > 0 {
             let refill = u128::from(elapsed) * rate_per_ms;
@@ -111,15 +210,15 @@ impl<T: TimeSource> RateLimiter<T> {
             b.last_ms = now;
         }
 
-        if b.tokens_scaled >= SCALE {
-            b.tokens_scaled -= SCALE;
+        if b.tokens_scaled >= token_cost {
+            b.tokens_scaled -= token_cost;
             Decision {
                 allowed: true,
                 retry_after_secs: 0,
             }
         } else {
-            let missing = SCALE - b.tokens_scaled;
-            // millis until next whole token.
+            let missing = token_cost.saturating_sub(b.tokens_scaled);
+            // millis until enough tokens (deterministic).
             let wait_ms = missing.div_ceil(rate_per_ms);
             let retry_after_secs_u128 = wait_ms.div_ceil(1000).max(1);
             let retry_after_secs = u64::try_from(retry_after_secs_u128).unwrap_or(u64::MAX);
@@ -128,6 +227,11 @@ impl<T: TimeSource> RateLimiter<T> {
                 retry_after_secs,
             }
         }
+    }
+
+    /// Get configuration (for observability).
+    pub fn config(&self) -> &RateLimitConfig {
+        &self.cfg
     }
 }
 

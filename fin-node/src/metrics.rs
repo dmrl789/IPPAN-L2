@@ -120,6 +120,45 @@ pub static RATE_LIMITED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static HTTP_RATE_LIMITED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "http_rate_limited_total",
+            "Total HTTP requests rate-limited by route",
+        ),
+        &["route"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static SECURITY_AUTH_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "security_auth_failures_total",
+            "Total authentication failures",
+        ),
+        &["route", "reason"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
+pub static SECURITY_ROUTE_GATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "security_route_gated_total",
+            "Total requests blocked by security mode gating",
+        ),
+        &["route"],
+    )
+    .expect("metric");
+    REGISTRY.register(Box::new(c.clone())).expect("register");
+    c
+});
+
 pub static PAYLOAD_REJECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("payload_rejected_total", "Total rejected payloads"),

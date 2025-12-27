@@ -1,27 +1,95 @@
 # IPPAN-L2 Docker Compose
-# Local development stack
+# Development and production stack configurations
+#
+# Usage:
+#   Development: docker compose up fin-node
+#   Production:  docker compose --profile prod up -d
+#   With monitoring: docker compose --profile monitoring up -d
+#
+# Profiles:
+#   - default: fin-node only
+#   - prod: fin-node with production settings
+#   - oracle: oracle daemon
+#   - monitoring: prometheus + grafana (optional)
 
 version: "3.8"
 
 services:
-  # FIN Node (service mode: health/ready/metrics)
+  # ==============================================================================
+  # FIN Node - Main L2 node
+  # ==============================================================================
   fin-node:
     build:
       context: .
-      dockerfile: Dockerfile.fin-node
+      dockerfile: Dockerfile
+      target: fin-node
     volumes:
       - ./configs:/app/configs:ro
-      - ./receipts:/app/receipts
+      - fin-data:/var/lib/ippan-l2
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - IPPAN_L2_CONFIG=/app/configs/${CONFIG_FILE:-local.toml}
+      - L1_BASE_URL=${L1_BASE_URL:-http://host.docker.internal:8080}
+      - L1_API_KEY=${L1_API_KEY:-}
+      - L1_ENDPOINT_CHAIN_STATUS=${L1_ENDPOINT_CHAIN_STATUS:-}
+      - L1_ENDPOINT_SUBMIT_BATCH=${L1_ENDPOINT_SUBMIT_BATCH:-}
+      - L1_ENDPOINT_GET_INCLUSION=${L1_ENDPOINT_GET_INCLUSION:-}
+      - L1_ENDPOINT_GET_FINALITY=${L1_ENDPOINT_GET_FINALITY:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+    command: ["--l1-mode", "http", "run"]
+    ports:
+      - "${FIN_NODE_PORT:-3000}:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/fin-node", "l1", "check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ==============================================================================
+  # FIN Node - Production mode
+  # ==============================================================================
+  fin-node-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: fin-node
+    volumes:
+      - ./configs:/app/configs:ro
+      - fin-data-prod:/var/lib/ippan-l2
     environment:
       - RUST_LOG=info
-      - IPPAN_L2_CONFIG=/app/configs/local.toml
-    command: ["run"]
+      - IPPAN_L2_CONFIG=/app/configs/prod.toml
+      - L1_BASE_URL=${L1_BASE_URL}
+      - L1_API_KEY=${L1_API_KEY}
+      - L1_ENDPOINT_CHAIN_STATUS=${L1_ENDPOINT_CHAIN_STATUS}
+      - L1_ENDPOINT_SUBMIT_BATCH=${L1_ENDPOINT_SUBMIT_BATCH}
+      - L1_ENDPOINT_GET_INCLUSION=${L1_ENDPOINT_GET_INCLUSION}
+      - L1_ENDPOINT_GET_FINALITY=${L1_ENDPOINT_GET_FINALITY}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+    command: ["--l1-mode", "http", "run"]
     ports:
       - "3000:3000"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "/app/fin-node", "l1", "check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     profiles:
-      - fin
+      - prod
 
-  # Oracle Daemon
+  # ==============================================================================
+  # Oracle Daemon - Ethereum event watcher
+  # ==============================================================================
   oracle-daemon:
     build:
       context: .
@@ -30,13 +98,59 @@ services:
     volumes:
       - ./integrations/eth-oracle/configs:/app/configs:ro
     environment:
-      - RUST_LOG=info
-      - IPPAN_RPC_URL=${IPPAN_RPC_URL:-http://host.docker.internal:8080}
+      - RUST_LOG=${RUST_LOG:-info}
+      - IPPAN_RPC_URL=${IPPAN_RPC_URL:-http://fin-node:3000}
       - ETH_RPC_URL=${ETH_RPC_URL}
       - ETH_PRIVATE_KEY=${ETH_PRIVATE_KEY}
     command: ["watch", "--config", "/app/configs/devnet_sepolia.toml"]
     restart: unless-stopped
+    depends_on:
+      - fin-node
     profiles:
       - oracle
 
-volumes: {}
+  # ==============================================================================
+  # Prometheus - Metrics collection
+  # ==============================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=15d'
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # ==============================================================================
+  # Grafana - Dashboards (optional)
+  # ==============================================================================
+  grafana:
+    image: grafana/grafana:10.2.0
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+volumes:
+  fin-data:
+  fin-data-prod:
+  prometheus-data:
+  grafana-data:

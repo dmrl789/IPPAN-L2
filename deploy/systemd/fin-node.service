@@ -1,6 +1,8 @@
 [Unit]
-Description=IPPAN-L2 fin-node
-After=network.target
+Description=IPPAN-L2 FIN Node
+Documentation=https://github.com/dmrl789/IPPAN-L2
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -8,15 +10,56 @@ User=ippan
 Group=ippan
 WorkingDirectory=/opt/ippan-l2
 
-# Path to the L2 config file (do not embed secrets in the file).
+# Configuration file path (do not embed secrets in the file)
 Environment=IPPAN_L2_CONFIG=/etc/ippan-l2/config.toml
 
-# Run in real L1 HTTP mode
+# Environment file for secrets (optional, recommended for prod)
+EnvironmentFile=-/etc/ippan-l2/secrets.env
+
+# Logging
+Environment=RUST_LOG=info
+
+# Run in L1 HTTP mode
 ExecStart=/opt/ippan-l2/fin-node --l1-mode http run
 
+# Restart policy
 Restart=always
-RestartSec=3
+RestartSec=5
+RestartPreventExitStatus=255
+
+# Security hardening
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Allow write to data directories
+ReadWritePaths=/var/lib/ippan-l2
+
+# Resource limits (adjust based on hardware)
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=2G
+CPUQuota=80%
+
+# Graceful shutdown timeout
+TimeoutStopSec=30
+
+# Capabilities
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Network access
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=any
 
 [Install]
 WantedBy=multi-user.target
