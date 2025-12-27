@@ -39,7 +39,7 @@ use tempfile::tempdir;
 fn test_beacon_header(slot: u64) -> BeaconBlockHeaderV1 {
     BeaconBlockHeaderV1 {
         slot,
-        proposer_index: (slot % 100) as u64,
+        proposer_index: slot % 100,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
         body_root: [0x33; 32],
