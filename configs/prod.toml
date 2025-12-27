@@ -1,33 +1,31 @@
-# IPPAN-L2 Production Configuration Template
-# 
-# IMPORTANT: This is a template. Copy and customize for your deployment.
-# Never commit production secrets to version control.
+# IPPAN-L2 Production Configuration
+#
+# This profile is intended for production deployments with strict security.
 #
 # Usage:
-#   export IPPAN_L2_CONFIG=/etc/ippan-l2/config.toml
-#   export L1_BASE_URL=https://core.ippan.io
-#   export L1_API_KEY=your-production-api-key
-#   ./fin-node
+#   export IPPAN_L2_CONFIG=./configs/prod.toml
+#   export L1_BASE_URL=https://your-l1-rpc.example.com
+#   export L1_API_KEY=your-api-key
+#   export ADMIN_TOKEN=your-admin-token-min-32-chars
+#   cargo run -p fin-node --release -- --l1-mode http run
 #
-# All sensitive values should come from environment variables.
+# IMPORTANT:
+# - All sensitive values MUST use `env:VAR` references.
+# - Never commit secrets to version control.
 
 [node]
-label = "prod-fin-node"
+label = "prod-fin-node-1"
 
 [l1]
-# IPPAN CORE settlement endpoint
-# REQUIRED: Set via L1_BASE_URL environment variable
 base_url = "env:L1_BASE_URL"
-# API key for authentication
-# REQUIRED: Set via L1_API_KEY environment variable
 api_key = "env:L1_API_KEY"
-connect_timeout_ms = 3000
-request_timeout_ms = 10000
+connect_timeout_ms = 5000
+request_timeout_ms = 15000
 
 [l1.retry]
-max_attempts = 5
-base_delay_ms = 250
-max_delay_ms = 3000
+max_attempts = 3
+base_delay_ms = 500
+max_delay_ms = 5000
 
 [l1.endpoints]
 chain_status = "env:L1_ENDPOINT_CHAIN_STATUS"
@@ -35,90 +33,152 @@ submit_batch = "env:L1_ENDPOINT_SUBMIT_BATCH"
 get_inclusion = "env:L1_ENDPOINT_GET_INCLUSION"
 get_finality = "env:L1_ENDPOINT_GET_FINALITY"
 
+# ============================================================
+# SECURITY CONFIGURATION
+# ============================================================
+[security]
+# Production mode: strict endpoint gating, auth required for sensitive ops.
+mode = "prod"
+
+# Admin token for ops endpoints (required in prod mode, min 32 chars).
+admin_token = "env:ADMIN_TOKEN"
+
+# Allowlisted bridge proof submitter public keys (hex-encoded ed25519).
+# Empty list allows all (not recommended for prod).
+# bridge_submitters = [
+#   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# ]
+
+# Allowlisted attestor public keys (hex-encoded ed25519).
+# Empty list allows all (not recommended for prod).
+# attestor_keys = [
+#   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# ]
+
+# Request timeout (30s default, max 60s recommended for prod)
+request_timeout_ms = 30000
+
+# Maximum query string length
+max_query_string_bytes = 2048
+
+# ============================================================
+# SERVER CONFIGURATION
+# ============================================================
 [server]
-# HTTP bind address for health/metrics endpoints
-# Use 0.0.0.0 for container deployments
 bind_address = "0.0.0.0:3000"
-# Enable metrics endpoint
 metrics_enabled = true
-# Best-effort overload protection (HTTP 503 when exceeded).
 max_inflight_requests = 64
 
+# ============================================================
+# LIMITS CONFIGURATION (strict for prod)
+# ============================================================
 [limits]
-max_body_bytes = 262144
+max_body_bytes = 262144        # 256 KiB
+max_bridge_proof_bytes = 524288  # 512 KiB
 max_string_bytes = 1024
 max_tags = 32
 max_tag_bytes = 48
-max_batch_items = 256
+max_batch_items = 128
 max_receipt_bytes = 262144
-max_json_depth = 64
+max_json_depth = 32
 
+# MPT proof limits (for eth merkle proofs)
+max_mpt_proof_nodes = 24
+max_mpt_proof_bytes = 32768    # 32 KiB
+max_header_rlp_bytes = 4096    # 4 KiB
+max_receipt_rlp_bytes = 16384  # 16 KiB
+
+# ============================================================
+# RATE LIMITING (enabled for prod)
+# ============================================================
 [rate_limit]
 enabled = true
 requests_per_minute = 120
-burst = 60
+burst = 30
 
+# ============================================================
+# PAGINATION
+# ============================================================
 [pagination]
 default_limit = 50
-max_limit = 200
+max_limit = 100
 
+# ============================================================
+# RETENTION & PRUNING
+# ============================================================
 [retention]
 receipts_days = 30
 recon_failed_days = 7
+audit_days = 90
 min_receipts_keep = 1000
 
 [pruning]
 enabled = true
 interval_secs = 86400
 
+# ============================================================
+# CORS (disabled by default for prod)
+# ============================================================
 [cors]
-# Default deny. Set `enabled=true` + allow_origins when running behind a trusted gateway.
 enabled = false
 allow_origins = []
 
-[hubs]
-# Enable FIN Hub
-fin_enabled = true
-# Enable DATA Hub
-data_enabled = true
-
+# ============================================================
+# STORAGE
+# ============================================================
 [storage]
-# Persistent storage path
-# IMPORTANT: Must be on persistent volume in containerized deployments
-path = "/var/lib/ippan-l2/prod"
+receipts_dir = "/var/lib/ippan-l2/receipts"
+fin_db_dir = "/var/lib/ippan-l2/fin_db"
+data_db_dir = "/var/lib/ippan-l2/data_db"
+policy_db_dir = "/var/lib/ippan-l2/policy_db"
+recon_db_dir = "/var/lib/ippan-l2/recon_db"
+audit_db_dir = "/var/lib/ippan-l2/audit_db"
+bootstrap_db_dir = "/var/lib/ippan-l2/bootstrap_db"
 
-# fin-node storage roots (used by this repo's fin-node config loader).
-# Note: `path` above is not consumed by fin-node; prefer explicit dirs below.
-receipts_dir = "/var/lib/ippan-l2/prod/receipts"
-fin_db_dir = "/var/lib/ippan-l2/prod/fin_db"
-data_db_dir = "/var/lib/ippan-l2/prod/data_db"
-policy_db_dir = "/var/lib/ippan-l2/prod/policy_db"
-recon_db_dir = "/var/lib/ippan-l2/prod/recon_db"
-
+# ============================================================
+# RECONCILIATION
+# ============================================================
 [recon]
-# Production recommendation: slower polling, bounded backoff.
 enabled = true
 interval_secs = 30
 batch_limit = 50
-max_scan = 20000
-max_attempts = 200
-base_delay_secs = 2
+max_scan = 5000
+max_attempts = 50
+base_delay_secs = 5
 max_delay_secs = 300
 
+# ============================================================
+# LINKAGE
+# ============================================================
 [linkage]
-# For strict settlement semantics, set:
-# entitlement_policy = "finality_required"
-entitlement_policy = "optimistic"
+entitlement_policy = "finality_required"
 
+# ============================================================
+# LOGGING
+# ============================================================
 [logging]
-# Log level: trace, debug, info, warn, error
-# Use "info" or "warn" in production
 level = "info"
-# Output format: json for log aggregation
 format = "json"
 
-[oracle]
-# Oracle daemon configuration
+# ============================================================
+# HIGH AVAILABILITY (optional)
+# ============================================================
+[ha]
+enabled = false
+# node_id = "prod-fin-node-1"
+# lease_ms = 15000
+# lock_db_dir = "/var/lib/ippan-l2/ha_db"
+
+# ============================================================
+# SNAPSHOTS (recommended for prod)
+# ============================================================
+[snapshots]
 enabled = true
-# Poll interval (production: less frequent to reduce load)
-poll_interval_ms = 60000
+output_dir = "/var/lib/ippan-l2/snapshots"
+max_snapshots = 10
+retain_bases = 4
+retain_deltas_per_base = 672
+
+[snapshots.schedule]
+enabled = true
+cron = "0 3 * * *"  # Daily at 3am UTC

@@ -4,7 +4,9 @@
 #![allow(clippy::float_cmp)]
 
 use crate::bootstrap_mirror_health::MirrorHealthStore;
-use crate::config::{CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig};
+use crate::config::{
+    CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig, SecurityConfig, SecurityMode,
+};
 use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
 use crate::ha::supervisor::HaState;
@@ -72,6 +74,7 @@ pub fn serve(
     limits: LimitsConfig,
     pagination: PaginationConfig,
     rate_limit: RateLimitConfig,
+    security: SecurityConfig,
     _cors: CorsConfig,
     max_inflight_requests: usize,
     bootstrap_db_dir: String,
@@ -82,10 +85,15 @@ pub fn serve(
 ) -> Result<(), String> {
     let server =
         Server::http(bind).map_err(|e| format!("failed to bind http server on {bind}: {e}"))?;
-    info!(bind, "fin-node http server started");
+    info!(
+        bind,
+        mode = security.mode.name(),
+        "fin-node http server started"
+    );
 
     let limiter = Arc::new(RateLimiter::new(rate_limit, SystemTimeSource));
     let inflight = Arc::new(AtomicUsize::new(0));
+    let security = Arc::new(security);
 
     while !stop.load(Ordering::Relaxed) {
         let mut req = match server.recv_timeout(Duration::from_millis(250)) {
@@ -131,11 +139,14 @@ pub fn serve(
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
 
-        // Per-IP rate limiting (best-effort).
-        if limiter.enabled() && !matches!(path, "/healthz" | "/readyz" | "/metrics") {
-            let d = limiter.check_ip(&ip);
+        // Per-IP rate limiting with route-aware cost (best-effort, deterministic).
+        if limiter.enabled() {
+            let d = limiter.check_route(&ip, path);
             if !d.allowed {
                 metrics::RATE_LIMITED_TOTAL.with_label_values(&["ip"]).inc();
+                metrics::HTTP_RATE_LIMITED_TOTAL
+                    .with_label_values(&[route])
+                    .inc();
                 metrics::HTTP_REQUESTS_TOTAL
                     .with_label_values(&[route, "429"])
                     .inc();
@@ -149,6 +160,41 @@ pub fn serve(
                     origin.as_deref(),
                 );
                 // Ignore respond errors (client disconnected).
+                let _ = req.respond(resp);
+                continue;
+            }
+        }
+
+        // Security mode gating: check if route is allowed in current mode.
+        match check_security(&security, &req, path) {
+            SecurityCheckResult::Allowed => {}
+            SecurityCheckResult::RouteDisabled => {
+                metrics::SECURITY_ROUTE_GATED_TOTAL
+                    .with_label_values(&[route])
+                    .inc();
+                metrics::HTTP_REQUESTS_TOTAL
+                    .with_label_values(&[route, "404"])
+                    .inc();
+                metrics::HTTP_REQUEST_DURATION_SECONDS
+                    .with_label_values(&[route])
+                    .observe(started.elapsed().as_secs_f64());
+                let resp = route_disabled_response(&request_id);
+                let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
+                let _ = req.respond(resp);
+                continue;
+            }
+            SecurityCheckResult::AuthRequired => {
+                metrics::SECURITY_AUTH_FAILURES_TOTAL
+                    .with_label_values(&[route, "missing_or_invalid"])
+                    .inc();
+                metrics::HTTP_REQUESTS_TOTAL
+                    .with_label_values(&[route, "401"])
+                    .inc();
+                metrics::HTTP_REQUEST_DURATION_SECONDS
+                    .with_label_values(&[route])
+                    .observe(started.elapsed().as_secs_f64());
+                let resp = auth_required_response(&request_id);
+                let resp = with_common_headers(resp, &request_id, &_cors, origin.as_deref());
                 let _ = req.respond(resp);
                 continue;
             }
@@ -1415,4 +1461,121 @@ fn readiness_body(l1: &dyn L1Client, expected_network_id: Option<&str>) -> (u16,
             (503, serde_json::to_string(&body).unwrap_or_default())
         }
     }
+}
+
+// ============================================================
+// Security mode gating helpers
+// ============================================================
+
+/// Check if a route is gated (disabled) in the current security mode.
+fn is_route_gated(security: &SecurityConfig, path: &str) -> bool {
+    let mode = security.mode;
+
+    // In prod mode, certain devnet-only endpoints are disabled
+    if mode == SecurityMode::Prod {
+        // M2M topup endpoint (devnet only)
+        if path.starts_with("/m2m/topup") {
+            return true;
+        }
+        // M2M ledger ops endpoints (devnet only)
+        if path.contains("/ledger") && path.starts_with("/m2m/") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a route requires admin auth in the current security mode.
+fn route_requires_admin_auth(security: &SecurityConfig, path: &str) -> bool {
+    let mode = security.mode;
+
+    // In prod mode, sensitive endpoints require auth
+    if mode == SecurityMode::Prod {
+        // List all proofs requires auth
+        if path == "/bridge/proofs" || path.starts_with("/bridge/proofs?") {
+            return true;
+        }
+        // Eth header submission requires auth
+        if path.starts_with("/bridge/headers") {
+            return true;
+        }
+    }
+
+    // In staging mode, eth headers require auth
+    if mode == SecurityMode::Staging && path.starts_with("/bridge/headers") {
+        return true;
+    }
+
+    false
+}
+
+/// Extract admin token from request headers.
+fn extract_admin_token(req: &tiny_http::Request) -> Option<String> {
+    // Check X-Admin-Token header
+    for h in req.headers() {
+        if h.field.equiv("X-Admin-Token") {
+            return Some(h.value.as_str().to_string());
+        }
+        // Also support Authorization: Bearer <token>
+        if h.field.equiv("Authorization") {
+            let v = h.value.as_str();
+            if let Some(token) = v.strip_prefix("Bearer ") {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Security check result.
+enum SecurityCheckResult {
+    /// Request is allowed to proceed.
+    Allowed,
+    /// Route is disabled in this security mode.
+    RouteDisabled,
+    /// Auth required but not provided or invalid.
+    AuthRequired,
+}
+
+/// Perform security checks on a request.
+fn check_security(
+    security: &SecurityConfig,
+    req: &tiny_http::Request,
+    path: &str,
+) -> SecurityCheckResult {
+    // Check if route is gated
+    if is_route_gated(security, path) {
+        return SecurityCheckResult::RouteDisabled;
+    }
+
+    // Check if route requires admin auth
+    if route_requires_admin_auth(security, path) {
+        if let Some(token) = extract_admin_token(req) {
+            if security.verify_admin_token(&token) {
+                return SecurityCheckResult::Allowed;
+            }
+        }
+        return SecurityCheckResult::AuthRequired;
+    }
+
+    SecurityCheckResult::Allowed
+}
+
+fn route_disabled_response(request_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    error_response(
+        404,
+        "route_disabled",
+        "this endpoint is disabled in the current security mode",
+        request_id,
+    )
+}
+
+fn auth_required_response(request_id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    error_response(
+        401,
+        "auth_required",
+        "authentication required for this endpoint",
+        request_id,
+    )
 }

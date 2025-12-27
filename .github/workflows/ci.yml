@@ -154,6 +154,28 @@ jobs:
           # Ensure settlement works with all features
           cargo test -p l2-batcher --features "contract-posting,signed-envelopes" reconciler
 
+  fuzz:
+    name: Fuzz Tests (nightly, optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build fuzz targets
+        run: |
+          cd fuzz
+          cargo +nightly fuzz build
+      - name: Run short fuzz (10s per target)
+        run: |
+          cd fuzz
+          for target in fuzz_rlp_receipt fuzz_mpt_proof fuzz_external_proof fuzz_fin_action; do
+            echo "Fuzzing $target..."
+            timeout 10s cargo +nightly fuzz run "$target" -- -max_total_time=10 || true
+          done
+
   # Summary job that depends on all checks
   ci-success:
     name: CI Success

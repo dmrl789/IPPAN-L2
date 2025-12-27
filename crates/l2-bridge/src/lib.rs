@@ -62,6 +62,12 @@ pub use eth_adapter::{
 };
 pub use eth_merkle::{verify_eth_receipt_merkle_proof, EthMerkleVerifyError, MerkleVerifiedEvent};
 
+#[cfg(feature = "merkle-proofs")]
+pub use eth_merkle::{
+    validate_proof_limits, verify_eth_receipt_merkle_proof_with_limits, ProofRejected,
+    VerificationLimits,
+};
+
 #[cfg(all(feature = "merkle-proofs", feature = "eth-headers"))]
 pub use eth_merkle::{
     can_verify_proof, verify_merkle_proof_with_headers, HeaderAwareMerkleError,

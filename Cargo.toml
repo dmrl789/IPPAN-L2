@@ -12,6 +12,7 @@ members = [
   "crates/l2-leader",
   "crates/ippan-rpc",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
