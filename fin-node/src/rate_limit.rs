@@ -62,10 +62,13 @@ impl RouteCategory {
             "/healthz" | "/readyz" | "/metrics" => Self::Health,
 
             // Submit endpoints
-            "/fin/actions" | "/data/datasets" | "/data/licenses" | "/data/attestations"
-            | "/data/listings" | "/data/allowlist/licensors" | "/data/allowlist/attestors" => {
-                Self::Submit
-            }
+            "/fin/actions"
+            | "/data/datasets"
+            | "/data/licenses"
+            | "/data/attestations"
+            | "/data/listings"
+            | "/data/allowlist/licensors"
+            | "/data/allowlist/attestors" => Self::Submit,
 
             // Bridge proof endpoints
             p if p.starts_with("/bridge/proofs") => Self::BridgeProof,
@@ -116,6 +119,8 @@ pub struct RateLimiter<T: TimeSource> {
     per_ip: Mutex<HashMap<String, Bucket>>,
     per_actor: Mutex<HashMap<String, Bucket>>,
     /// Per-route category buckets (for differentiated limits).
+    /// Currently unused but reserved for future per-route-category limiting.
+    #[allow(dead_code)]
     per_route: Mutex<HashMap<(String, RouteCategory), Bucket>>,
 }
 
@@ -134,6 +139,7 @@ impl<T: TimeSource> RateLimiter<T> {
         self.cfg.enabled
     }
 
+    #[allow(dead_code)] // Reserved for future use
     pub fn check_ip(&self, ip: &str) -> Decision {
         self.check(&self.per_ip, ip, 1)
     }
@@ -230,6 +236,7 @@ impl<T: TimeSource> RateLimiter<T> {
     }
 
     /// Get configuration (for observability).
+    #[allow(dead_code)] // Reserved for future use
     pub fn config(&self) -> &RateLimitConfig {
         &self.cfg
     }

@@ -67,6 +67,7 @@ pub enum SecurityMode {
     Prod,
 }
 
+#[allow(dead_code)] // Methods reserved for future use
 impl SecurityMode {
     /// Check if this mode allows devnet-only endpoints (e.g., `/m2m/topup`).
     pub fn allows_devnet_endpoints(&self) -> bool {
@@ -164,9 +165,8 @@ impl SecurityConfig {
             if k.trim().is_empty() {
                 return Err(format!("[security].bridge_submitters[{i}] is empty"));
             }
-            let raw = hex::decode(k).map_err(|e| {
-                format!("[security].bridge_submitters[{i}] invalid hex: {e}")
-            })?;
+            let raw = hex::decode(k)
+                .map_err(|e| format!("[security].bridge_submitters[{i}] invalid hex: {e}"))?;
             if raw.len() != 32 {
                 return Err(format!(
                     "[security].bridge_submitters[{i}] must be 32 bytes (got {})",
@@ -211,6 +211,7 @@ impl SecurityConfig {
     }
 
     /// Check if a bridge submitter pubkey is allowlisted.
+    #[allow(dead_code)] // Reserved for future use
     pub fn is_bridge_submitter_allowed(&self, pubkey_hex: &str) -> bool {
         // Empty list means allow all (devnet behavior)
         if self.bridge_submitters.is_empty() {
@@ -222,6 +223,7 @@ impl SecurityConfig {
     }
 
     /// Check if an attestor pubkey is allowlisted.
+    #[allow(dead_code)] // Reserved for future use
     pub fn is_attestor_allowed(&self, pubkey_hex: &str) -> bool {
         // Empty list means allow all (devnet behavior)
         if self.attestor_keys.is_empty() {
@@ -350,6 +352,7 @@ impl Default for ServerConfig {
 
 /// Admission/abuse-resistance limits.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Some fields are reserved for future use
 pub struct LimitsConfig {
     /// Max HTTP request body size (bytes). Oversized bodies return HTTP 413.
     #[serde(default = "default_max_body_bytes")]
@@ -1095,6 +1098,7 @@ impl FinNodeConfig {
     }
 
     /// Get the security mode.
+    #[allow(dead_code)] // Reserved for future use
     pub fn security_mode(&self) -> SecurityMode {
         self.security.mode
     }

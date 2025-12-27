@@ -4,7 +4,9 @@
 #![allow(clippy::float_cmp)]
 
 use crate::bootstrap_mirror_health::MirrorHealthStore;
-use crate::config::{CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig, SecurityConfig, SecurityMode};
+use crate::config::{
+    CorsConfig, LimitsConfig, PaginationConfig, RateLimitConfig, SecurityConfig, SecurityMode,
+};
 use crate::data_api::{ApiError as DataApiError, DataApi};
 use crate::fin_api::{ApiError, FinApi};
 use crate::ha::supervisor::HaState;
@@ -83,7 +85,11 @@ pub fn serve(
 ) -> Result<(), String> {
     let server =
         Server::http(bind).map_err(|e| format!("failed to bind http server on {bind}: {e}"))?;
-    info!(bind, mode = security.mode.name(), "fin-node http server started");
+    info!(
+        bind,
+        mode = security.mode.name(),
+        "fin-node http server started"
+    );
 
     let limiter = Arc::new(RateLimiter::new(rate_limit, SystemTimeSource));
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -1497,10 +1503,8 @@ fn route_requires_admin_auth(security: &SecurityConfig, path: &str) -> bool {
     }
 
     // In staging mode, eth headers require auth
-    if mode == SecurityMode::Staging {
-        if path.starts_with("/bridge/headers") {
-            return true;
-        }
+    if mode == SecurityMode::Staging && path.starts_with("/bridge/headers") {
+        return true;
     }
 
     false
