@@ -43,6 +43,18 @@ pub mod eth_headers_verify;
 #[cfg(feature = "eth-headers")]
 pub mod eth_headers_api;
 
+/// Ethereum PoS sync committee light client verification (requires `eth-lightclient` feature).
+#[cfg(feature = "eth-lightclient")]
+pub mod eth_lightclient_verify;
+
+/// Ethereum PoS sync committee light client API (requires `eth-lightclient` feature).
+#[cfg(feature = "eth-lightclient")]
+pub mod eth_lightclient_api;
+
+/// Ethereum PoS sync committee light client reconciler (requires `eth-lightclient` feature).
+#[cfg(feature = "eth-lightclient")]
+pub mod eth_lightclient_reconciler;
+
 pub use eth_adapter::{
     CompositeVerifier, EthAttestationVerifier, EthAttestationVerifierConfig, ExpectedEventBinding,
     ExternalVerifier, ExternalVerifyError, MockVerifier, VerifiedEvent,
@@ -54,6 +66,12 @@ pub use eth_merkle::{verify_eth_receipt_merkle_proof, EthMerkleVerifyError, Merk
 pub use eth_merkle::{
     can_verify_proof, verify_merkle_proof_with_headers, HeaderAwareMerkleError,
     HeaderAwareVerifiedEvent, ProofReadiness,
+};
+
+#[cfg(all(feature = "merkle-proofs", feature = "eth-lightclient"))]
+pub use eth_merkle::{
+    can_verify_proof_with_lightclient, verify_merkle_proof_with_lightclient,
+    LightClientMerkleError, LightClientProofReadiness, LightClientVerifiedEvent,
 };
 pub use external_proof_api::{
     BindProofResponse, ExternalProofApi, ExternalProofApiError, IntentProofsVerifiedResponse,
@@ -102,6 +120,26 @@ pub use eth_headers_api::{
     BestTipResponse, ConfirmationsResponse, EthHeaderApi, EthHeaderApiConfig, EthHeaderApiError,
     HeaderInput, HeaderResponse, HeaderStatsResponse, HeaderSubmitResult, SubmitHeadersRequest,
     SubmitHeadersResponse,
+};
+
+#[cfg(feature = "eth-lightclient")]
+pub use eth_lightclient_verify::{
+    BootstrapVerifyResult, LightClientVerifier, LightClientVerifierConfig, LightClientVerifyError,
+    UpdateVerifyResult,
+};
+
+#[cfg(feature = "eth-lightclient")]
+pub use eth_lightclient_api::{
+    BootstrapRequest, BootstrapResponse, FinalizedHeaderResponse, LightClientApi,
+    LightClientApiConfig, LightClientApiError, StatusResponse, UpdateRequest, UpdateResponse,
+    VerificationDetails,
+};
+
+#[cfg(feature = "eth-lightclient")]
+pub use eth_lightclient_reconciler::{
+    spawn_lightclient_reconciler, LightClientReconcileCycleResult, LightClientReconcilerConfig,
+    LightClientReconcilerHandle, LightClientReconcilerMetrics,
+    LightClientReconcilerMetricsSnapshot,
 };
 
 use std::sync::Arc;

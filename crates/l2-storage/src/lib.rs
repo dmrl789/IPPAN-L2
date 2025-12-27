@@ -28,6 +28,13 @@ pub use eth_headers::{
     HeaderVerificationState, StoredHeader,
 };
 
+/// Ethereum light client storage (requires `eth-lightclient` feature).
+#[cfg(feature = "eth-lightclient")]
+pub mod eth_lightclient;
+
+#[cfg(feature = "eth-lightclient")]
+pub use eth_lightclient::{EthLightClientStorage, EthLightClientStorageError};
+
 use std::path::Path;
 
 use l2_core::forced_inclusion::{ForcedInclusionStatus, InclusionTicket};
