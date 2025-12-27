@@ -4,8 +4,6 @@
 [advisories]
 # Advisories to ignore (transitive dependencies we can't easily update)
 ignore = [
-    # idna 0.4.0 - Punycode label issue, comes from ethers/url dependency chain
-    "RUSTSEC-2024-0421",
     # ring 0.16.20 - AES panic on overflow, comes from ethers/rustls dependency chain
     "RUSTSEC-2025-0009",
     # ring 0.16.20 is unmaintained - same as above
@@ -19,6 +17,9 @@ ignore = [
     # ruint 1.17.0 - reciprocal_mg10 unsoundness, transitive from alloy-primitives
     # No fix available upstream yet
     "RUSTSEC-2025-0137",
+    # paste unmaintained - transitive from alloy-primitives
+    # No fix available upstream yet
+    "RUSTSEC-2024-0436",
 ]
 # Treat informational advisories as warnings (not errors)
 informational_warnings = ["unmaintained", "unsound", "notice"]
