@@ -27,6 +27,9 @@ chacha20poly1305 = { version = "0.10", features = ["std"], optional = true }
 getrandom = { version = "0.2", optional = true }
 
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"], optional = true }
+# Ethereum header hashing (keccak256 + RLP)
+alloy-rlp = { version = "0.3", optional = true }
+alloy-primitives = { version = "0.8", optional = true }
 
 [features]
 default = []
@@ -36,6 +39,8 @@ l1-http = ["dep:reqwest"]
 signed-envelopes = ["dep:ed25519-dalek"]
 ## Enable operational encryption-at-rest helpers (AEAD, formats, traits).
 encryption-at-rest = ["dep:chacha20poly1305", "dep:getrandom"]
+## Enable Ethereum header hashing (keccak256 + RLP encoding/decoding).
+keccak-headers = ["dep:alloy-rlp", "dep:alloy-primitives"]
 
 [dev-dependencies]
 serde_json = "1"

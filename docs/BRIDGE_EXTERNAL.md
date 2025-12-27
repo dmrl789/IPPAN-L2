@@ -67,22 +67,55 @@ pub enum ExternalChainId {
 }
 ```
 
+#### Verification Modes
+
+The bridge supports multiple verification modes with different trust assumptions:
+
+| Mode | Trust Assumption | Speed | Use Case |
+|------|------------------|-------|----------|
+| `attestation` | Trust in allowlisted attestors | Fast | Production MVP, trusted operators |
+| `eth_merkle_receipt_proof` | Trust in Ethereum consensus | Slower | Fully decentralized, trustless |
+| `merkle_with_headers` | Verified header chain | Moderate | Deterministic confirmations (MVP light client) |
+
+```rust
+pub enum VerificationMode {
+    /// Verification via signed attestation from a trusted attestor.
+    Attestation,
+    /// Verification via Ethereum Merkle Patricia Trie receipt inclusion proof.
+    EthMerkleReceiptProof,
+}
+```
+
+#### Header Chain Verification (Light Client MVP)
+
+When the `eth-headers` feature is enabled, Merkle proofs can be verified against a locally
+stored and validated Ethereum header chain. This provides:
+
+1. **Deterministic confirmations**: Computed from verified header depth, not external RPC claims
+2. **Block hash validation**: Proofs are anchored to known, verified headers
+3. **Receipt root verification**: Uses stored header's receipts_root as source of truth
+
+Trust model:
+- **Checkpoints**: Explicitly trusted header hashes serve as roots of trust
+- **Chain validation**: Headers must descend from checkpoints to be verified
+- **Fork choice**: Highest block number wins; ties broken by lexicographically smallest hash
+
 #### ExternalEventProofV1
 
 Versioned enum for different proof types:
 
 ```rust
 pub enum ExternalEventProofV1 {
-    /// MVP: Trusted attestor signs a statement about an event
+    /// Trusted attestor signs a statement about an event
     EthReceiptAttestationV1(EthReceiptAttestationV1),
-    /// Future: Full merkle proof against block header
+    /// Full Merkle Patricia Trie proof against block header
     EthReceiptMerkleProofV1(EthReceiptMerkleProofV1),
 }
 ```
 
 #### EthReceiptAttestationV1
 
-The MVP proof type - a signed attestation from a trusted party:
+Attestation mode - a signed attestation from a trusted party:
 
 ```rust
 pub struct EthReceiptAttestationV1 {
@@ -99,6 +132,36 @@ pub struct EthReceiptAttestationV1 {
     pub signature: [u8; 64],           // Ed25519 signature
 }
 ```
+
+#### EthReceiptMerkleProofV1
+
+Merkle proof mode - cryptographic proof of event inclusion:
+
+```rust
+pub struct EthReceiptMerkleProofV1 {
+    pub chain: ExternalChainId,        // Which chain
+    pub tx_hash: [u8; 32],             // Transaction hash
+    pub log_index: u32,                // Log index in receipt
+    pub contract: [u8; 20],            // Contract address
+    pub topic0: [u8; 32],              // Event signature
+    pub data_hash: [u8; 32],           // Blake3 hash of event data
+    pub block_number: u64,             // Block number
+    pub block_hash: [u8; 32],          // Block hash (keccak256 of header_rlp)
+    pub header_rlp: Vec<u8>,           // RLP-encoded block header
+    pub tx_index: u32,                 // Transaction index in block
+    pub receipt_rlp: Vec<u8>,          // RLP-encoded receipt
+    pub proof_nodes: Vec<Vec<u8>>,     // MPT proof nodes
+    pub confirmations: Option<u32>,    // Optional: for confirmation policy
+    pub tip_block_number: Option<u64>, // Optional: current chain tip
+}
+```
+
+Merkle proof verification:
+1. Verify `keccak256(header_rlp) == block_hash`
+2. Extract `receipts_root` from block header
+3. Verify receipt inclusion via MPT proof against `receipts_root`
+4. Decode receipt and extract log at `log_index`
+5. Verify log matches: `contract`, `topic0`, `blake3(data) == data_hash`
 
 #### ExternalProofState
 
@@ -226,7 +289,80 @@ pub struct ExternalProofReconcilerConfig {
 }
 ```
 
-### 6. External Proof API (`l2-bridge/src/external_proof_api.rs`)
+### 6. Ethereum Header Chain (Light Client MVP)
+
+The header chain subsystem (`eth-headers` feature) provides trust-minimized confirmation
+counting without relying on external RPCs.
+
+#### Components
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| `EthereumHeaderV1` | `l2-core/src/eth_header.rs` | Canonical header struct with RLP encoding |
+| `EthHeaderStorage` | `l2-storage/src/eth_headers.rs` | Persistent header store with fork choice |
+| `HeaderVerifier` | `l2-bridge/src/eth_headers_verify.rs` | Checkpoint-based verification |
+| `EthHeaderApi` | `l2-bridge/src/eth_headers_api.rs` | HTTP API for header submission/query |
+
+#### Trust Model
+
+The MVP light client uses **explicit checkpoints** as trust anchors:
+
+```
+                    Checkpoint (trusted)
+                         │
+                         ▼
+                    Block N (verified)
+                         │
+                    ┌────┴────┐
+                    ▼         ▼
+              Block N+1   Block N+1' (fork)
+              (verified)  (verified)
+                    │
+                    ▼
+              Block N+2 (best tip)
+```
+
+1. **Checkpoints**: Trusted header hashes that serve as roots of trust
+2. **Verification**: Headers descending from checkpoints are "verified"
+3. **Confirmations**: Computed as `best_tip_number - block_number + 1`
+4. **Fork choice**: Deterministic (highest number, then smallest hash)
+
+#### Configuration
+
+```bash
+# Bootstrap checkpoints (chain_id:hash:number,...)
+ETH_BOOTSTRAP_CHECKPOINTS="1:0xabc123...:18000000"
+
+# Confirmation thresholds
+ETH_MIN_CONFIRMATIONS_MAINNET=12
+ETH_MIN_CONFIRMATIONS_TESTNET=6
+
+# Allow uncheckpointed headers (devnet mode)
+ETH_HEADER_ALLOW_UNCHECKPOINTED=false
+```
+
+#### API Endpoints (devnet mode)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/bridge/eth/headers` | POST | Submit headers (requires `DEVNET=1`) |
+| `/bridge/eth/headers/best_tip` | GET | Get current best tip |
+| `/bridge/eth/headers/:hash` | GET | Get header by hash |
+| `/bridge/eth/confirmations/:hash` | GET | Get confirmations for block |
+| `/bridge/eth/headers/stats` | GET | Header chain statistics |
+
+#### Header-Aware Merkle Proofs
+
+When header verification is required (`REQUIRE_HEADER_VERIFICATION=1`), Merkle proofs:
+
+1. Must reference blocks known in the header store
+2. Must be on a verified chain (descend from checkpoint)
+3. Have confirmations computed from header depth (not from proof payload)
+4. Use stored header's receipts_root (not from proof)
+
+If the block is not yet known, the proof remains **pending** (not rejected).
+
+### 7. External Proof API (`l2-bridge/src/external_proof_api.rs`)
 
 HTTP API endpoints for proof management:
 
@@ -236,31 +372,64 @@ HTTP API endpoints for proof management:
 POST /bridge/proofs
 ```
 
-Request:
+##### Attestation Mode Request
+
+Submit a signed attestation from a trusted attestor:
+
 ```json
 {
     "proof_type": "eth_receipt_attestation_v1",
     "chain": "ethereum_mainnet",
-    "tx_hash": "0xabc...",
+    "tx_hash": "0xaabbccdd...",
     "log_index": 0,
-    "contract": "0xdef...",
-    "topic0": "0x123...",
-    "data_hash": "0x456...",
+    "contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    "data_hash": "0x1234567890abcdef...",
     "block_number": 18000000,
-    "block_hash": "0x789...",
+    "block_hash": "0x9876543210fedcba...",
     "confirmations": 15,
-    "attestor_pubkey": "0x...",
-    "signature": "0x..."
+    "attestor_pubkey": "0x11223344...",
+    "signature": "0x55667788..."
 }
 ```
 
-Response:
+##### Merkle Proof Mode Request
+
+Submit a cryptographic Merkle Patricia Trie proof:
+
+```json
+{
+    "proof_type": "eth_receipt_merkle_v1",
+    "chain": "ethereum_mainnet",
+    "tx_hash": "0xaabbccdd...",
+    "log_index": 0,
+    "contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    "data_hash": "0x1234567890abcdef...",
+    "block_number": 18000000,
+    "block_hash": "0x9876543210fedcba...",
+    "tx_index": 42,
+    "header_rlp": "0xf90210a0...",
+    "receipt_rlp": "0xf901a8...",
+    "proof_nodes": [
+        "0xf851a0...",
+        "0xf8b180a0...",
+        "0xe219a0..."
+    ],
+    "confirmations": 12,
+    "tip_block_number": 18000012
+}
+```
+
+##### Response
+
 ```json
 {
     "proof_id": "abc123...",
     "was_new": true,
     "chain": "ethereum:1",
-    "proof_type": "eth_receipt_attestation_v1",
+    "proof_type": "eth_receipt_merkle_v1",
+    "verification_mode": "eth_merkle_receipt_proof",
     "block_number": 18000000
 }
 ```
@@ -276,9 +445,10 @@ Response:
 {
     "proof_id": "abc123...",
     "chain": "ethereum:1",
-    "proof_type": "eth_receipt_attestation_v1",
+    "proof_type": "eth_receipt_merkle_v1",
+    "verification_mode": "eth_merkle_receipt_proof",
     "block_number": 18000000,
-    "tx_hash": "0xabc...",
+    "tx_hash": "0xaabbccdd...",
     "state": "verified",
     "is_verified": true,
     "is_rejected": false
@@ -405,47 +575,142 @@ curl -X POST http://ippan-node/bridge/intents/{intent_id}/commit
 
 ## Security Considerations
 
-### Trust Model
+### Verification Modes and Trust Assumptions
 
-The MVP uses **trusted attestations**, which have the following trust assumptions:
+The bridge supports two verification modes with different trust/security tradeoffs:
 
+#### Attestation Mode
+
+Trust assumptions:
 1. **Attestor honesty**: The attestor correctly observes and reports external events
 2. **Key security**: The attestor's private key is not compromised
 3. **Allowlist management**: The attestor allowlist is correctly maintained
 
-### Verification Checks
-
-For `EthReceiptAttestationV1`, the following checks are performed:
-
+Verification checks:
 1. **Basic validation**: All fields are non-zero and well-formed
 2. **Attestor allowlist**: The attestor's public key must be in the configured allowlist
 3. **Signature verification**: Ed25519 signature over canonical attestation data
 4. **Confirmation threshold**: Minimum confirmations (12 for mainnet, 6 for testnet)
 5. **Event binding** (optional): Contract, topic0, data_hash, chain match expected values
 
-### Future: Merkle Proofs
+Best for: Production deployments with trusted operators, fast verification.
 
-The system is designed to support `EthReceiptMerkleProofV1` in the future, which would:
+#### Merkle Proof Mode
 
-1. Eliminate trust in attestors
-2. Require only trust in Ethereum consensus
-3. Enable fully trustless bridging
+Trust assumptions:
+1. **Block finality**: The block header is valid and sufficiently confirmed
+2. **Ethereum consensus**: Trust in Ethereum's consensus mechanism
+
+Verification checks:
+1. **Block hash verification**: `keccak256(header_rlp) == block_hash`
+2. **Receipts root extraction**: Parse block header to get `receipts_root`
+3. **MPT proof verification**: Verify receipt inclusion against `receipts_root`
+4. **Receipt decoding**: Parse receipt RLP and extract log at `log_index`
+5. **Event filter matching**: Verify `contract`, `topic0`, `blake3(data) == data_hash`
+6. **Confirmation policy**: Optional minimum block confirmations
+
+Best for: Trustless, decentralized deployments. No trusted third party required.
+
+### Confirmation Policy
+
+Both modes support confirmation thresholds to prevent reorg attacks:
+
+| Chain | Attestation Default | Merkle Proof Default |
+|-------|---------------------|----------------------|
+| Mainnet | 12 blocks | 12 blocks |
+| Testnet | 6 blocks | 6 blocks |
+
+Configure via environment variables:
+```bash
+# For attestation verifier
+ETH_MIN_CONFIRMATIONS_MAINNET=12
+ETH_MIN_CONFIRMATIONS_TESTNET=6
+
+# For Merkle proof reconciler
+MERKLE_PROOF_MIN_CONFIRMATIONS_MAINNET=12
+MERKLE_PROOF_MIN_CONFIRMATIONS_TESTNET=6
+```
+
+#### Header-Aware Merkle Proof Mode (requires `eth-headers` feature)
+
+Trust assumptions:
+1. **Bootstrap checkpoints**: Explicitly configured trusted header hashes
+2. **Header chain validity**: Headers structurally valid and linked
+3. **No sync committee verification** (MVP limitation)
+
+Verification checks:
+1. **Block known**: Block hash must exist in header store
+2. **Verified chain**: Block must descend from a checkpoint
+3. **Confirmations from headers**: Computed from header depth, not proof claims
+4. **Receipt root from store**: Uses stored header's receipts_root
+5. **Full MPT verification**: Same as basic Merkle proof mode
+
+Best for: Deterministic, local confirmation counting without external RPC.
+
+### Choosing a Verification Mode
+
+| Consideration | Attestation | Merkle Proof | Merkle + Headers |
+|---------------|-------------|--------------|------------------|
+| Trust requirement | Trusted attestor | Ethereum consensus | Bootstrap checkpoints |
+| Confirmation source | Proof payload | Proof payload | Header chain depth |
+| External RPC needed | No | For proof gen | For header submission |
+| Verification speed | Fast | Moderate | Moderate |
+| Decentralization | Semi-centralized | Decentralized | Deterministic |
+
+For production:
+1. **Start**: Attestation mode for speed and simplicity
+2. **Upgrade**: Merkle proofs for trustless verification
+3. **Best**: Merkle + Headers for deterministic confirmations
 
 ## Configuration
 
 ### Environment Variables
 
 ```bash
-# Attestor configuration
+# Attestation verifier configuration
 ETH_ATTESTOR_PUBKEYS="pubkey1_hex,pubkey2_hex"
 ETH_MIN_CONFIRMATIONS_MAINNET=12
 ETH_MIN_CONFIRMATIONS_TESTNET=6
 
+# Merkle proof reconciler confirmation policy
+MERKLE_PROOF_MIN_CONFIRMATIONS_MAINNET=12
+MERKLE_PROOF_MIN_CONFIRMATIONS_TESTNET=6
+
 # Reconciler configuration
 EXTERNAL_PROOF_RECONCILER_ENABLED=true
-EXTERNAL_PROOF_RECONCILER_POLL_MS=5000
-EXTERNAL_PROOF_RECONCILER_MAX_PROOFS=100
+EXTERNAL_PROOF_POLL_MS=5000
+EXTERNAL_PROOF_MAX_PER_CYCLE=100
+
+# Header chain configuration (eth-headers feature)
+ETH_BOOTSTRAP_CHECKPOINTS="1:0xabc123...:18000000"  # chain_id:hash:number
+ETH_HEADER_ALLOW_UNCHECKPOINTED=false               # Allow headers without checkpoints (devnet)
+REQUIRE_HEADER_VERIFICATION=false                   # Require header store for Merkle proofs
+ETH_CHAIN_ID=1                                       # Default chain ID for API
+DEVNET=0                                             # Enable devnet mode (header submission)
+ETH_MAX_HEADERS_PER_REQUEST=100                      # Max headers per submission
 ```
+
+### Feature Flags
+
+Merkle proof verification requires the `merkle-proofs` feature:
+
+```bash
+cargo build -p l2-bridge --features merkle-proofs
+```
+
+Without this feature, Merkle proofs will be rejected with "feature not enabled".
+
+Header chain verification requires the `eth-headers` feature:
+
+```bash
+cargo build -p l2-bridge --features eth-headers
+```
+
+The `eth-headers` feature implies `merkle-proofs` and enables:
+- Ethereum header storage and verification
+- Deterministic confirmation counting from headers
+- Header submission API (devnet mode)
+- Header-aware Merkle proof verification
 
 ### Running the Reconciler
 
@@ -460,11 +725,26 @@ Run the external proof tests:
 cargo test -p l2-bridge --test external_proofs
 ```
 
+Run the Merkle proof verification tests (requires `merkle-proofs` feature):
+
+```bash
+cargo test -p l2-bridge --features merkle-proofs --test eth_merkle_vectors
+```
+
 Run all bridge tests:
 
 ```bash
-cargo test -p l2-bridge
+cargo test -p l2-bridge --features merkle-proofs
 ```
+
+### Test Coverage
+
+The Merkle proof test suite (`eth_merkle_vectors.rs`) includes:
+
+- **Valid proofs**: ERC20 Transfer events, Bridge deposit events
+- **Tamper detection**: Mutated proof nodes, wrong block hash
+- **Filter validation**: Wrong contract, wrong topic0, wrong data hash
+- **Bounds checking**: Invalid log index, empty proof nodes
 
 ## API Reference
 
@@ -492,7 +772,20 @@ cargo test -p l2-bridge
 
 - **External Proof**: A cryptographic proof of an event on an external blockchain
 - **Attestation**: A signed statement from a trusted party about an external event
-- **Merkle Proof**: A cryptographic proof using merkle tree inclusion
+- **Merkle Proof**: A cryptographic proof using Merkle Patricia Trie (MPT) inclusion
+- **MPT (Merkle Patricia Trie)**: Ethereum's data structure for storing receipts
+- **Receipt RLP**: RLP-encoded Ethereum transaction receipt
+- **Header RLP**: RLP-encoded Ethereum block header
+- **Receipts Root**: The MPT root hash of all receipts in a block
+- **Proof Nodes**: The MPT path from receipts root to receipt leaf
+- **Verification Mode**: The method used to verify a proof (attestation or merkle)
 - **Proof-Carrying Intent**: An intent that requires external proof(s) to proceed
 - **Reconciler**: Background process that verifies external proofs
 - **Binding**: Association between a proof and an intent
+- **Confirmation Policy**: Minimum block confirmations required for proof acceptance
+- **Header Chain**: A sequence of Ethereum block headers with parent links
+- **Checkpoint**: An explicitly trusted header hash used as a root of trust
+- **Verified Chain**: Headers that descend from a checkpoint
+- **Best Tip**: The highest-numbered verified block (with hash tie-breaking)
+- **Fork Choice**: Algorithm for selecting the canonical chain among competing forks
+- **Light Client**: A system that validates block headers without full state

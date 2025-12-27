@@ -18,6 +18,16 @@ pub mod m2m;
 pub mod m2m_ops;
 pub mod settlement;
 
+/// Ethereum header chain storage (requires `eth-headers` feature).
+#[cfg(feature = "eth-headers")]
+pub mod eth_headers;
+
+#[cfg(feature = "eth-headers")]
+pub use eth_headers::{
+    BestTip, EthHeaderStorage, EthHeaderStorageError, HeaderCounts, HeaderEntry,
+    HeaderVerificationState, StoredHeader,
+};
+
 use std::path::Path;
 
 use l2_core::forced_inclusion::{ForcedInclusionStatus, InclusionTicket};
@@ -34,7 +44,7 @@ pub use settlement::{
 
 pub use external::{
     ExternalProofCounts, ExternalProofEntry, ExternalProofStorage, ExternalProofStorageError,
-    ProofIntentBinding,
+    ProofIntentBinding, VerifiedSummary,
 };
 pub use intents::{
     validate_intent_transition, IntentState, IntentStateCounts, IntentStateEntry, IntentStorage,

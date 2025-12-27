@@ -18,7 +18,7 @@
 
 use l2_core::{
     canonical_decode, canonical_encode, ExternalEventProofV1, ExternalProofId, ExternalProofState,
-    IntentId,
+    IntentId, VerificationMode,
 };
 use sled::Tree;
 use std::fmt;
@@ -39,6 +39,24 @@ pub enum ExternalProofStorageError {
     InvalidTransition(String),
 }
 
+/// Summary of verified fields for a proof.
+///
+/// This captures the key fields that were verified, useful for audit trails
+/// and intent verification without re-checking the full proof.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerifiedSummary {
+    /// The verification mode used.
+    pub mode: VerificationMode,
+    /// Block number where the event was included.
+    pub block_number: u64,
+    /// Log index within the transaction.
+    pub log_index: u32,
+    /// Blake3 hash of verified event data.
+    pub event_data_hash: [u8; 32],
+    /// Timestamp when verification completed (ms since epoch).
+    pub verified_at_ms: u64,
+}
+
 /// Entry in the proof storage for listing.
 #[derive(Debug, Clone)]
 pub struct ExternalProofEntry {
@@ -48,6 +66,10 @@ pub struct ExternalProofEntry {
     pub proof: ExternalEventProofV1,
     /// Current verification state.
     pub state: ExternalProofState,
+    /// Verification mode used for this proof.
+    pub verification_mode: VerificationMode,
+    /// Summary of verified fields (if verified).
+    pub verified_summary: Option<VerifiedSummary>,
 }
 
 /// Entry for proof-to-intent bindings.
@@ -91,13 +113,24 @@ impl fmt::Display for ExternalProofCounts {
     }
 }
 
-/// Stored proof data (proof + state).
+/// Stored proof data (proof + state + verification info).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct StoredProof {
     proof: ExternalEventProofV1,
     state: ExternalProofState,
     /// Timestamp when proof was first stored (ms since epoch).
     stored_at_ms: u64,
+    /// Verification mode used for this proof.
+    #[serde(default = "default_verification_mode")]
+    verification_mode: VerificationMode,
+    /// Summary of verified fields (populated on successful verification).
+    #[serde(default)]
+    verified_summary: Option<VerifiedSummary>,
+}
+
+/// Default verification mode for backwards compatibility.
+fn default_verification_mode() -> VerificationMode {
+    VerificationMode::Attestation
 }
 
 /// Stored binding data.
@@ -137,6 +170,7 @@ impl ExternalProofStorage {
     ///
     /// Returns `Ok(true)` if the proof was stored, `Ok(false)` if it already existed.
     /// Initial state is always `Unverified`.
+    /// Verification mode is derived from the proof type.
     pub fn put_proof_if_absent(
         &self,
         proof: &ExternalEventProofV1,
@@ -150,11 +184,16 @@ impl ExternalProofStorage {
             return Ok(false);
         }
 
+        // Derive verification mode from proof type
+        let verification_mode = proof.verification_mode();
+
         // Store with initial Unverified state
         let stored = StoredProof {
             proof: proof.clone(),
             state: ExternalProofState::Unverified,
             stored_at_ms,
+            verification_mode,
+            verified_summary: None,
         };
 
         let bytes = canonical_encode(&stored)?;
@@ -180,6 +219,8 @@ impl ExternalProofStorage {
                     proof_id: *proof_id,
                     proof: stored.proof,
                     state: stored.state,
+                    verification_mode: stored.verification_mode,
+                    verified_summary: stored.verified_summary,
                 }))
             }
             None => Ok(None),
@@ -214,10 +255,35 @@ impl ExternalProofStorage {
     ///
     /// State transitions must be from Unverified to Verified/Rejected.
     /// Once Verified or Rejected, the state cannot change.
+    ///
+    /// For setting Verified state with a summary, use `set_proof_verified_with_summary`.
     pub fn set_proof_state(
         &self,
         proof_id: &ExternalProofId,
         new_state: ExternalProofState,
+    ) -> Result<(), ExternalProofStorageError> {
+        self.set_proof_state_internal(proof_id, new_state, None)
+    }
+
+    /// Update the verification state of a proof to Verified with a summary.
+    ///
+    /// This records the verification mode and summary of verified fields.
+    pub fn set_proof_verified_with_summary(
+        &self,
+        proof_id: &ExternalProofId,
+        verified_at_ms: u64,
+        summary: VerifiedSummary,
+    ) -> Result<(), ExternalProofStorageError> {
+        let new_state = ExternalProofState::verified(verified_at_ms);
+        self.set_proof_state_internal(proof_id, new_state, Some(summary))
+    }
+
+    /// Internal method to update proof state with optional summary.
+    fn set_proof_state_internal(
+        &self,
+        proof_id: &ExternalProofId,
+        new_state: ExternalProofState,
+        summary: Option<VerifiedSummary>,
     ) -> Result<(), ExternalProofStorageError> {
         let key = proof_id.to_hex();
 
@@ -252,8 +318,11 @@ impl ExternalProofStorage {
         let old_state_key = format!("{}:{}", stored.state.name(), key);
         self.state_index.remove(old_state_key.as_bytes())?;
 
-        // Update state
+        // Update state and summary
         stored.state = new_state.clone();
+        if let Some(s) = summary {
+            stored.verified_summary = Some(s);
+        }
 
         // Store updated proof
         let new_bytes = canonical_encode(&stored)?;
@@ -264,6 +333,36 @@ impl ExternalProofStorage {
         self.state_index.insert(new_state_key.as_bytes(), &[])?;
 
         Ok(())
+    }
+
+    /// Get the verification mode for a proof.
+    pub fn get_verification_mode(
+        &self,
+        proof_id: &ExternalProofId,
+    ) -> Result<Option<VerificationMode>, ExternalProofStorageError> {
+        let key = proof_id.to_hex();
+        match self.proofs.get(key.as_bytes())? {
+            Some(bytes) => {
+                let stored: StoredProof = canonical_decode(&bytes)?;
+                Ok(Some(stored.verification_mode))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get the verified summary for a proof (if verified).
+    pub fn get_verified_summary(
+        &self,
+        proof_id: &ExternalProofId,
+    ) -> Result<Option<VerifiedSummary>, ExternalProofStorageError> {
+        let key = proof_id.to_hex();
+        match self.proofs.get(key.as_bytes())? {
+            Some(bytes) => {
+                let stored: StoredProof = canonical_decode(&bytes)?;
+                Ok(stored.verified_summary)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Bind a proof to an intent.
@@ -952,5 +1051,113 @@ mod tests {
             result,
             Err(ExternalProofStorageError::NotFound(_))
         ));
+    }
+
+    // ========== Verification Mode Tests ==========
+
+    #[test]
+    fn verification_mode_stored_and_retrieved() {
+        let db = test_db();
+        let storage = ExternalProofStorage::new(&db).unwrap();
+
+        let proof = test_attestation(0xAA);
+        let proof_id = proof.proof_id().unwrap();
+
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
+
+        // Check verification mode is derived from proof type
+        let mode = storage.get_verification_mode(&proof_id).unwrap().unwrap();
+        assert_eq!(mode, VerificationMode::Attestation);
+
+        // Check via entry
+        let entry = storage.get_proof(&proof_id).unwrap().unwrap();
+        assert_eq!(entry.verification_mode, VerificationMode::Attestation);
+    }
+
+    #[test]
+    fn verified_summary_stored() {
+        let db = test_db();
+        let storage = ExternalProofStorage::new(&db).unwrap();
+
+        let proof = test_attestation(0xAA);
+        let proof_id = proof.proof_id().unwrap();
+
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
+
+        // Create a verified summary
+        let summary = VerifiedSummary {
+            mode: VerificationMode::Attestation,
+            block_number: 18_000_000,
+            log_index: 0,
+            event_data_hash: [0xDD; 32],
+            verified_at_ms: 1_700_000_001_000,
+        };
+
+        // Set verified with summary
+        storage
+            .set_proof_verified_with_summary(&proof_id, 1_700_000_001_000, summary.clone())
+            .unwrap();
+
+        // Check summary is stored
+        let retrieved = storage.get_verified_summary(&proof_id).unwrap().unwrap();
+        assert_eq!(retrieved.mode, summary.mode);
+        assert_eq!(retrieved.block_number, summary.block_number);
+        assert_eq!(retrieved.log_index, summary.log_index);
+        assert_eq!(retrieved.event_data_hash, summary.event_data_hash);
+        assert_eq!(retrieved.verified_at_ms, summary.verified_at_ms);
+
+        // Check via entry
+        let entry = storage.get_proof(&proof_id).unwrap().unwrap();
+        assert!(entry.verified_summary.is_some());
+        assert!(entry.state.is_verified());
+    }
+
+    #[test]
+    fn unverified_proof_has_no_summary() {
+        let db = test_db();
+        let storage = ExternalProofStorage::new(&db).unwrap();
+
+        let proof = test_attestation(0xAA);
+        let proof_id = proof.proof_id().unwrap();
+
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
+
+        // Unverified proof should have no summary
+        let summary = storage.get_verified_summary(&proof_id).unwrap();
+        assert!(summary.is_none());
+
+        let entry = storage.get_proof(&proof_id).unwrap().unwrap();
+        assert!(entry.verified_summary.is_none());
+    }
+
+    #[test]
+    fn rejected_proof_has_no_summary() {
+        let db = test_db();
+        let storage = ExternalProofStorage::new(&db).unwrap();
+
+        let proof = test_attestation(0xAA);
+        let proof_id = proof.proof_id().unwrap();
+
+        storage
+            .put_proof_if_absent(&proof, 1_700_000_000_000)
+            .unwrap();
+
+        // Reject the proof
+        storage
+            .set_proof_state(
+                &proof_id,
+                ExternalProofState::rejected("invalid".to_string(), 1_700_000_001_000),
+            )
+            .unwrap();
+
+        // Rejected proof should have no summary
+        let summary = storage.get_verified_summary(&proof_id).unwrap();
+        assert!(summary.is_none());
     }
 }
