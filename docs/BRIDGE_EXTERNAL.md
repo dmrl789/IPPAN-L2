@@ -76,6 +76,7 @@ The bridge supports multiple verification modes with different trust assumptions
 | `attestation` | Trust in allowlisted attestors | Fast | Production MVP, trusted operators |
 | `eth_merkle_receipt_proof` | Trust in Ethereum consensus | Slower | Fully decentralized, trustless |
 | `merkle_with_headers` | Verified header chain | Moderate | Deterministic confirmations (MVP light client) |
+| `merkle_with_lightclient` | PoS sync committee finality | Moderate | Trust-minimized, cryptographic finality |
 
 ```rust
 pub enum VerificationMode {
@@ -361,6 +362,207 @@ When header verification is required (`REQUIRE_HEADER_VERIFICATION=1`), Merkle p
 4. Use stored header's receipts_root (not from proof)
 
 If the block is not yet known, the proof remains **pending** (not rejected).
+
+### 7. Ethereum PoS Sync Committee Light Client (Trust-Minimized)
+
+The sync committee light client (`eth-lightclient` feature) provides cryptographic finality
+verification using Ethereum's PoS sync committee mechanism. This is the recommended mode
+for production deployments requiring maximum security.
+
+#### Components
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| `BeaconBlockHeaderV1` | `l2-core/src/eth_lightclient.rs` | Beacon chain block header |
+| `ExecutionPayloadHeaderV1` | `l2-core/src/eth_lightclient.rs` | Execution layer header (EIP-4788) |
+| `LightClientBootstrapV1` | `l2-core/src/eth_lightclient.rs` | Initial trusted state |
+| `LightClientUpdateV1` | `l2-core/src/eth_lightclient.rs` | State advancement update |
+| `SyncCommitteeV1` | `l2-core/src/eth_lightclient.rs` | 512-validator signing committee |
+| `EthLightClientStorage` | `l2-storage/src/eth_lightclient.rs` | Persistent light client state |
+| `LightClientVerifier` | `l2-bridge/src/eth_lightclient_verify.rs` | BLS + Merkle proof verification |
+| `LightClientApi` | `l2-bridge/src/eth_lightclient_api.rs` | HTTP API for bootstrap/update |
+| `LightClientReconciler` | `l2-bridge/src/eth_lightclient_reconciler.rs` | Background update processor |
+
+#### Trust Model
+
+The sync committee light client uses **cryptographic finality** instead of checkpoints:
+
+```
+                    Genesis (trusted)
+                         │
+                         ▼
+                    Sync Committee Period 0
+                         │ (BLS signature)
+                         ▼
+                    Sync Committee Period 1
+                         │ (BLS signature)
+                         ▼
+                    Finalized Beacon Block
+                         │ (EIP-4788 binding)
+                         ▼
+                    Finalized Execution Block
+                         │
+                         ▼
+                    Receipt Proof (verified)
+```
+
+1. **Bootstrap**: Initial trusted sync committee + beacon header
+2. **Updates**: BLS-signed attestations from sync committee (2/3 majority required)
+3. **Finality**: Cryptographically verified finalized beacon blocks
+4. **Execution Binding**: EIP-4788 links beacon state to execution headers
+5. **Receipt Proofs**: Anchored to cryptographically finalized execution headers
+
+#### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/bridge/eth/lightclient/bootstrap` | POST | Initialize light client |
+| `/bridge/eth/lightclient/update` | POST | Submit light client update |
+| `/bridge/eth/lightclient/status` | GET | Get light client status |
+| `/bridge/eth/lightclient/finalized/:hash` | GET | Check if block is finalized |
+
+#### Bootstrap Request
+
+```json
+{
+    "bootstrap": {
+        "header": {
+            "slot": 8000000,
+            "proposer_index": 12345,
+            "parent_root": "0x...",
+            "state_root": "0x...",
+            "body_root": "0x..."
+        },
+        "current_sync_committee": {
+            "pubkeys": ["0x...", ...],
+            "aggregate_pubkey": "0x..."
+        },
+        "current_sync_committee_branch": ["0x...", ...]
+    },
+    "execution_header": {
+        "block_hash": "0x...",
+        "block_number": 18000000,
+        "receipts_root": "0x...",
+        ...
+    }
+}
+```
+
+#### Update Request
+
+```json
+{
+    "update": {
+        "attested_header": { ... },
+        "finalized_header": { ... },
+        "finality_branch": ["0x...", ...],
+        "sync_aggregate": {
+            "sync_committee_bits": "0xffff...",
+            "sync_committee_signature": "0x..."
+        },
+        "signature_slot": 8001001,
+        "next_sync_committee": null,
+        "next_sync_committee_branch": null
+    },
+    "execution_header": { ... }
+}
+```
+
+#### Status Response
+
+```json
+{
+    "bootstrapped": true,
+    "status": {
+        "finalized_slot": 8000900,
+        "finalized_beacon_root": "0x...",
+        "current_period": 976,
+        "finalized_execution_number": 18000005,
+        "finalized_execution_hash": "0x...",
+        "updates_applied": 42
+    },
+    "chain_id": 1,
+    "devnet_enabled": false
+}
+```
+
+#### Configuration
+
+```bash
+# Light client configuration
+ETH_CHAIN_ID=1                          # Chain ID (1=mainnet, 11155111=sepolia)
+DEVNET=0                                # Enable devnet mode (skip verification)
+SKIP_LC_VERIFICATION=0                  # Skip BLS/Merkle verification (testing only)
+
+# Reconciler configuration
+LC_RECONCILER_ENABLED=true              # Enable light client reconciler
+LC_RECONCILER_POLL_MS=10000            # Poll interval (ms)
+LC_RECONCILER_MAX_UPDATES=10           # Max updates per cycle
+LC_RECONCILER_MAX_PROOFS=50            # Max proofs to re-verify per cycle
+LC_MIN_CONFIRMATIONS=1                  # Min confirmations for finalized proofs
+```
+
+#### Network Presets
+
+The verifier includes presets for major networks:
+
+| Network | Chain ID | Genesis Validators Root |
+|---------|----------|------------------------|
+| Mainnet | 1 | `0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95` |
+| Sepolia | 11155111 | `0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078` |
+| Holesky | 17000 | `0x9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1` |
+
+#### Light Client-Aware Merkle Proofs
+
+When the light client is bootstrapped, Merkle proofs can be verified against finalized
+execution headers:
+
+```rust
+use l2_bridge::eth_merkle::{
+    verify_merkle_proof_with_lightclient,
+    can_verify_proof_with_lightclient,
+    LightClientProofReadiness,
+};
+
+// Check if proof can be verified
+let readiness = can_verify_proof_with_lightclient(&proof, &lc_storage, min_confirmations);
+match readiness {
+    LightClientProofReadiness::Ready { confirmations } => {
+        // Proof is ready to verify
+    }
+    LightClientProofReadiness::BlockNotFinalized => {
+        // Wait for finalization
+    }
+    LightClientProofReadiness::NotBootstrapped => {
+        // Light client not initialized
+    }
+    // ...
+}
+
+// Verify with light client
+let result = verify_merkle_proof_with_lightclient(&proof, &lc_storage, min_confirmations)?;
+assert!(result.finalized);
+```
+
+#### Operational Requirements
+
+1. **Bootstrap**: Light client must be bootstrapped before it can process updates
+2. **Update Feed**: Updates must be submitted regularly to track finality
+3. **Sync Committee Rotation**: Updates with `next_sync_committee` must be applied at period boundaries
+4. **Storage Growth**: Finalized execution headers are stored (~1KB per header)
+5. **Execution Headers**: Must be provided with updates for receipt proof verification
+
+#### Comparison: Checkpoint vs Sync Committee Light Client
+
+| Aspect | Checkpoint (MVP) | Sync Committee |
+|--------|------------------|----------------|
+| Trust basis | Explicit checkpoints | BLS signatures |
+| Finality model | Block depth | Cryptographic finality |
+| Reorg resistance | Confirmation count | 2 epochs (~13 min) |
+| Verification | Hash comparison | BLS + Merkle proofs |
+| Update frequency | As headers arrive | ~27 hours (committee rotation) |
+| Setup complexity | Simple | Requires bootstrap |
+| Security | Trust in checkpoints | Trust in genesis |
 
 ### 7. External Proof API (`l2-bridge/src/external_proof_api.rs`)
 
@@ -649,18 +851,20 @@ Best for: Deterministic, local confirmation counting without external RPC.
 
 ### Choosing a Verification Mode
 
-| Consideration | Attestation | Merkle Proof | Merkle + Headers |
-|---------------|-------------|--------------|------------------|
-| Trust requirement | Trusted attestor | Ethereum consensus | Bootstrap checkpoints |
-| Confirmation source | Proof payload | Proof payload | Header chain depth |
-| External RPC needed | No | For proof gen | For header submission |
-| Verification speed | Fast | Moderate | Moderate |
-| Decentralization | Semi-centralized | Decentralized | Deterministic |
+| Consideration | Attestation | Merkle Proof | Merkle + Headers | Merkle + Light Client |
+|---------------|-------------|--------------|------------------|----------------------|
+| Trust requirement | Trusted attestor | Ethereum consensus | Bootstrap checkpoints | Genesis + BLS |
+| Confirmation source | Proof payload | Proof payload | Header chain depth | Finalized tip |
+| Finality model | Block depth | Block depth | Block depth | Cryptographic |
+| External RPC needed | No | For proof gen | For header submission | For updates |
+| Verification speed | Fast | Moderate | Moderate | Moderate |
+| Decentralization | Semi-centralized | Decentralized | Deterministic | Trust-minimized |
 
 For production:
 1. **Start**: Attestation mode for speed and simplicity
 2. **Upgrade**: Merkle proofs for trustless verification
-3. **Best**: Merkle + Headers for deterministic confirmations
+3. **Better**: Merkle + Headers for deterministic confirmations
+4. **Best**: Merkle + Light Client for cryptographic finality (recommended)
 
 ## Configuration
 
@@ -712,6 +916,20 @@ The `eth-headers` feature implies `merkle-proofs` and enables:
 - Header submission API (devnet mode)
 - Header-aware Merkle proof verification
 
+PoS sync committee light client requires the `eth-lightclient` feature:
+
+```bash
+cargo build -p l2-bridge --features eth-lightclient
+```
+
+The `eth-lightclient` feature implies `merkle-proofs` and enables:
+- Sync committee light client storage and verification
+- BLS signature verification for sync committee attestations
+- Cryptographic finality tracking
+- Light client bootstrap/update API
+- Light client reconciler for automatic updates
+- Finalized execution header tracking
+
 ### Running the Reconciler
 
 The reconciler is started automatically when the IPPAN node starts with HA mode enabled.
@@ -731,10 +949,16 @@ Run the Merkle proof verification tests (requires `merkle-proofs` feature):
 cargo test -p l2-bridge --features merkle-proofs --test eth_merkle_vectors
 ```
 
-Run all bridge tests:
+Run the light client tests (requires `eth-lightclient` feature):
 
 ```bash
-cargo test -p l2-bridge --features merkle-proofs
+cargo test -p l2-bridge --features eth-lightclient --test eth_lightclient_vectors
+```
+
+Run all bridge tests with all features:
+
+```bash
+cargo test -p l2-bridge --features eth-lightclient
 ```
 
 ### Test Coverage
@@ -745,6 +969,14 @@ The Merkle proof test suite (`eth_merkle_vectors.rs`) includes:
 - **Tamper detection**: Mutated proof nodes, wrong block hash
 - **Filter validation**: Wrong contract, wrong topic0, wrong data hash
 - **Bounds checking**: Invalid log index, empty proof nodes
+
+The light client test suite (`eth_lightclient_vectors.rs`) includes:
+
+- **Bootstrap tests**: Initialization, execution headers, idempotency
+- **Update tests**: Finalized header advancement, sync committee rotation
+- **Finality tests**: Header confirmation counting, non-finalized queries
+- **Proof readiness**: Bootstrap required, block finalization, sufficient confirmations
+- **Verifier tests**: Network configs, header root determinism
 
 ## API Reference
 
@@ -789,3 +1021,14 @@ The Merkle proof test suite (`eth_merkle_vectors.rs`) includes:
 - **Best Tip**: The highest-numbered verified block (with hash tie-breaking)
 - **Fork Choice**: Algorithm for selecting the canonical chain among competing forks
 - **Light Client**: A system that validates block headers without full state
+- **Sync Committee**: 512 validators that attest to beacon blocks in PoS Ethereum
+- **Beacon Block Header**: Consensus layer block header in Ethereum PoS
+- **Execution Payload Header**: Execution layer header embedded in beacon blocks
+- **BLS Signature**: Boneh-Lynn-Shacham signature scheme used in Ethereum PoS
+- **Sync Aggregate**: Collection of sync committee signatures and participation bits
+- **Light Client Bootstrap**: Initial trusted state including sync committee
+- **Light Client Update**: Data to advance light client state with new finality
+- **Finalized Header**: Block header with cryptographic finality (cannot be reverted)
+- **EIP-4788**: Ethereum proposal linking beacon state to execution layer
+- **Sync Committee Period**: ~27 hours during which a sync committee is active
+- **Genesis Validators Root**: Hash of initial validator set, used for domain separation

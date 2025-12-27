@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub mod batch_envelope;
 pub mod canonical;
 pub mod eth_header;
+pub mod eth_lightclient;
 pub mod external_proof;
 pub mod fees;
 pub mod finality;
@@ -40,6 +41,14 @@ pub use canonical::{
 pub use eth_header::{header_hash_from_rlp, header_id_from_rlp};
 pub use eth_header::{
     Address, EthHeaderError, EthereumHeaderV1, Hash256, HeaderId, MAX_EXTRA_DATA_SIZE,
+};
+pub use eth_lightclient::{
+    BLSPubkey, BLSSignature, BeaconBlockHeaderV1, ExecutionPayloadHeaderV1, LightClientBootstrapV1,
+    LightClientError, LightClientFinalityUpdateV1, LightClientStatusV1, LightClientStoreV1,
+    LightClientUpdateV1, Root, SyncAggregateV1, SyncCommitteeV1, TrustedBootstrap,
+    UpdateApplicability, EPOCHS_PER_SYNC_COMMITTEE_PERIOD, MIN_SYNC_COMMITTEE_PARTICIPANTS,
+    SLOTS_PER_EPOCH, SLOTS_PER_SYNC_COMMITTEE_PERIOD, SYNC_COMMITTEE_BITS_SIZE,
+    SYNC_COMMITTEE_SIZE,
 };
 pub use external_proof::{
     AttestationData, EthReceiptAttestationV1, EthReceiptMerkleProofV1, ExternalChainId,

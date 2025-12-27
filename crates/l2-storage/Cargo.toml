@@ -24,6 +24,8 @@ blake3 = "1"
 default = []
 ## Enable Ethereum header storage (requires keccak-headers in l2-core).
 eth-headers = ["l2-core/keccak-headers"]
+## Enable Ethereum PoS light client storage.
+eth-lightclient = []
 
 [dev-dependencies]
 tempfile = "3"

@@ -879,6 +879,218 @@ mod header_aware {
 #[cfg(all(feature = "merkle-proofs", feature = "eth-headers"))]
 pub use header_aware::*;
 
+/// Light client-aware Merkle proof verification (requires `eth-lightclient` feature).
+///
+/// This module extends the basic Merkle proof verification with PoS light client awareness,
+/// requiring that proofs reference blocks that are:
+/// 1. Finalized by the sync committee light client
+/// 2. Have sufficient confirmations from the finalized tip
+#[cfg(all(feature = "merkle-proofs", feature = "eth-lightclient"))]
+mod lightclient_aware {
+    use super::implementation::*;
+    use l2_core::EthReceiptMerkleProofV1;
+    use l2_storage::eth_lightclient::EthLightClientStorage;
+    use thiserror::Error;
+
+    /// Errors from light client-aware Merkle proof verification.
+    #[derive(Debug, Error)]
+    pub enum LightClientMerkleError {
+        #[error("merkle proof error: {0}")]
+        Merkle(#[from] EthMerkleVerifyError),
+
+        #[error("light client not bootstrapped")]
+        NotBootstrapped,
+
+        #[error("block not finalized by light client: {0}")]
+        BlockNotFinalized(String),
+
+        #[error("receipts root mismatch: proof has {proof}, finalized has {stored}")]
+        ReceiptsRootMismatch { proof: String, stored: String },
+
+        #[error("insufficient confirmations: got {got}, need {need}")]
+        InsufficientConfirmations { got: u64, need: u64 },
+
+        #[error("storage error: {0}")]
+        Storage(#[from] l2_storage::eth_lightclient::EthLightClientStorageError),
+    }
+
+    /// Result of light client-aware Merkle proof verification.
+    #[derive(Debug, Clone)]
+    pub struct LightClientVerifiedEvent {
+        /// The verified event from Merkle proof.
+        pub event: MerkleVerifiedEvent,
+
+        /// Number of confirmations from the finalized tip.
+        pub confirmations: u64,
+
+        /// Whether the block is finalized by the light client.
+        pub finalized: bool,
+    }
+
+    /// Verify a Merkle receipt proof with light client finality.
+    ///
+    /// This function:
+    /// 1. Checks that the light client is bootstrapped
+    /// 2. Verifies the block is finalized by the light client
+    /// 3. Optionally cross-checks the receipts_root with stored finalized header
+    /// 4. Computes confirmations from the finalized tip
+    /// 5. Performs the MPT proof verification
+    pub fn verify_merkle_proof_with_lightclient(
+        proof: &EthReceiptMerkleProofV1,
+        storage: &EthLightClientStorage,
+        min_confirmations: u64,
+    ) -> Result<LightClientVerifiedEvent, LightClientMerkleError> {
+        // Step 1: Check light client is bootstrapped
+        if !storage.is_bootstrapped()? {
+            return Err(LightClientMerkleError::NotBootstrapped);
+        }
+
+        // Step 2: Check if block is finalized
+        if !storage.is_execution_header_finalized(&proof.block_hash)? {
+            return Err(LightClientMerkleError::BlockNotFinalized(hex::encode(
+                proof.block_hash,
+            )));
+        }
+
+        // Step 3: Get confirmations and check minimum
+        let confirmations = storage
+            .execution_confirmations(&proof.block_hash)?
+            .unwrap_or(0);
+
+        if confirmations < min_confirmations {
+            return Err(LightClientMerkleError::InsufficientConfirmations {
+                got: confirmations,
+                need: min_confirmations,
+            });
+        }
+
+        // Step 4: Optionally verify receipts_root against stored finalized header
+        if let Some(stored_header) = storage.get_finalized_execution_header(&proof.block_hash)? {
+            // Extract receipts_root from proof's header RLP
+            let header_from_proof =
+                super::implementation::BlockHeader::from_rlp(&proof.header_rlp)?;
+
+            if header_from_proof.receipts_root != stored_header.receipts_root {
+                return Err(LightClientMerkleError::ReceiptsRootMismatch {
+                    proof: hex::encode(header_from_proof.receipts_root),
+                    stored: hex::encode(stored_header.receipts_root),
+                });
+            }
+        }
+
+        // Step 5: Verify block hash matches keccak256(header_rlp)
+        use alloy_primitives::keccak256;
+        let computed_hash = keccak256(&proof.header_rlp);
+        if computed_hash.as_slice() != proof.block_hash {
+            return Err(LightClientMerkleError::Merkle(
+                EthMerkleVerifyError::BlockHashMismatch {
+                    expected: hex::encode(proof.block_hash),
+                    got: hex::encode(computed_hash),
+                },
+            ));
+        }
+
+        // Step 6: Perform the full Merkle proof verification
+        let event = verify_eth_receipt_merkle_proof(proof)?;
+
+        Ok(LightClientVerifiedEvent {
+            event,
+            confirmations,
+            finalized: true,
+        })
+    }
+
+    /// Check if a proof can be verified with the light client.
+    ///
+    /// This is useful for the reconciler to determine if a proof is ready for verification
+    /// or should remain pending waiting for finalization.
+    pub fn can_verify_proof_with_lightclient(
+        proof: &EthReceiptMerkleProofV1,
+        storage: &EthLightClientStorage,
+        min_confirmations: u64,
+    ) -> LightClientProofReadiness {
+        // Check if bootstrapped
+        match storage.is_bootstrapped() {
+            Ok(true) => {}
+            Ok(false) => return LightClientProofReadiness::NotBootstrapped,
+            Err(_) => return LightClientProofReadiness::StorageError,
+        }
+
+        // Check if block is finalized
+        match storage.is_execution_header_finalized(&proof.block_hash) {
+            Ok(true) => {}
+            Ok(false) => return LightClientProofReadiness::BlockNotFinalized,
+            Err(_) => return LightClientProofReadiness::StorageError,
+        }
+
+        // Check confirmations
+        match storage.execution_confirmations(&proof.block_hash) {
+            Ok(Some(confs)) => {
+                if confs >= min_confirmations {
+                    LightClientProofReadiness::Ready {
+                        confirmations: confs,
+                    }
+                } else {
+                    LightClientProofReadiness::InsufficientConfirmations {
+                        got: confs,
+                        need: min_confirmations,
+                    }
+                }
+            }
+            Ok(None) => LightClientProofReadiness::BlockNotFinalized,
+            Err(_) => LightClientProofReadiness::StorageError,
+        }
+    }
+
+    /// Light client proof readiness status.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LightClientProofReadiness {
+        /// Proof is ready for verification.
+        Ready { confirmations: u64 },
+        /// Light client not bootstrapped.
+        NotBootstrapped,
+        /// Block not finalized by light client.
+        BlockNotFinalized,
+        /// Insufficient confirmations from finalized tip.
+        InsufficientConfirmations { got: u64, need: u64 },
+        /// Storage error.
+        StorageError,
+    }
+
+    impl LightClientProofReadiness {
+        /// Check if the proof is ready.
+        pub fn is_ready(&self) -> bool {
+            matches!(self, Self::Ready { .. })
+        }
+
+        /// Check if the proof is pending (might become ready later).
+        pub fn is_pending(&self) -> bool {
+            matches!(
+                self,
+                Self::NotBootstrapped
+                    | Self::BlockNotFinalized
+                    | Self::InsufficientConfirmations { .. }
+            )
+        }
+
+        /// Get a human-readable reason for not being ready.
+        pub fn reason(&self) -> Option<String> {
+            match self {
+                Self::Ready { .. } => None,
+                Self::NotBootstrapped => Some("light client not bootstrapped".to_string()),
+                Self::BlockNotFinalized => Some("block not finalized by light client".to_string()),
+                Self::InsufficientConfirmations { got, need } => {
+                    Some(format!("insufficient confirmations: {} < {}", got, need))
+                }
+                Self::StorageError => Some("storage error".to_string()),
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "merkle-proofs", feature = "eth-lightclient"))]
+pub use lightclient_aware::*;
+
 // Stub exports when feature is not enabled
 #[cfg(not(feature = "merkle-proofs"))]
 pub mod stub {

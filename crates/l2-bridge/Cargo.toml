@@ -28,6 +28,11 @@ alloy-rlp = { version = "0.3", optional = true }
 alloy-primitives = { version = "0.8", optional = true }
 sha3 = { version = "0.10", optional = true }
 blake3 = { version = "1", optional = true }
+# BLS signature verification for Ethereum PoS light client
+blst = { version = "0.3", optional = true }
+# SHA-256 for SSZ hashing
+sha2 = { version = "0.10", optional = true }
+hex-literal = { version = "0.4", optional = true }
 
 [features]
 default = []
@@ -37,6 +42,8 @@ signed-envelopes = ["dep:ed25519-dalek", "l2-core/signed-envelopes"]
 merkle-proofs = ["dep:alloy-rlp", "dep:alloy-primitives", "dep:sha3", "dep:blake3"]
 ## Enable Ethereum header chain verification (light client MVP).
 eth-headers = ["l2-core/keccak-headers", "l2-storage/eth-headers", "merkle-proofs"]
+## Enable Ethereum PoS sync committee light client verification.
+eth-lightclient = ["l2-storage/eth-lightclient", "merkle-proofs", "dep:blst", "dep:sha2", "dep:hex-literal"]
 
 [dev-dependencies]
 tempfile = "3"
