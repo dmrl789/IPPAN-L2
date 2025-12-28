@@ -1505,7 +1505,11 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
                 oldest_included_age_ms,
             },
             last_finalised,
-            last_reconcile_ms: state.reconciler.as_ref().map(|r| r.last_reconcile_ms()).filter(|&ms| ms > 0)
+            last_reconcile_ms: state
+                .reconciler
+                .as_ref()
+                .map(|r| r.last_reconcile_ms())
+                .filter(|&ms| ms > 0),
         },
         forced_inclusion: ForcedInclusionInfo {
             enabled: true,

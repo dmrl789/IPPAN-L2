@@ -803,7 +803,10 @@ mod tests {
 
         assert!(entry.execution_header.is_some());
         assert_eq!(entry.update.finalized_header.slot, 8_000_900);
-        assert_eq!(entry.execution_header.as_ref().unwrap().block_number, 18_000_000);
+        assert_eq!(
+            entry.execution_header.as_ref().unwrap().block_number,
+            18_000_000
+        );
     }
 
     #[test]

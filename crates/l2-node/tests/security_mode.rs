@@ -87,12 +87,10 @@ fn default_security_mode_is_dev() {
 
     let mode = env::var("NODE_SECURITY_MODE")
         .ok()
-        .map(|s| {
-            match s.to_lowercase().as_str() {
-                "prod" | "production" => "prod",
-                "staging" => "staging",
-                _ => "dev",
-            }
+        .map(|s| match s.to_lowercase().as_str() {
+            "prod" | "production" => "prod",
+            "staging" => "staging",
+            _ => "dev",
         })
         .unwrap_or("dev");
 
