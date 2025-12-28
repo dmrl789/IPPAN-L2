@@ -8,12 +8,21 @@
 //! - `POST /bridge/eth/lightclient/update` - Submit a light client update
 //! - `GET /bridge/eth/lightclient/status` - Get current light client status
 //! - `GET /bridge/eth/lightclient/finalized/:block_hash` - Check if execution header is finalized
+//! - `POST /bridge/eth/execution_headers` - Submit bulk execution headers (devnet only)
 //!
 //! ## Trust Model
 //!
 //! - Bootstrap can only be applied once (unless devnet reset is enabled)
 //! - Updates are verified cryptographically using BLS signatures
 //! - Finalized execution headers are deterministically derived from verified beacon blocks
+//!
+//! ## Execution Header Flow
+//!
+//! When a Merkle proof arrives before the execution header is available for the block,
+//! the proof stays in "pending" (Unverified) state. Execution headers can be submitted via:
+//! 1. The `execution_header` field in bootstrap/update requests
+//! 2. The `submit_execution_header` method in the reconciler handle
+//! 3. The bulk `POST /bridge/eth/execution_headers` endpoint (devnet only)
 
 use crate::eth_lightclient_verify::{
     LightClientVerifier, LightClientVerifierConfig, LightClientVerifyError,
@@ -249,6 +258,61 @@ pub struct FinalizedHeaderResponse {
     /// Confirmations (finalized tip number - this block number + 1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmations: Option<u64>,
+}
+
+// ========== Bulk Execution Header Submission (devnet) ==========
+
+/// Default maximum execution headers per bulk request.
+pub const DEFAULT_MAX_EXECUTION_HEADERS_PER_REQUEST: usize = 100;
+
+/// Default maximum total bytes for bulk execution header requests.
+pub const DEFAULT_MAX_EXECUTION_HEADERS_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Request to submit bulk execution headers.
+///
+/// POST /bridge/eth/execution_headers
+///
+/// This endpoint allows submitting execution headers for blocks that were
+/// finalized by earlier beacon updates but whose execution headers were not
+/// available at the time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkExecutionHeadersRequest {
+    /// List of execution headers to submit.
+    pub headers: Vec<ExecutionPayloadHeaderV1>,
+}
+
+/// Result for a single execution header submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionHeaderResult {
+    /// Block hash of this header.
+    #[serde(with = "hex_root")]
+    pub block_hash: Root,
+
+    /// Block number of this header.
+    pub block_number: u64,
+
+    /// Whether the header was accepted.
+    pub accepted: bool,
+
+    /// Reason if not accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Response from bulk execution header submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkExecutionHeadersResponse {
+    /// Number of headers accepted.
+    pub accepted_count: usize,
+
+    /// Number of headers skipped (already stored or not yet finalized).
+    pub skipped_count: usize,
+
+    /// Number of headers rejected (validation errors).
+    pub rejected_count: usize,
+
+    /// Individual results for each header.
+    pub results: Vec<ExecutionHeaderResult>,
 }
 
 // ========== Serde Helpers ==========
@@ -549,6 +613,137 @@ impl LightClientApi {
     pub fn can_verify_at_block(&self, block_hash: &Root) -> Result<bool, LightClientApiError> {
         Ok(self.storage.is_execution_header_finalized(block_hash)?)
     }
+
+    /// Submit bulk execution headers.
+    ///
+    /// POST /bridge/eth/execution_headers
+    ///
+    /// This endpoint allows submitting execution headers for blocks whose
+    /// block numbers are within the finalized range (i.e., block_number <= finalized tip).
+    /// Headers are validated and stored if they pass validation.
+    ///
+    /// ## Caps (DoS protection)
+    ///
+    /// - Maximum headers per request: `DEFAULT_MAX_EXECUTION_HEADERS_PER_REQUEST` (100)
+    /// - Only available in devnet mode (to prevent abuse in prod)
+    ///
+    /// ## Use Case
+    ///
+    /// When a Merkle proof arrives before the execution header is available,
+    /// the proof stays in "pending" (Unverified) state. This endpoint allows
+    /// external systems to submit the missing execution header, enabling the
+    /// reconciler to verify the proof on its next cycle.
+    pub fn submit_execution_headers(
+        &self,
+        request: BulkExecutionHeadersRequest,
+    ) -> Result<BulkExecutionHeadersResponse, LightClientApiError> {
+        // Check devnet mode
+        if !self.config.devnet_enabled {
+            return Err(LightClientApiError::InvalidRequest(
+                "bulk execution header submission is only available in devnet mode".to_string(),
+            ));
+        }
+
+        // Check cap on number of headers
+        if request.headers.len() > DEFAULT_MAX_EXECUTION_HEADERS_PER_REQUEST {
+            return Err(LightClientApiError::InvalidRequest(format!(
+                "too many headers: {} (max {})",
+                request.headers.len(),
+                DEFAULT_MAX_EXECUTION_HEADERS_PER_REQUEST
+            )));
+        }
+
+        // Check bootstrapped
+        if !self.storage.is_bootstrapped()? {
+            return Err(LightClientApiError::NotBootstrapped);
+        }
+
+        let mut accepted_count = 0;
+        let mut skipped_count = 0;
+        let mut rejected_count = 0;
+        let mut results = Vec::with_capacity(request.headers.len());
+
+        for header in &request.headers {
+            // Basic validation
+            if let Err(e) = header.validate_basic() {
+                results.push(ExecutionHeaderResult {
+                    block_hash: header.block_hash,
+                    block_number: header.block_number,
+                    accepted: false,
+                    reason: Some(format!("validation failed: {}", e)),
+                });
+                rejected_count += 1;
+                continue;
+            }
+
+            // Check if already stored first (for accurate reporting)
+            let already_stored = self
+                .storage
+                .is_execution_header_finalized(&header.block_hash)?;
+
+            if already_stored {
+                results.push(ExecutionHeaderResult {
+                    block_hash: header.block_hash,
+                    block_number: header.block_number,
+                    accepted: false,
+                    reason: Some("header already stored".to_string()),
+                });
+                skipped_count += 1;
+                continue;
+            }
+
+            // Try to store if within finalized range
+            match self.storage.store_execution_header_if_finalized(header) {
+                Ok(true) => {
+                    results.push(ExecutionHeaderResult {
+                        block_hash: header.block_hash,
+                        block_number: header.block_number,
+                        accepted: true,
+                        reason: None,
+                    });
+                    accepted_count += 1;
+                    debug!(
+                        block_hash = %hex::encode(header.block_hash),
+                        block_number = header.block_number,
+                        "stored execution header via bulk API"
+                    );
+                }
+                Ok(false) => {
+                    // Block not yet finalized
+                    results.push(ExecutionHeaderResult {
+                        block_hash: header.block_hash,
+                        block_number: header.block_number,
+                        accepted: false,
+                        reason: Some("block not yet finalized".to_string()),
+                    });
+                    skipped_count += 1;
+                }
+                Err(e) => {
+                    results.push(ExecutionHeaderResult {
+                        block_hash: header.block_hash,
+                        block_number: header.block_number,
+                        accepted: false,
+                        reason: Some(format!("storage error: {}", e)),
+                    });
+                    rejected_count += 1;
+                }
+            }
+        }
+
+        info!(
+            accepted = accepted_count,
+            skipped = skipped_count,
+            rejected = rejected_count,
+            "processed bulk execution headers"
+        );
+
+        Ok(BulkExecutionHeadersResponse {
+            accepted_count,
+            skipped_count,
+            rejected_count,
+            results,
+        })
+    }
 }
 
 /// Get current time in milliseconds.
@@ -754,5 +949,221 @@ mod tests {
         // Clean up
         std::env::remove_var("ETH_CHAIN_ID");
         std::env::remove_var("DEVNET");
+    }
+
+    // ========== Bulk Execution Header Tests ==========
+
+    fn test_execution_header(block_number: u64) -> ExecutionPayloadHeaderV1 {
+        ExecutionPayloadHeaderV1 {
+            parent_hash: [0x11; 32],
+            fee_recipient: [0x22; 20],
+            state_root: [0x33; 32],
+            receipts_root: [0x44; 32],
+            logs_bloom: [0x00; 256],
+            prev_randao: [0x55; 32],
+            block_number,
+            gas_limit: 30_000_000,
+            gas_used: 15_000_000,
+            timestamp: 1_700_000_000 + block_number,
+            extra_data: vec![],
+            base_fee_per_gas: 10_000_000_000,
+            block_hash: {
+                // Make hash unique based on block number
+                let mut hash = [0x66; 32];
+                hash[0..8].copy_from_slice(&block_number.to_le_bytes());
+                hash
+            },
+            transactions_root: [0x77; 32],
+            withdrawals_root: [0x88; 32],
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+
+    #[test]
+    fn bulk_execution_headers_requires_bootstrap() {
+        let api = setup_api();
+
+        let request = BulkExecutionHeadersRequest {
+            headers: vec![test_execution_header(18_000_000)],
+        };
+
+        let result = api.submit_execution_headers(request);
+        assert!(matches!(result, Err(LightClientApiError::NotBootstrapped)));
+    }
+
+    #[test]
+    fn bulk_execution_headers_empty_request() {
+        let api = setup_api();
+
+        // Bootstrap first with an execution header to establish finalized tip
+        let exec_header = test_execution_header(18_000_000);
+        let bootstrap_request = BootstrapRequest {
+            bootstrap: test_bootstrap(),
+            execution_header: Some(exec_header),
+        };
+        api.bootstrap(bootstrap_request).expect("bootstrap");
+
+        // Submit empty request
+        let request = BulkExecutionHeadersRequest { headers: vec![] };
+        let response = api.submit_execution_headers(request).expect("submit");
+
+        assert_eq!(response.accepted_count, 0);
+        assert_eq!(response.skipped_count, 0);
+        assert_eq!(response.rejected_count, 0);
+        assert!(response.results.is_empty());
+    }
+
+    #[test]
+    fn bulk_execution_headers_accepts_finalized_blocks() {
+        let api = setup_api();
+
+        // Bootstrap with execution header at block 18_000_000
+        let exec_header = test_execution_header(18_000_000);
+        let bootstrap_request = BootstrapRequest {
+            bootstrap: test_bootstrap(),
+            execution_header: Some(exec_header),
+        };
+        api.bootstrap(bootstrap_request).expect("bootstrap");
+
+        // Submit update to advance finalized tip to include more blocks
+        let update_exec = test_execution_header(18_000_100);
+        let update_request = UpdateRequest {
+            update: test_update(),
+            execution_header: Some(update_exec),
+        };
+        api.submit_update(update_request).expect("update");
+
+        // Now submit execution headers for blocks in between (18_000_001 to 18_000_010)
+        let headers: Vec<_> = (1..=10)
+            .map(|i| test_execution_header(18_000_000 + i))
+            .collect();
+        let request = BulkExecutionHeadersRequest { headers };
+        let response = api.submit_execution_headers(request).expect("submit");
+
+        // All should be accepted since they're within finalized range
+        assert_eq!(response.accepted_count, 10);
+        assert_eq!(response.skipped_count, 0);
+        assert_eq!(response.rejected_count, 0);
+    }
+
+    #[test]
+    fn bulk_execution_headers_skips_not_finalized() {
+        let api = setup_api();
+
+        // Bootstrap with execution header at block 18_000_000
+        let exec_header = test_execution_header(18_000_000);
+        let bootstrap_request = BootstrapRequest {
+            bootstrap: test_bootstrap(),
+            execution_header: Some(exec_header),
+        };
+        api.bootstrap(bootstrap_request).expect("bootstrap");
+
+        // Submit headers for blocks beyond finalized tip
+        let headers: Vec<_> = (1..=5)
+            .map(|i| test_execution_header(18_000_000 + i))
+            .collect();
+        let request = BulkExecutionHeadersRequest { headers };
+        let response = api.submit_execution_headers(request).expect("submit");
+
+        // All should be skipped since they're beyond finalized tip
+        assert_eq!(response.accepted_count, 0);
+        assert_eq!(response.skipped_count, 5);
+        assert_eq!(response.rejected_count, 0);
+        for result in &response.results {
+            assert!(!result.accepted);
+            assert!(result
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("not yet finalized"));
+        }
+    }
+
+    #[test]
+    fn bulk_execution_headers_skips_already_stored() {
+        let api = setup_api();
+
+        // Bootstrap with execution header
+        let exec_header = test_execution_header(18_000_000);
+        let bootstrap_request = BootstrapRequest {
+            bootstrap: test_bootstrap(),
+            execution_header: Some(exec_header.clone()),
+        };
+        api.bootstrap(bootstrap_request).expect("bootstrap");
+
+        // Try to submit the same header again
+        let request = BulkExecutionHeadersRequest {
+            headers: vec![exec_header],
+        };
+        let response = api.submit_execution_headers(request).expect("submit");
+
+        assert_eq!(response.accepted_count, 0);
+        assert_eq!(response.skipped_count, 1);
+        assert_eq!(response.rejected_count, 0);
+        assert!(response.results[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("already stored"));
+    }
+
+    #[test]
+    fn bulk_execution_headers_cap_enforced() {
+        let api = setup_api();
+
+        // Bootstrap
+        let exec_header = test_execution_header(18_000_000);
+        let bootstrap_request = BootstrapRequest {
+            bootstrap: test_bootstrap(),
+            execution_header: Some(exec_header),
+        };
+        api.bootstrap(bootstrap_request).expect("bootstrap");
+
+        // Create request with too many headers
+        let headers: Vec<_> = (0..DEFAULT_MAX_EXECUTION_HEADERS_PER_REQUEST + 1)
+            .map(|i| test_execution_header(18_000_000 + i as u64))
+            .collect();
+        let request = BulkExecutionHeadersRequest { headers };
+
+        let result = api.submit_execution_headers(request);
+        assert!(matches!(
+            result,
+            Err(LightClientApiError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_execution_headers_devnet_only() {
+        // Create a prod-mode API (skip verification for test data, but devnet_enabled=false)
+        let dir = tempdir().expect("tmpdir");
+        let db = sled::open(dir.path()).expect("open sled");
+        let storage = Arc::new(EthLightClientStorage::new(&db, 1).expect("storage"));
+        let config = LightClientApiConfig {
+            chain_id: 1,
+            devnet_enabled: false,   // This is the key - prod mode
+            skip_verification: true, // Skip verification for test data
+        };
+        let api = LightClientApi::with_default_verifier(storage, config);
+
+        // Bootstrap
+        let bootstrap_request = BootstrapRequest {
+            bootstrap: test_bootstrap(),
+            execution_header: None,
+        };
+        api.bootstrap(bootstrap_request).expect("bootstrap");
+
+        // Try to submit headers - should fail because devnet is not enabled
+        let request = BulkExecutionHeadersRequest {
+            headers: vec![test_execution_header(18_000_000)],
+        };
+        let result = api.submit_execution_headers(request);
+        assert!(matches!(
+            result,
+            Err(LightClientApiError::InvalidRequest(_))
+        ));
+        if let Err(LightClientApiError::InvalidRequest(msg)) = result {
+            assert!(msg.contains("devnet"), "error should mention devnet");
+        }
     }
 }
