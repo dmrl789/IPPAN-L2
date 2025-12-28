@@ -219,7 +219,6 @@ impl std::str::FromStr for SecurityMode {
     }
 }
 
-
 // ============== Auth Configuration ==============
 
 /// Authentication configuration for the node.
@@ -236,7 +235,9 @@ impl AuthConfig {
     /// Load auth configuration from environment.
     pub fn from_env() -> Self {
         let security_mode = Settings::security_mode();
-        let admin_token = std::env::var("IPPAN_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+        let admin_token = std::env::var("IPPAN_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         Self {
             admin_token,
@@ -1515,7 +1516,9 @@ async fn run() -> Result<(), NodeError> {
     let execution_header_routes = Router::new()
         // POST /bridge/eth/execution_headers - larger limit (1 MiB)
         .route("/eth/execution_headers", post(submit_execution_headers))
-        .layer(RequestBodyLimitLayer::new(request_limits::MAX_EXECUTION_HEADERS_BODY));
+        .layer(RequestBodyLimitLayer::new(
+            request_limits::MAX_EXECUTION_HEADERS_BODY,
+        ));
 
     // Standard bridge routes (use default body limit)
     let bridge_standard_routes = Router::new()
@@ -1553,7 +1556,9 @@ async fn run() -> Result<(), NodeError> {
         .route("/m2m/schedule", get(m2m_get_schedule))
         .with_state(state.clone())
         // Global default body limit (256 KiB) - applied to all routes without explicit limit
-        .layer(RequestBodyLimitLayer::new(request_limits::DEFAULT_BODY_LIMIT));
+        .layer(RequestBodyLimitLayer::new(
+            request_limits::DEFAULT_BODY_LIMIT,
+        ));
 
     let addr: SocketAddr = settings.listen_addr.parse().expect("invalid listen addr");
     info!(%addr, "listening");
@@ -3350,9 +3355,11 @@ mod request_limits {
     pub const MAX_PROOF_NODES_BYTES: usize = 128 * 1024; // 128 KiB
 
     /// Maximum topics per log.
+    #[allow(dead_code)] // Reserved for future log validation
     pub const MAX_TOPICS: usize = 4;
 
     /// Maximum log data bytes.
+    #[allow(dead_code)] // Reserved for future log validation
     pub const MAX_LOG_DATA_BYTES: usize = 32 * 1024; // 32 KiB
 
     /// Maximum headers per submission request.

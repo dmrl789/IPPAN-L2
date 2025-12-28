@@ -38,9 +38,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Test helper: Verify token
 fn verify_token(expected: Option<&str>, provided: Option<&str>, mode: &str) -> bool {
     match (expected, provided) {
-        (Some(expected), Some(provided)) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
-        (None, _) if !requires_auth(mode) => true,  // Devnet without token is ok
-        (Some(_), None) => !requires_auth(mode),    // No token provided - only ok in devnet
+        (Some(expected), Some(provided)) => {
+            constant_time_eq(expected.as_bytes(), provided.as_bytes())
+        }
+        (None, _) if !requires_auth(mode) => true, // Devnet without token is ok
+        (Some(_), None) => !requires_auth(mode),   // No token provided - only ok in devnet
         _ => false,
     }
 }
@@ -222,28 +224,30 @@ fn security_mode_allows_ops_endpoints() {
 // ============== Request Limit Tests ==============
 
 mod request_limits {
-    pub const DEFAULT_BODY_LIMIT: usize = 256 * 1024;  // 256 KiB
-    pub const MAX_PROOF_BODY: usize = 512 * 1024;      // 512 KiB
-    pub const MAX_EXECUTION_HEADERS_BODY: usize = 1024 * 1024;  // 1 MiB
+    pub const DEFAULT_BODY_LIMIT: usize = 256 * 1024; // 256 KiB
+    pub const MAX_PROOF_BODY: usize = 512 * 1024; // 512 KiB
+    pub const MAX_EXECUTION_HEADERS_BODY: usize = 1024 * 1024; // 1 MiB
     pub const MAX_PROOF_NODES: usize = 64;
-    pub const MAX_PROOF_NODES_BYTES: usize = 128 * 1024;  // 128 KiB
+    pub const MAX_PROOF_NODES_BYTES: usize = 128 * 1024; // 128 KiB
     pub const MAX_HEADERS_PER_REQUEST: usize = 100;
 }
 
 #[test]
 fn request_limits_are_reasonable() {
+    // Use const blocks for compile-time assertions on constants
     // Default limit should be smaller than proof limit
-    assert!(request_limits::DEFAULT_BODY_LIMIT < request_limits::MAX_PROOF_BODY);
+    const _: () = assert!(request_limits::DEFAULT_BODY_LIMIT < request_limits::MAX_PROOF_BODY);
 
     // Proof limit should be smaller than execution headers limit
-    assert!(request_limits::MAX_PROOF_BODY < request_limits::MAX_EXECUTION_HEADERS_BODY);
+    const _: () =
+        assert!(request_limits::MAX_PROOF_BODY < request_limits::MAX_EXECUTION_HEADERS_BODY);
 
     // Proof nodes limit should be reasonable
-    assert!(request_limits::MAX_PROOF_NODES <= 64);
-    assert!(request_limits::MAX_PROOF_NODES_BYTES <= 256 * 1024);
+    const _: () = assert!(request_limits::MAX_PROOF_NODES <= 64);
+    const _: () = assert!(request_limits::MAX_PROOF_NODES_BYTES <= 256 * 1024);
 
     // Headers per request should be bounded
-    assert!(request_limits::MAX_HEADERS_PER_REQUEST <= 1000);
+    const _: () = assert!(request_limits::MAX_HEADERS_PER_REQUEST <= 1000);
 }
 
 #[test]

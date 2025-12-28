@@ -689,6 +689,7 @@ impl HeaderVerificationContext {
 }
 
 /// Verify a Merkle proof using the eth_merkle verifier.
+#[allow(dead_code)] // Used when eth-headers feature is enabled
 fn verify_merkle_proof(
     config: &ExternalProofReconcilerConfig,
     proof: &ExternalEventProofV1,
@@ -721,6 +722,7 @@ fn verify_merkle_proof(
 }
 
 /// Legacy Merkle proof verification (without header store).
+#[allow(dead_code)] // Used when eth-headers feature is enabled
 fn verify_merkle_proof_legacy(
     config: &ExternalProofReconcilerConfig,
     merkle_proof: &l2_core::EthReceiptMerkleProofV1,
