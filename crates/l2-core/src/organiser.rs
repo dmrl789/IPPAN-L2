@@ -399,6 +399,7 @@ impl Organiser for NoopOrganiser {
         OrganiserVersion::None
     }
 
+    #[cfg_attr(feature = "profiling", tracing::instrument(skip(self, _inputs), level = "debug", name = "organiser_decide"))]
     fn decide(&self, _inputs: &OrganiserInputs) -> OrganiserDecision {
         self.default_decision.clone()
     }

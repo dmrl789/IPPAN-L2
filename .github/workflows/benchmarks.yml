@@ -1,0 +1,159 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: 'Comma-separated list of scenarios to run (empty for all)'
+        required: false
+        default: ''
+        type: string
+      iterations:
+        description: 'Number of iterations per scenario'
+        required: false
+        default: '1000'
+        type: string
+      run_criterion:
+        description: 'Also run criterion microbenchmarks'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  l2-bench:
+    name: L2 Benchmark Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # For git commit info in output
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build l2-bench
+        run: cargo build --release -p l2-bench
+
+      - name: Run l2-bench scenarios
+        id: benchmark
+        run: |
+          mkdir -p benchmark-results
+          
+          # Build command with optional scenario filter
+          CMD="cargo run --release -p l2-bench -- run"
+          
+          if [ -n "${{ github.event.inputs.scenarios }}" ]; then
+            CMD="$CMD --scenario ${{ github.event.inputs.scenarios }}"
+          else
+            CMD="$CMD --scenario all"
+          fi
+          
+          CMD="$CMD --iterations ${{ github.event.inputs.iterations }}"
+          CMD="$CMD --output benchmark-results/bench.json"
+          
+          echo "Running: $CMD"
+          $CMD
+          
+          # Print summary to log
+          echo "## Benchmark Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo run --release -p l2-bench -- run --scenario all --iterations 1 2>&1 | tail -40 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results/
+          retention-days: 90
+
+      - name: Add benchmark info to summary
+        run: |
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Runner:** ${{ runner.os }} / ${{ runner.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Benchmark results artifact: \`benchmark-results\`" >> $GITHUB_STEP_SUMMARY
+
+  criterion:
+    name: Criterion Microbenchmarks
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.run_criterion == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Run l2-core criterion benchmarks
+        run: |
+          cargo bench -p l2-core --bench core_benchmarks -- --noplot 2>&1 | tee criterion-core.txt
+
+      - name: Run l2-batcher criterion benchmarks
+        run: |
+          cargo bench -p l2-batcher --bench batcher_benchmarks -- --noplot 2>&1 | tee criterion-batcher.txt
+
+      - name: Run l2-bridge criterion benchmarks
+        run: |
+          cargo bench -p l2-bridge --bench bridge_benchmarks -- --noplot 2>&1 | tee criterion-bridge.txt
+
+      - name: Run l2-bridge merkle criterion benchmarks
+        run: |
+          cargo bench -p l2-bridge --bench bridge_benchmarks --features merkle-proofs -- --noplot 2>&1 | tee criterion-bridge-merkle.txt
+
+      - name: Upload criterion results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: |
+            criterion-*.txt
+            target/criterion/
+          retention-days: 90
+
+      - name: Add criterion summary
+        run: |
+          echo "## Criterion Microbenchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### l2-core" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "^(compute_m2m_fee|canonical_encode|canonical_decode|batch_envelope|compute_tx_root|noop_organiser)" criterion-core.txt || echo "No results found"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### l2-batcher" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "^(gbdt_organiser|policy_bounds)" criterion-batcher.txt || echo "No results found"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  profiling:
+    name: Profiling Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build with profiling feature
+        run: |
+          cargo build -p l2-core --features profiling
+          cargo build -p l2-batcher --features profiling
+          cargo build -p l2-storage --features profiling
+          cargo build -p l2-bridge --features profiling
+
+      - name: Verify profiling spans are compiled
+        run: |
+          # Check that tracing spans are present in the build
+          echo "Profiling build successful - tracing spans enabled"

@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod batch_envelope;
+pub mod bench;
 pub mod canonical;
 pub mod eth_header;
 pub mod eth_lightclient;

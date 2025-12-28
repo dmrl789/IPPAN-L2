@@ -18,6 +18,8 @@ async-l1-http = ["dep:reqwest", "dep:base64"]
 contract-posting = []
 ## Enable signed batch envelopes.
 signed-envelopes = ["l2-core/signed-envelopes"]
+## Enable profiling spans for flamegraph-friendly tracing.
+profiling = ["l2-core/profiling"]
 
 [dependencies]
 async-trait = "0.1"
@@ -36,3 +38,8 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+criterion = "0.5"
+
+[[bench]]
+name = "batcher_benchmarks"
+harness = false

@@ -44,7 +44,15 @@ merkle-proofs = ["dep:alloy-rlp", "dep:alloy-primitives", "dep:sha3", "dep:blake
 eth-headers = ["l2-core/keccak-headers", "l2-storage/eth-headers", "merkle-proofs"]
 ## Enable Ethereum PoS sync committee light client verification.
 eth-lightclient = ["l2-storage/eth-lightclient", "merkle-proofs", "dep:blst", "dep:sha2", "dep:hex-literal"]
+## Enable profiling spans for flamegraph-friendly tracing.
+profiling = ["l2-core/profiling"]
 
 [dev-dependencies]
 tempfile = "3"
 sled = "0.34"
+criterion = "0.5"
+blake3 = "1"
+
+[[bench]]
+name = "bridge_benchmarks"
+harness = false
