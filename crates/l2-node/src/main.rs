@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::signal;
 use tokio::sync::RwLock;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -149,15 +150,60 @@ impl std::str::FromStr for PosterMode {
 
 /// Security mode for the node.
 ///
-/// Controls security-sensitive features like poster mode restrictions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Controls security-sensitive features like poster mode restrictions,
+/// endpoint authentication requirements, and devnet-only endpoint access.
+///
+/// ## Modes
+///
+/// - `devnet`: Development mode - all features enabled, auth optional
+/// - `staging`: Staging mode - auth required for sensitive ops endpoints
+/// - `prod`: Production mode - strictest security, auth required everywhere
+///
+/// ## Environment Variables
+///
+/// - `NODE_SECURITY_MODE`: Set to "devnet", "staging", or "prod"
+/// - `IPPAN_ADMIN_TOKEN`: Required for staging/prod, used for auth
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecurityMode {
-    /// Development mode - all features enabled, no restrictions.
-    Dev,
+    /// Development/devnet mode - all features enabled, no restrictions.
+    /// Auth is optional but supported if `IPPAN_ADMIN_TOKEN` is set.
+    #[default]
+    Devnet,
     /// Staging mode - most prod-like restrictions but with some flexibility.
+    /// Auth required for sensitive ops endpoints.
     Staging,
     /// Production mode - strictest security, raw poster mode forbidden.
+    /// Auth required for all sensitive endpoints.
     Prod,
+}
+
+impl SecurityMode {
+    /// Check if auth is required for sensitive ops endpoints.
+    pub fn requires_auth(&self) -> bool {
+        matches!(self, Self::Staging | Self::Prod)
+    }
+
+    /// Check if devnet-only endpoints are allowed.
+    pub fn allows_devnet_endpoints(&self) -> bool {
+        matches!(self, Self::Devnet)
+    }
+
+    /// Check if ops endpoints are allowed (with or without auth).
+    pub fn allows_ops_endpoints(&self) -> bool {
+        // In prod, ops endpoints are disabled entirely
+        // In staging, they require auth
+        // In devnet, they're open
+        !matches!(self, Self::Prod)
+    }
+
+    /// Get the mode name for logging.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Devnet => "devnet",
+            Self::Staging => "staging",
+            Self::Prod => "prod",
+        }
+    }
 }
 
 impl std::str::FromStr for SecurityMode {
@@ -167,9 +213,77 @@ impl std::str::FromStr for SecurityMode {
         Ok(match s.to_lowercase().as_str() {
             "prod" | "production" => Self::Prod,
             "staging" => Self::Staging,
-            _ => Self::Dev, // default
+            "devnet" | "dev" | "development" | "" => Self::Devnet,
+            _ => Self::Devnet, // default to safest development mode
         })
     }
+}
+
+
+// ============== Auth Configuration ==============
+
+/// Authentication configuration for the node.
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    /// Admin token for sensitive endpoint authentication.
+    /// Required in staging/prod mode.
+    pub admin_token: Option<String>,
+    /// Security mode determining auth requirements.
+    pub security_mode: SecurityMode,
+}
+
+impl AuthConfig {
+    /// Load auth configuration from environment.
+    pub fn from_env() -> Self {
+        let security_mode = Settings::security_mode();
+        let admin_token = std::env::var("IPPAN_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+
+        Self {
+            admin_token,
+            security_mode,
+        }
+    }
+
+    /// Validate the auth configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.security_mode.requires_auth() && self.admin_token.is_none() {
+            return Err(format!(
+                "NODE_SECURITY_MODE={} requires IPPAN_ADMIN_TOKEN to be set",
+                self.security_mode.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if a provided token matches the admin token.
+    ///
+    /// Uses constant-time comparison to prevent timing attacks.
+    pub fn verify_token(&self, provided: &str) -> bool {
+        match &self.admin_token {
+            Some(expected) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
+            None => {
+                // In devnet mode without token, allow access
+                !self.security_mode.requires_auth()
+            }
+        }
+    }
+
+    /// Check if auth is required for ops endpoints.
+    pub fn requires_auth_for_ops(&self) -> bool {
+        self.security_mode.requires_auth()
+    }
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Settings {
@@ -178,7 +292,7 @@ impl Settings {
         std::env::var("NODE_SECURITY_MODE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(SecurityMode::Dev)
+            .unwrap_or(SecurityMode::Devnet)
     }
 
     /// Validate settings at startup. Fails fast on invalid configuration.
@@ -186,11 +300,15 @@ impl Settings {
         let security_mode = Self::security_mode();
         let poster_mode = self.get_poster_mode();
 
+        // Validate auth configuration
+        let auth_config = AuthConfig::from_env();
+        auth_config.validate().map_err(NodeError::Config)?;
+
         // SECURITY: In production mode, raw poster mode is forbidden
         if security_mode == SecurityMode::Prod && poster_mode == PosterMode::Raw {
             return Err(NodeError::Config(
                 "NODE_SECURITY_MODE=prod forbids L2_POSTER_MODE=raw. \
-                 Raw posting mode is insecure and only allowed in dev/staging environments. \
+                 Raw posting mode is insecure and only allowed in devnet/staging environments. \
                  Either set NODE_SECURITY_MODE=staging or use L2_POSTER_MODE=contract"
                     .to_string(),
             ));
@@ -723,6 +841,8 @@ struct AppState {
     m2m_storage: Option<Arc<M2mStorage>>,
     // M2M fee schedule
     fee_schedule: FeeSchedule,
+    // Authentication config
+    auth_config: AuthConfig,
 }
 
 impl AppState {
@@ -779,6 +899,69 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    /// Check if admin auth is required and valid.
+    ///
+    /// Returns Ok(()) if:
+    /// - Security mode is devnet (no auth required)
+    /// - Valid admin token is provided in X-IPPAN-ADMIN-TOKEN header
+    fn check_admin_auth(&self, headers: &axum::http::HeaderMap) -> Result<(), AuthError> {
+        // In devnet mode, auth is optional
+        if !self.auth_config.requires_auth_for_ops() {
+            return Ok(());
+        }
+
+        // Extract token from header
+        let token = headers
+            .get("X-IPPAN-ADMIN-TOKEN")
+            .and_then(|v| v.to_str().ok())
+            .ok_or(AuthError::MissingToken)?;
+
+        // Verify token
+        if self.auth_config.verify_token(token) {
+            Ok(())
+        } else {
+            Err(AuthError::InvalidToken)
+        }
+    }
+}
+
+// ============== Auth Error Types ==============
+
+/// Authentication error type.
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("missing X-IPPAN-ADMIN-TOKEN header")]
+    MissingToken,
+    #[error("invalid admin token")]
+    InvalidToken,
+    #[error("endpoint not available in this security mode")]
+    EndpointNotAllowed,
+}
+
+impl AuthError {
+    /// Get HTTP status code for this error.
+    fn status_code(&self) -> StatusCode {
+        match self {
+            AuthError::MissingToken => StatusCode::UNAUTHORIZED,
+            AuthError::InvalidToken => StatusCode::UNAUTHORIZED,
+            AuthError::EndpointNotAllowed => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> axum::response::Response {
+        let body = serde_json::json!({
+            "error": self.to_string(),
+            "code": match &self {
+                AuthError::MissingToken => "missing_token",
+                AuthError::InvalidToken => "invalid_token",
+                AuthError::EndpointNotAllowed => "endpoint_not_allowed",
+            }
+        });
+        (self.status_code(), Json(body)).into_response()
     }
 }
 
@@ -989,6 +1172,35 @@ struct BridgeStatusInfo {
     last_event_time: Option<u64>,
     deposits_total: u64,
     withdrawals_total: u64,
+    /// External proof verification status.
+    proofs: BridgeProofsInfo,
+}
+
+/// External proof verification observability.
+#[derive(Serialize)]
+struct BridgeProofsInfo {
+    /// Total pending (unverified) proofs.
+    pending_proofs_total: u64,
+    /// Proofs pending due to missing execution header.
+    pending_proofs_missing_execution_header: u64,
+    /// Total verified proofs.
+    verified_proofs_total: u64,
+    /// Total rejected proofs.
+    rejected_proofs_total: u64,
+    /// Last proof verification timestamp (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_proof_verify_ms: Option<u64>,
+    /// Last reconciliation timestamp (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reconcile_ms: Option<u64>,
+    /// Last successful reconciliation timestamp (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reconcile_ok_ms: Option<u64>,
+    /// Last failed reconciliation timestamp (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reconcile_err_ms: Option<u64>,
+    /// Security mode affecting proof verification.
+    security_mode: String,
 }
 
 #[derive(Serialize)]
@@ -1252,6 +1464,15 @@ async fn run() -> Result<(), NodeError> {
         "forced inclusion config"
     );
 
+    // Load auth config
+    let auth_config = AuthConfig::from_env();
+    info!(
+        security_mode = auth_config.security_mode.name(),
+        auth_required = auth_config.requires_auth_for_ops(),
+        admin_token_set = auth_config.admin_token.is_some(),
+        "security config"
+    );
+
     let state = AppState {
         storage,
         start_instant: Instant::now(),
@@ -1268,6 +1489,7 @@ async fn run() -> Result<(), NodeError> {
         forced_config,
         m2m_storage,
         fee_schedule,
+        auth_config,
     };
 
     // Spawn background task for leader state updates (rotating mode)
@@ -1284,6 +1506,28 @@ async fn run() -> Result<(), NodeError> {
         });
     }
 
+    // Routes with higher body limits (proofs and execution headers)
+    let bridge_ops_routes = Router::new()
+        // POST /bridge/proofs - larger limit for proof payloads (512 KiB)
+        .route("/proofs", post(submit_proof))
+        .layer(RequestBodyLimitLayer::new(request_limits::MAX_PROOF_BODY));
+
+    let execution_header_routes = Router::new()
+        // POST /bridge/eth/execution_headers - larger limit (1 MiB)
+        .route("/eth/execution_headers", post(submit_execution_headers))
+        .layer(RequestBodyLimitLayer::new(request_limits::MAX_EXECUTION_HEADERS_BODY));
+
+    // Standard bridge routes (use default body limit)
+    let bridge_standard_routes = Router::new()
+        .route("/proofs", get(list_proofs))
+        .route("/proofs/{proof_id}", get(get_proof))
+        .route("/eth/headers/stats", get(get_header_stats))
+        // Public bridge endpoints
+        .route("/deposit/claim", post(claim_deposit))
+        .route("/deposit/{id}", get(get_deposit))
+        .route("/withdraw", post(request_withdraw))
+        .route("/withdraw/{id}", get(get_withdraw));
+
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -1295,11 +1539,11 @@ async fn run() -> Result<(), NodeError> {
         // Forced inclusion endpoints
         .route("/tx/force", post(force_include_tx))
         .route("/tx/force/{hash}", get(get_force_status))
-        // Bridge endpoints
-        .route("/bridge/deposit/claim", post(claim_deposit))
-        .route("/bridge/deposit/{id}", get(get_deposit))
-        .route("/bridge/withdraw", post(request_withdraw))
-        .route("/bridge/withdraw/{id}", get(get_withdraw))
+        // Bridge routes with special body limits
+        .nest("/bridge", bridge_ops_routes)
+        .nest("/bridge", execution_header_routes)
+        // Bridge routes with standard limits
+        .nest("/bridge", bridge_standard_routes)
         // Batch endpoints
         .route("/batch/{hash}", get(get_batch))
         // M2M fee endpoints
@@ -1307,7 +1551,9 @@ async fn run() -> Result<(), NodeError> {
         .route("/m2m/balance/{machine_id}", get(m2m_get_balance))
         .route("/m2m/topup", post(m2m_topup))
         .route("/m2m/schedule", get(m2m_get_schedule))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        // Global default body limit (256 KiB) - applied to all routes without explicit limit
+        .layer(RequestBodyLimitLayer::new(request_limits::DEFAULT_BODY_LIMIT));
 
     let addr: SocketAddr = settings.listen_addr.parse().expect("invalid listen addr");
     info!(%addr, "listening");
@@ -1476,6 +1722,19 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
             last_event_time: bridge_snapshot.last_event_time_ms,
             deposits_total,
             withdrawals_total,
+            proofs: BridgeProofsInfo {
+                // These are placeholder values - would be populated from ExternalProofStorage
+                // when the full external proof system is integrated
+                pending_proofs_total: 0,
+                pending_proofs_missing_execution_header: 0,
+                verified_proofs_total: 0,
+                rejected_proofs_total: 0,
+                last_proof_verify_ms: None,
+                last_reconcile_ms: None,
+                last_reconcile_ok_ms: None,
+                last_reconcile_err_ms: None,
+                security_mode: state.auth_config.security_mode.name().to_string(),
+            },
         },
         posting: PostingInfo {
             pending: posting_counts.pending,
@@ -2937,18 +3196,17 @@ async fn m2m_topup(
     state: axum::extract::State<AppState>,
     Json(req): Json<TopupRequest>,
 ) -> impl IntoResponse {
-    // Check if devnet mode
-    let devnet = std::env::var("DEVNET")
-        .map(|s| s == "1" || s.to_lowercase() == "true")
-        .unwrap_or(false);
-
-    if !devnet {
+    // Check if devnet mode using security mode
+    if !state.auth_config.security_mode.allows_devnet_endpoints() {
         return (
             StatusCode::FORBIDDEN,
             Json(TopupResponse {
                 success: false,
                 new_balance_scaled: None,
-                error: Some("top-up only available in devnet mode (DEVNET=1)".to_string()),
+                error: Some(format!(
+                    "top-up only available in devnet mode (current: {})",
+                    state.auth_config.security_mode.name()
+                )),
             }),
         );
     }
@@ -3070,6 +3328,257 @@ fn run_startup_recovery(storage: &Storage) -> StartupRecoveryInfo {
     }
 
     info
+}
+
+// ============== Protected Bridge Endpoints ==============
+
+/// Request body size limits (in bytes).
+mod request_limits {
+    /// Default body limit for most routes.
+    pub const DEFAULT_BODY_LIMIT: usize = 256 * 1024; // 256 KiB
+
+    /// Maximum body size for proof submissions.
+    pub const MAX_PROOF_BODY: usize = 512 * 1024; // 512 KiB
+
+    /// Maximum body size for execution header submissions.
+    pub const MAX_EXECUTION_HEADERS_BODY: usize = 1024 * 1024; // 1 MiB
+
+    /// Maximum number of proof nodes.
+    pub const MAX_PROOF_NODES: usize = 64;
+
+    /// Maximum total proof nodes bytes.
+    pub const MAX_PROOF_NODES_BYTES: usize = 128 * 1024; // 128 KiB
+
+    /// Maximum topics per log.
+    pub const MAX_TOPICS: usize = 4;
+
+    /// Maximum log data bytes.
+    pub const MAX_LOG_DATA_BYTES: usize = 32 * 1024; // 32 KiB
+
+    /// Maximum headers per submission request.
+    pub const MAX_HEADERS_PER_REQUEST: usize = 100;
+}
+
+/// Submit an external proof (auth protected in staging/prod).
+///
+/// POST /bridge/proofs
+async fn submit_proof(
+    state: axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Auth check for staging/prod
+    if let Err(e) = state.check_admin_auth(&headers) {
+        return e.into_response();
+    }
+
+    // Validate request size limits
+    if let Err(e) = validate_proof_request(&req) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e,
+                "code": "validation_error"
+            })),
+        )
+            .into_response();
+    }
+
+    // For now, return a stub response until external proof storage is fully integrated
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "accepted": true,
+            "proof_id": "stub_proof_id",
+            "message": "External proof API endpoint - implementation pending full storage integration"
+        })),
+    )
+        .into_response()
+}
+
+/// Validate proof request against size limits.
+fn validate_proof_request(req: &serde_json::Value) -> Result<(), String> {
+    // Check proof_nodes count and size
+    if let Some(proof_nodes) = req.get("proof_nodes").and_then(|v| v.as_array()) {
+        if proof_nodes.len() > request_limits::MAX_PROOF_NODES {
+            return Err(format!(
+                "too many proof nodes: {} > {}",
+                proof_nodes.len(),
+                request_limits::MAX_PROOF_NODES
+            ));
+        }
+
+        let total_bytes: usize = proof_nodes
+            .iter()
+            .filter_map(|n| n.as_str())
+            .map(|s| s.len() / 2) // hex string -> bytes
+            .sum();
+
+        if total_bytes > request_limits::MAX_PROOF_NODES_BYTES {
+            return Err(format!(
+                "proof nodes too large: {} bytes > {} max",
+                total_bytes,
+                request_limits::MAX_PROOF_NODES_BYTES
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// List proofs (auth protected in staging/prod).
+///
+/// GET /bridge/proofs?state=unverified&limit=100
+async fn list_proofs(
+    state: axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    query: axum::extract::Query<ListProofsQueryParams>,
+) -> impl IntoResponse {
+    // Auth check for staging/prod
+    if let Err(e) = state.check_admin_auth(&headers) {
+        return e.into_response();
+    }
+
+    // Return stub data
+    let limit = query.limit.unwrap_or(100).min(1000);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "proofs": [],
+            "total": 0,
+            "limit": limit,
+            "state_filter": query.state
+        })),
+    )
+        .into_response()
+}
+
+/// Query parameters for listing proofs.
+#[derive(Debug, Clone, Deserialize)]
+struct ListProofsQueryParams {
+    /// Filter by state (unverified, verified, rejected).
+    #[serde(default)]
+    state: Option<String>,
+    /// Maximum number of proofs to return.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Get proof status (auth protected in staging/prod).
+///
+/// GET /bridge/proofs/:proof_id
+async fn get_proof(
+    state: axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(proof_id): Path<String>,
+) -> impl IntoResponse {
+    // Auth check for staging/prod
+    if let Err(e) = state.check_admin_auth(&headers) {
+        return e.into_response();
+    }
+
+    // Return stub data
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "proof_id": proof_id,
+            "state": "pending",
+            "message": "External proof status endpoint - implementation pending full storage integration"
+        })),
+    )
+        .into_response()
+}
+
+/// Submit execution headers (auth protected in staging/prod).
+///
+/// POST /bridge/eth/execution_headers
+async fn submit_execution_headers(
+    state: axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Auth check for staging/prod
+    if let Err(e) = state.check_admin_auth(&headers) {
+        return e.into_response();
+    }
+
+    // Validate request
+    if let Err(e) = validate_execution_headers_request(&req) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e,
+                "code": "validation_error"
+            })),
+        )
+            .into_response();
+    }
+
+    // Check if devnet-only endpoint is allowed
+    // In production, execution headers should come from trusted sources only
+    if state.auth_config.security_mode == SecurityMode::Prod {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "execution header submission disabled in production mode",
+                "code": "endpoint_not_allowed"
+            })),
+        )
+            .into_response();
+    }
+
+    // Return stub response
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "accepted": true,
+            "headers_count": req.get("headers").and_then(|h| h.as_array()).map(|a| a.len()).unwrap_or(0),
+            "message": "Execution headers endpoint - implementation pending eth-headers feature integration"
+        })),
+    )
+        .into_response()
+}
+
+/// Validate execution headers request against size limits.
+fn validate_execution_headers_request(req: &serde_json::Value) -> Result<(), String> {
+    if let Some(headers) = req.get("headers").and_then(|v| v.as_array()) {
+        if headers.len() > request_limits::MAX_HEADERS_PER_REQUEST {
+            return Err(format!(
+                "too many headers: {} > {}",
+                headers.len(),
+                request_limits::MAX_HEADERS_PER_REQUEST
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Get header chain statistics (auth protected in staging/prod).
+///
+/// GET /bridge/eth/headers/stats
+async fn get_header_stats(
+    state: axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Auth check for staging/prod
+    if let Err(e) = state.check_admin_auth(&headers) {
+        return e.into_response();
+    }
+
+    // Return stub data
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "chain_id": state.settings.chain_id,
+            "total_headers": 0,
+            "verified_headers": 0,
+            "checkpoint_headers": 0,
+            "best_tip": null,
+            "security_mode": state.auth_config.security_mode.name()
+        })),
+    )
+        .into_response()
 }
 
 // ============== Utility Functions ==============
