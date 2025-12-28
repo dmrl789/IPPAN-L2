@@ -147,9 +147,55 @@ impl std::str::FromStr for PosterMode {
     }
 }
 
+/// Security mode for the node.
+///
+/// Controls security-sensitive features like poster mode restrictions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityMode {
+    /// Development mode - all features enabled, no restrictions.
+    Dev,
+    /// Staging mode - most prod-like restrictions but with some flexibility.
+    Staging,
+    /// Production mode - strictest security, raw poster mode forbidden.
+    Prod,
+}
+
+impl std::str::FromStr for SecurityMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "prod" | "production" => Self::Prod,
+            "staging" => Self::Staging,
+            _ => Self::Dev, // default
+        })
+    }
+}
+
 impl Settings {
+    /// Get the security mode from environment.
+    pub fn security_mode() -> SecurityMode {
+        std::env::var("NODE_SECURITY_MODE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(SecurityMode::Dev)
+    }
+
     /// Validate settings at startup. Fails fast on invalid configuration.
     pub(crate) fn validate(&self) -> Result<(), NodeError> {
+        let security_mode = Self::security_mode();
+        let poster_mode = self.get_poster_mode();
+
+        // SECURITY: In production mode, raw poster mode is forbidden
+        if security_mode == SecurityMode::Prod && poster_mode == PosterMode::Raw {
+            return Err(NodeError::Config(
+                "NODE_SECURITY_MODE=prod forbids L2_POSTER_MODE=raw. \
+                 Raw posting mode is insecure and only allowed in dev/staging environments. \
+                 Either set NODE_SECURITY_MODE=staging or use L2_POSTER_MODE=contract"
+                    .to_string(),
+            ));
+        }
+
         // If contract posting requested, ensure the feature is enabled
         #[cfg(not(feature = "contract-posting"))]
         {
@@ -1459,7 +1505,7 @@ async fn status(state: axum::extract::State<AppState>) -> impl IntoResponse {
                 oldest_included_age_ms,
             },
             last_finalised,
-            last_reconcile_ms: None, // TODO: track this in reconciler state
+            last_reconcile_ms: state.reconciler.as_ref().map(|r| r.last_reconcile_ms()).filter(|&ms| ms > 0)
         },
         forced_inclusion: ForcedInclusionInfo {
             enabled: true,

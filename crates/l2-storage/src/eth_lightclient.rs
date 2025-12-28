@@ -277,7 +277,7 @@ impl EthLightClientStorage {
         Ok(true)
     }
 
-    /// Store a finalized execution header.
+    /// Store a finalized execution header (internal).
     fn store_finalized_execution_header(
         &self,
         header: &ExecutionPayloadHeaderV1,
@@ -295,6 +295,63 @@ impl EthLightClientStorage {
             .insert(num_key, &header.block_hash[..])?;
 
         Ok(())
+    }
+
+    /// Store an execution header if its block number is within finalized range.
+    ///
+    /// This method is used to accept standalone execution headers for blocks
+    /// that were finalized by earlier beacon updates but whose execution headers
+    /// were not available at the time.
+    ///
+    /// Returns `Ok(true)` if stored, `Ok(false)` if block is not yet finalized,
+    /// or an error if storage fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - The execution payload header to potentially store
+    ///
+    /// # Validation
+    ///
+    /// The header is only stored if:
+    /// 1. The light client is bootstrapped
+    /// 2. The header's block_number <= current finalized execution block number
+    /// 3. The header is not already stored (idempotent)
+    pub fn store_execution_header_if_finalized(
+        &self,
+        header: &ExecutionPayloadHeaderV1,
+    ) -> Result<bool, EthLightClientStorageError> {
+        // Check if already stored (idempotent)
+        if self.is_execution_header_finalized(&header.block_hash)? {
+            return Ok(true);
+        }
+
+        // Get current finalized execution block number
+        let store = match self.get_lc_state()? {
+            Some(s) => s,
+            None => return Ok(false), // Not bootstrapped
+        };
+
+        let finalized_block_number = match store.finalized_execution_block_number() {
+            Some(n) => n,
+            None => return Ok(false), // No finalized execution block yet
+        };
+
+        // Only store if block number is within finalized range
+        if header.block_number > finalized_block_number {
+            return Ok(false);
+        }
+
+        // Store the header
+        self.store_finalized_execution_header(header)?;
+
+        debug!(
+            chain_id = self.chain_id,
+            block_hash = %hex::encode(header.block_hash),
+            block_number = header.block_number,
+            "stored standalone execution header"
+        );
+
+        Ok(true)
     }
 
     /// Check if an execution block hash is finalized.
