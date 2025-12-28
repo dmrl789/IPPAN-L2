@@ -143,9 +143,9 @@ pub use eth_lightclient_api::{
 
 #[cfg(feature = "eth-lightclient")]
 pub use eth_lightclient_reconciler::{
-    spawn_lightclient_reconciler, LightClientReconcileCycleResult, LightClientReconcilerConfig,
-    LightClientReconcilerHandle, LightClientReconcilerMetrics,
-    LightClientReconcilerMetricsSnapshot,
+    spawn_lightclient_reconciler, EnqueueError, LightClientReconcileCycleResult,
+    LightClientReconcilerConfig, LightClientReconcilerHandle, LightClientReconcilerMetrics,
+    LightClientReconcilerMetricsSnapshot, PendingUpdateEntry,
 };
 
 use std::sync::Arc;

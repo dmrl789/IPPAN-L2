@@ -124,6 +124,89 @@ impl SettlementReconcilerConfig {
 pub struct SettlementReconcilerHandle {
     /// Channel to signal shutdown.
     _cancel: Arc<watch::Sender<bool>>,
+    /// Shared metrics (updated by the reconciler task).
+    metrics: Arc<SharedReconcilerMetrics>,
+}
+
+/// Shared metrics exposed via the reconciler handle.
+pub struct SharedReconcilerMetrics {
+    /// Last reconciliation timestamp (ms since epoch).
+    last_reconcile_ms: std::sync::atomic::AtomicU64,
+    /// Last successful reconciliation timestamp (ms since epoch).
+    last_reconcile_ok_ms: std::sync::atomic::AtomicU64,
+    /// Last failed reconciliation timestamp (ms since epoch).
+    last_reconcile_err_ms: std::sync::atomic::AtomicU64,
+    /// Total cycles completed.
+    cycles_completed: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SharedReconcilerMetrics {
+    fn default() -> Self {
+        Self {
+            last_reconcile_ms: std::sync::atomic::AtomicU64::new(0),
+            last_reconcile_ok_ms: std::sync::atomic::AtomicU64::new(0),
+            last_reconcile_err_ms: std::sync::atomic::AtomicU64::new(0),
+            cycles_completed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl SharedReconcilerMetrics {
+    fn record_cycle_ok(&self) {
+        let now = now_ms();
+        self.last_reconcile_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        self.last_reconcile_ok_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        self.cycles_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_cycle_err(&self) {
+        let now = now_ms();
+        self.last_reconcile_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        self.last_reconcile_err_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        self.cycles_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl SettlementReconcilerHandle {
+    /// Get the last reconciliation timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no reconciliation has completed yet.
+    pub fn last_reconcile_ms(&self) -> u64 {
+        self.metrics
+            .last_reconcile_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the last successful reconciliation timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no successful reconciliation has completed yet.
+    pub fn last_reconcile_ok_ms(&self) -> u64 {
+        self.metrics
+            .last_reconcile_ok_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the last failed reconciliation timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no failed reconciliation has occurred yet.
+    pub fn last_reconcile_err_ms(&self) -> u64 {
+        self.metrics
+            .last_reconcile_err_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the total number of reconciliation cycles completed.
+    pub fn cycles_completed(&self) -> u64 {
+        self.metrics
+            .cycles_completed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Metrics for reconciler operations.
@@ -180,13 +263,16 @@ where
     C: AsyncL1Client + Send + Sync + 'static,
 {
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let metrics = Arc::new(SharedReconcilerMetrics::default());
+    let metrics_clone = Arc::clone(&metrics);
 
     tokio::spawn(async move {
-        run_settlement_reconciler(config, storage, l1_client, cancel_rx).await;
+        run_settlement_reconciler(config, storage, l1_client, cancel_rx, metrics_clone).await;
     });
 
     SettlementReconcilerHandle {
         _cancel: Arc::new(cancel_tx),
+        metrics,
     }
 }
 
@@ -196,6 +282,7 @@ async fn run_settlement_reconciler<C>(
     storage: Arc<Storage>,
     l1_client: Option<C>,
     mut cancel_rx: watch::Receiver<bool>,
+    metrics: Arc<SharedReconcilerMetrics>,
 ) where
     C: AsyncL1Client + Send + Sync,
 {
@@ -207,8 +294,12 @@ async fn run_settlement_reconciler<C>(
     );
 
     // Run once immediately on startup (crash recovery)
-    if let Err(e) = run_reconcile_cycle(&config, &storage, &l1_client).await {
-        warn!(error = %e, "initial reconciliation failed");
+    match run_reconcile_cycle(&config, &storage, &l1_client).await {
+        Ok(_) => metrics.record_cycle_ok(),
+        Err(e) => {
+            warn!(error = %e, "initial reconciliation failed");
+            metrics.record_cycle_err();
+        }
     }
 
     let mut interval = tokio::time::interval(Duration::from_millis(config.interval_ms));
@@ -216,8 +307,12 @@ async fn run_settlement_reconciler<C>(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = run_reconcile_cycle(&config, &storage, &l1_client).await {
-                    warn!(error = %e, "reconciliation cycle failed");
+                match run_reconcile_cycle(&config, &storage, &l1_client).await {
+                    Ok(_) => metrics.record_cycle_ok(),
+                    Err(e) => {
+                        warn!(error = %e, "reconciliation cycle failed");
+                        metrics.record_cycle_err();
+                    }
                 }
             }
             _ = cancel_rx.changed() => {
@@ -860,6 +955,44 @@ impl MultiHubReconcileCycleResult {
 pub struct MultiHubReconcilerHandle {
     /// Channel to signal shutdown.
     _cancel: Arc<watch::Sender<bool>>,
+    /// Shared metrics (updated by the reconciler task).
+    metrics: Arc<SharedReconcilerMetrics>,
+}
+
+impl MultiHubReconcilerHandle {
+    /// Get the last reconciliation timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no reconciliation has completed yet.
+    pub fn last_reconcile_ms(&self) -> u64 {
+        self.metrics
+            .last_reconcile_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the last successful reconciliation timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no successful reconciliation has completed yet.
+    pub fn last_reconcile_ok_ms(&self) -> u64 {
+        self.metrics
+            .last_reconcile_ok_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the last failed reconciliation timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no failed reconciliation has occurred yet.
+    pub fn last_reconcile_err_ms(&self) -> u64 {
+        self.metrics
+            .last_reconcile_err_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the total number of reconciliation cycles completed.
+    pub fn cycles_completed(&self) -> u64 {
+        self.metrics
+            .cycles_completed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Spawn the multi-hub settlement reconciler background task.
@@ -885,13 +1018,16 @@ where
     C: crate::async_l1_client::AsyncL1Client + Send + Sync + 'static,
 {
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let metrics = Arc::new(SharedReconcilerMetrics::default());
+    let metrics_clone = Arc::clone(&metrics);
 
     tokio::spawn(async move {
-        run_multi_hub_reconciler(config, storage, l1_client, cancel_rx).await;
+        run_multi_hub_reconciler(config, storage, l1_client, cancel_rx, metrics_clone).await;
     });
 
     MultiHubReconcilerHandle {
         _cancel: Arc::new(cancel_tx),
+        metrics,
     }
 }
 
@@ -901,6 +1037,7 @@ async fn run_multi_hub_reconciler<C>(
     storage: Arc<Storage>,
     l1_client: Option<C>,
     mut cancel_rx: watch::Receiver<bool>,
+    metrics: Arc<SharedReconcilerMetrics>,
 ) where
     C: crate::async_l1_client::AsyncL1Client + Send + Sync,
 {
@@ -912,8 +1049,12 @@ async fn run_multi_hub_reconciler<C>(
     );
 
     // Run once immediately on startup (crash recovery)
-    if let Err(e) = run_multi_hub_reconcile_cycle(&config, &storage, &l1_client).await {
-        warn!(error = %e, "initial multi-hub reconciliation failed");
+    match run_multi_hub_reconcile_cycle(&config, &storage, &l1_client).await {
+        Ok(_) => metrics.record_cycle_ok(),
+        Err(e) => {
+            warn!(error = %e, "initial multi-hub reconciliation failed");
+            metrics.record_cycle_err();
+        }
     }
 
     let mut interval = tokio::time::interval(Duration::from_millis(config.interval_ms));
@@ -921,8 +1062,12 @@ async fn run_multi_hub_reconciler<C>(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = run_multi_hub_reconcile_cycle(&config, &storage, &l1_client).await {
-                    warn!(error = %e, "multi-hub reconciliation cycle failed");
+                match run_multi_hub_reconcile_cycle(&config, &storage, &l1_client).await {
+                    Ok(_) => metrics.record_cycle_ok(),
+                    Err(e) => {
+                        warn!(error = %e, "multi-hub reconciliation cycle failed");
+                        metrics.record_cycle_err();
+                    }
                 }
             }
             _ = cancel_rx.changed() => {
@@ -1091,6 +1236,82 @@ mod tests {
         assert_eq!(config.interval_ms, 10_000);
         assert_eq!(config.batch_limit, 100);
         assert_eq!(config.finality_confirmations, 6);
+    }
+
+    #[test]
+    fn shared_metrics_record_cycle_ok() {
+        let metrics = SharedReconcilerMetrics::default();
+        assert_eq!(
+            metrics
+                .last_reconcile_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .cycles_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        metrics.record_cycle_ok();
+
+        assert!(
+            metrics
+                .last_reconcile_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            metrics
+                .last_reconcile_ok_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            metrics
+                .last_reconcile_err_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .cycles_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn shared_metrics_record_cycle_err() {
+        let metrics = SharedReconcilerMetrics::default();
+
+        metrics.record_cycle_err();
+
+        assert!(
+            metrics
+                .last_reconcile_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            metrics
+                .last_reconcile_ok_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(
+            metrics
+                .last_reconcile_err_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            metrics
+                .cycles_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]

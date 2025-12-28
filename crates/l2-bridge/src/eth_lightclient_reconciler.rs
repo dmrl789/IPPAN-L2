@@ -21,9 +21,12 @@
 
 use crate::eth_lightclient_api::{LightClientApi, LightClientApiError, UpdateRequest};
 use crate::eth_merkle::verify_eth_receipt_merkle_proof;
-use l2_core::{eth_lightclient::LightClientUpdateV1, ExternalProofState, VerificationMode};
+use l2_core::{
+    eth_lightclient::{ExecutionPayloadHeaderV1, LightClientUpdateV1},
+    ExternalProofState, VerificationMode,
+};
 use l2_storage::ExternalProofStorage;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +51,19 @@ pub struct LightClientReconcilerConfig {
 
     /// Minimum confirmations required for finalized proofs.
     pub min_confirmations: u64,
+
+    // === DoS Protection Caps ===
+    /// Maximum pending updates that can be queued.
+    /// New updates are rejected once this limit is reached.
+    pub max_pending_updates: usize,
+
+    /// Maximum pending execution headers that can be queued.
+    /// New headers are rejected once this limit is reached.
+    pub max_pending_exec_headers: usize,
+
+    /// Maximum execution headers to retain in storage.
+    /// Oldest headers (by block number) are evicted once this limit is reached.
+    pub max_retained_exec_headers: usize,
 }
 
 impl Default for LightClientReconcilerConfig {
@@ -58,6 +74,10 @@ impl Default for LightClientReconcilerConfig {
             max_proofs_per_cycle: 50,
             enabled: true,
             min_confirmations: 1, // Finalized is already final
+            // DoS protection defaults
+            max_pending_updates: 1000,
+            max_pending_exec_headers: 1000,
+            max_retained_exec_headers: 100_000, // ~100k headers
         }
     }
 }
@@ -90,12 +110,31 @@ impl LightClientReconcilerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
 
+        // DoS protection caps
+        let max_pending_updates = std::env::var("LC_MAX_PENDING_UPDATES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        let max_pending_exec_headers = std::env::var("LC_MAX_PENDING_EXEC_HEADERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        let max_retained_exec_headers = std::env::var("LC_MAX_RETAINED_EXEC_HEADERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000);
+
         Self {
             poll_interval_ms,
             max_updates_per_cycle,
             max_proofs_per_cycle,
             enabled,
             min_confirmations,
+            max_pending_updates,
+            max_pending_exec_headers,
+            max_retained_exec_headers,
         }
     }
 }
@@ -183,6 +222,8 @@ pub struct LightClientReconcileCycleResult {
     pub updates_applied: usize,
     /// Number of updates rejected this cycle.
     pub updates_rejected: usize,
+    /// Number of execution headers stored this cycle.
+    pub exec_headers_stored: usize,
     /// Number of proofs re-verified this cycle.
     pub proofs_reverified: usize,
     /// Current finalized slot.
@@ -191,27 +232,146 @@ pub struct LightClientReconcileCycleResult {
     pub finalized_block_number: Option<u64>,
 }
 
+/// Entry containing an update and its optional execution header.
+#[derive(Debug, Clone)]
+pub struct PendingUpdateEntry {
+    /// The light client update.
+    pub update: LightClientUpdateV1,
+    /// Optional execution header to store alongside this update.
+    pub execution_header: Option<ExecutionPayloadHeaderV1>,
+}
+
 /// Handle to the light client reconciler.
 pub struct LightClientReconcilerHandle {
-    /// Pending updates queue.
-    pending_updates: Arc<Mutex<VecDeque<LightClientUpdateV1>>>,
+    /// Pending updates queue (with optional execution headers).
+    pending_updates: Arc<Mutex<VecDeque<PendingUpdateEntry>>>,
+    /// Pending execution headers (keyed by block hash hex).
+    /// These can be submitted independently of updates for blocks
+    /// that were finalized by earlier updates.
+    pending_exec_headers: Arc<Mutex<HashMap<String, ExecutionPayloadHeaderV1>>>,
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
     /// Metrics.
     pub metrics: Arc<LightClientReconcilerMetrics>,
+    /// Configuration (for enforcing caps).
+    config: LightClientReconcilerConfig,
 }
 
+/// Error when enqueueing updates or headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueError {
+    /// Queue is at capacity.
+    QueueFull,
+}
+
+impl std::fmt::Display for EnqueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "queue is at capacity"),
+        }
+    }
+}
+
+impl std::error::Error for EnqueueError {}
+
 impl LightClientReconcilerHandle {
-    /// Queue an update for processing.
-    pub async fn queue_update(&self, update: LightClientUpdateV1) {
+    /// Queue an update for processing (legacy method without execution header).
+    ///
+    /// Returns `Err(EnqueueError::QueueFull)` if the queue is at capacity.
+    pub async fn queue_update(&self, update: LightClientUpdateV1) -> Result<(), EnqueueError> {
+        self.queue_update_with_header(update, None).await
+    }
+
+    /// Queue an update with an optional execution header.
+    ///
+    /// When the update is processed, the execution header (if provided) will be
+    /// stored alongside the beacon state update, enabling proof verification
+    /// for that block.
+    ///
+    /// Returns `Err(EnqueueError::QueueFull)` if the queue is at capacity.
+    pub async fn queue_update_with_header(
+        &self,
+        update: LightClientUpdateV1,
+        execution_header: Option<ExecutionPayloadHeaderV1>,
+    ) -> Result<(), EnqueueError> {
         let mut queue = self.pending_updates.lock().await;
-        queue.push_back(update);
-        debug!(queue_len = queue.len(), "queued light client update");
+
+        // Enforce cap
+        if queue.len() >= self.config.max_pending_updates {
+            warn!(
+                queue_len = queue.len(),
+                max = self.config.max_pending_updates,
+                "rejecting update: queue at capacity"
+            );
+            return Err(EnqueueError::QueueFull);
+        }
+
+        let has_exec_header = execution_header.is_some();
+        queue.push_back(PendingUpdateEntry {
+            update,
+            execution_header,
+        });
+        debug!(
+            queue_len = queue.len(),
+            has_exec_header = has_exec_header,
+            "queued light client update"
+        );
+        Ok(())
+    }
+
+    /// Submit an execution header for a finalized block.
+    ///
+    /// Use this to provide execution headers for blocks that were finalized
+    /// by earlier beacon updates but whose execution headers were not available
+    /// at the time.
+    ///
+    /// Returns `Ok(true)` if the header was accepted (new).
+    /// Returns `Ok(false)` if already queued.
+    /// Returns `Err(EnqueueError::QueueFull)` if the queue is at capacity.
+    pub async fn submit_execution_header(
+        &self,
+        header: ExecutionPayloadHeaderV1,
+    ) -> Result<bool, EnqueueError> {
+        let key = hex::encode(header.block_hash);
+        let mut pending = self.pending_exec_headers.lock().await;
+
+        // Check if already queued
+        if pending.contains_key(&key) {
+            debug!(
+                block_hash = %key,
+                block_number = header.block_number,
+                "execution header already pending"
+            );
+            return Ok(false);
+        }
+
+        // Enforce cap
+        if pending.len() >= self.config.max_pending_exec_headers {
+            warn!(
+                pending_len = pending.len(),
+                max = self.config.max_pending_exec_headers,
+                "rejecting execution header: queue at capacity"
+            );
+            return Err(EnqueueError::QueueFull);
+        }
+
+        pending.insert(key.clone(), header.clone());
+        debug!(
+            block_hash = %key,
+            block_number = header.block_number,
+            "queued standalone execution header"
+        );
+        Ok(true)
     }
 
     /// Get the pending updates count.
     pub async fn pending_count(&self) -> usize {
         self.pending_updates.lock().await.len()
+    }
+
+    /// Get the pending execution headers count.
+    pub async fn pending_exec_headers_count(&self) -> usize {
+        self.pending_exec_headers.lock().await.len()
     }
 
     /// Signal shutdown.
@@ -223,6 +383,18 @@ impl LightClientReconcilerHandle {
     pub fn metrics_snapshot(&self) -> LightClientReconcilerMetricsSnapshot {
         self.metrics.snapshot()
     }
+
+    /// Get the last reconcile cycle timestamp (ms since epoch).
+    ///
+    /// Returns 0 if no cycle has completed yet.
+    pub fn last_reconcile_ms(&self) -> u64 {
+        self.metrics.last_cycle_ms.load(Ordering::Relaxed)
+    }
+
+    /// Get the configuration (read-only).
+    pub fn config(&self) -> &LightClientReconcilerConfig {
+        &self.config
+    }
 }
 
 /// Spawn the light client reconciler background task.
@@ -232,13 +404,16 @@ pub fn spawn_lightclient_reconciler(
     config: LightClientReconcilerConfig,
 ) -> LightClientReconcilerHandle {
     let pending_updates = Arc::new(Mutex::new(VecDeque::new()));
+    let pending_exec_headers = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let metrics = Arc::new(LightClientReconcilerMetrics::new());
 
     let handle = LightClientReconcilerHandle {
         pending_updates: Arc::clone(&pending_updates),
+        pending_exec_headers: Arc::clone(&pending_exec_headers),
         shutdown: Arc::clone(&shutdown),
         metrics: Arc::clone(&metrics),
+        config: config.clone(),
     };
 
     if config.enabled {
@@ -246,6 +421,7 @@ pub fn spawn_lightclient_reconciler(
             lc_api,
             proof_storage,
             pending_updates,
+            pending_exec_headers,
             shutdown,
             metrics,
             config,
@@ -260,7 +436,8 @@ pub fn spawn_lightclient_reconciler(
 async fn run_reconciler_loop(
     lc_api: Arc<LightClientApi>,
     proof_storage: Arc<ExternalProofStorage>,
-    pending_updates: Arc<Mutex<VecDeque<LightClientUpdateV1>>>,
+    pending_updates: Arc<Mutex<VecDeque<PendingUpdateEntry>>>,
+    pending_exec_headers: Arc<Mutex<HashMap<String, ExecutionPayloadHeaderV1>>>,
     shutdown: Arc<AtomicBool>,
     metrics: Arc<LightClientReconcilerMetrics>,
     config: LightClientReconcilerConfig,
@@ -280,13 +457,24 @@ async fn run_reconciler_loop(
             break;
         }
 
-        match run_reconcile_cycle(&lc_api, &proof_storage, &pending_updates, &metrics, &config)
-            .await
+        match run_reconcile_cycle(
+            &lc_api,
+            &proof_storage,
+            &pending_updates,
+            &pending_exec_headers,
+            &metrics,
+            &config,
+        )
+        .await
         {
             Ok(result) => {
-                if result.updates_applied > 0 || result.proofs_reverified > 0 {
+                if result.updates_applied > 0
+                    || result.proofs_reverified > 0
+                    || result.exec_headers_stored > 0
+                {
                     info!(
                         updates_applied = result.updates_applied,
+                        exec_headers_stored = result.exec_headers_stored,
                         proofs_reverified = result.proofs_reverified,
                         finalized_slot = result.finalized_slot,
                         "reconcile cycle completed"
@@ -303,22 +491,25 @@ async fn run_reconciler_loop(
 async fn run_reconcile_cycle(
     lc_api: &Arc<LightClientApi>,
     proof_storage: &Arc<ExternalProofStorage>,
-    pending_updates: &Arc<Mutex<VecDeque<LightClientUpdateV1>>>,
+    pending_updates: &Arc<Mutex<VecDeque<PendingUpdateEntry>>>,
+    pending_exec_headers: &Arc<Mutex<HashMap<String, ExecutionPayloadHeaderV1>>>,
     metrics: &Arc<LightClientReconcilerMetrics>,
     config: &LightClientReconcilerConfig,
 ) -> Result<LightClientReconcileCycleResult, LightClientApiError> {
     let mut updates_applied = 0;
     let mut updates_rejected = 0;
+    let mut exec_headers_stored = 0;
     let mut proofs_reverified = 0;
 
-    // Phase 1: Apply pending updates
+    // Phase 1: Apply pending updates (with their execution headers)
     {
         let mut queue = pending_updates.lock().await;
         for _ in 0..config.max_updates_per_cycle {
-            if let Some(update) = queue.pop_front() {
+            if let Some(entry) = queue.pop_front() {
+                let has_exec_header = entry.execution_header.is_some();
                 let request = UpdateRequest {
-                    update,
-                    execution_header: None, // TODO: fetch execution header
+                    update: entry.update,
+                    execution_header: entry.execution_header,
                 };
 
                 match lc_api.submit_update(request) {
@@ -326,9 +517,13 @@ async fn run_reconcile_cycle(
                         if response.accepted {
                             metrics.record_update_applied();
                             updates_applied += 1;
+                            if has_exec_header {
+                                exec_headers_stored += 1;
+                            }
                             debug!(
                                 update_id = %hex::encode(response.update_id),
                                 finalized_slot = response.finalized_slot,
+                                has_exec_header = has_exec_header,
                                 "applied update"
                             );
                         } else {
@@ -352,7 +547,54 @@ async fn run_reconcile_cycle(
         }
     }
 
-    // Phase 2: Get current finalized state
+    // Phase 2: Process standalone execution headers
+    // These are headers submitted independently for blocks that were
+    // finalized by previous beacon updates.
+    {
+        let mut pending = pending_exec_headers.lock().await;
+        // Take up to max_updates_per_cycle headers
+        let keys_to_process: Vec<String> = pending
+            .keys()
+            .take(config.max_updates_per_cycle)
+            .cloned()
+            .collect();
+
+        for key in keys_to_process {
+            if let Some(header) = pending.remove(&key) {
+                // Store the execution header directly
+                match lc_api
+                    .storage()
+                    .store_execution_header_if_finalized(&header)
+                {
+                    Ok(true) => {
+                        exec_headers_stored += 1;
+                        debug!(
+                            block_hash = %key,
+                            block_number = header.block_number,
+                            "stored standalone execution header"
+                        );
+                    }
+                    Ok(false) => {
+                        // Block not finalized yet - re-queue for later
+                        pending.insert(key.clone(), header);
+                        debug!(
+                            block_hash = %key,
+                            "execution header block not yet finalized, re-queued"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            block_hash = %key,
+                            error = %e,
+                            "failed to store execution header"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: Get current finalized state
     let status = lc_api.get_status()?;
     let (finalized_slot, finalized_block_number) = if let Some(ref s) = status.status {
         (s.finalized_slot, s.finalized_execution_number)
@@ -360,7 +602,7 @@ async fn run_reconcile_cycle(
         (0, None)
     };
 
-    // Phase 3: Re-verify pending proofs that might now be finalized
+    // Phase 4: Re-verify pending proofs that might now be finalized
     if status.bootstrapped {
         let pending_proofs = proof_storage
             .list_unverified_proofs(config.max_proofs_per_cycle)
@@ -440,6 +682,7 @@ async fn run_reconcile_cycle(
     Ok(LightClientReconcileCycleResult {
         updates_applied,
         updates_rejected,
+        exec_headers_stored,
         proofs_reverified,
         finalized_slot,
         finalized_block_number,
@@ -464,6 +707,18 @@ mod tests {
         let config = LightClientReconcilerConfig::default();
         assert_eq!(config.poll_interval_ms, 10_000);
         assert!(config.enabled);
+        // Check DoS protection caps
+        assert_eq!(config.max_pending_updates, 1000);
+        assert_eq!(config.max_pending_exec_headers, 1000);
+        assert_eq!(config.max_retained_exec_headers, 100_000);
+    }
+
+    #[test]
+    fn config_from_env_defaults() {
+        // Just verify from_env() doesn't panic with no env vars set
+        let config = LightClientReconcilerConfig::from_env();
+        assert!(config.enabled);
+        assert!(config.max_pending_updates > 0);
     }
 
     #[test]
@@ -488,5 +743,91 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.updates_applied, 2);
         assert_eq!(snapshot.proofs_reverified, 1);
+    }
+
+    #[test]
+    fn pending_update_entry_with_header() {
+        use l2_core::eth_lightclient::{
+            BeaconBlockHeaderV1, ExecutionPayloadHeaderV1, LightClientUpdateV1, SyncAggregateV1,
+        };
+
+        let update = LightClientUpdateV1 {
+            attested_header: BeaconBlockHeaderV1 {
+                slot: 8_001_000,
+                proposer_index: 12345,
+                parent_root: [0x11; 32],
+                state_root: [0x22; 32],
+                body_root: [0x33; 32],
+            },
+            next_sync_committee: None,
+            next_sync_committee_branch: None,
+            finalized_header: BeaconBlockHeaderV1 {
+                slot: 8_000_900,
+                proposer_index: 12345,
+                parent_root: [0x11; 32],
+                state_root: [0x22; 32],
+                body_root: [0x33; 32],
+            },
+            finality_branch: vec![[0xDD; 32]; 6],
+            sync_aggregate: SyncAggregateV1 {
+                sync_committee_bits: vec![0xFF; 64],
+                sync_committee_signature: [0xEE; 96],
+            },
+            signature_slot: 8_001_001,
+        };
+
+        let exec_header = ExecutionPayloadHeaderV1 {
+            parent_hash: [0x11; 32],
+            fee_recipient: [0x22; 20],
+            state_root: [0x33; 32],
+            receipts_root: [0x44; 32],
+            logs_bloom: [0x00; 256],
+            prev_randao: [0x55; 32],
+            block_number: 18_000_000,
+            gas_limit: 30_000_000,
+            gas_used: 15_000_000,
+            timestamp: 1_700_000_000,
+            extra_data: vec![],
+            base_fee_per_gas: 10_000_000_000,
+            block_hash: [0x66; 32],
+            transactions_root: [0x77; 32],
+            withdrawals_root: [0x88; 32],
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+
+        let entry = PendingUpdateEntry {
+            update: update.clone(),
+            execution_header: Some(exec_header.clone()),
+        };
+
+        assert!(entry.execution_header.is_some());
+        assert_eq!(entry.update.finalized_header.slot, 8_000_900);
+        assert_eq!(
+            entry.execution_header.as_ref().unwrap().block_number,
+            18_000_000
+        );
+    }
+
+    #[test]
+    fn enqueue_error_display() {
+        let err = EnqueueError::QueueFull;
+        assert_eq!(err.to_string(), "queue is at capacity");
+    }
+
+    #[test]
+    fn cycle_result_with_exec_headers() {
+        let result = LightClientReconcileCycleResult {
+            updates_applied: 2,
+            updates_rejected: 0,
+            exec_headers_stored: 3,
+            proofs_reverified: 1,
+            finalized_slot: 8_000_000,
+            finalized_block_number: Some(18_000_000),
+        };
+
+        assert_eq!(result.updates_applied, 2);
+        assert_eq!(result.exec_headers_stored, 3);
+        assert_eq!(result.proofs_reverified, 1);
     }
 }
