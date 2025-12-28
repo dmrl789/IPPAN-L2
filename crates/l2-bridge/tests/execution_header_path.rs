@@ -17,7 +17,9 @@ use l2_core::eth_lightclient::{
     BeaconBlockHeaderV1, ExecutionPayloadHeaderV1, LightClientBootstrapV1, LightClientUpdateV1,
     SyncAggregateV1, SyncCommitteeV1, SYNC_COMMITTEE_BITS_SIZE, SYNC_COMMITTEE_SIZE,
 };
-use l2_core::{EthReceiptMerkleProofV1, ExternalEventProofV1, ExternalProofState, VerificationMode};
+use l2_core::{
+    EthReceiptMerkleProofV1, ExternalEventProofV1, ExternalProofState, VerificationMode,
+};
 use l2_storage::eth_lightclient::EthLightClientStorage;
 use l2_storage::ExternalProofStorage;
 use std::sync::Arc;
@@ -113,8 +115,8 @@ fn test_merkle_proof(block_number: u64, block_hash: [u8; 32]) -> EthReceiptMerkl
         contract: [0x22; 20],
         topic0: [0x33; 32],
         data_hash: [0x44; 32],
-        header_rlp: vec![0xAA; 100], // Mock header RLP
-        receipt_rlp: vec![0xBB; 100], // Mock receipt RLP
+        header_rlp: vec![0xAA; 100],       // Mock header RLP
+        receipt_rlp: vec![0xBB; 100],      // Mock receipt RLP
         proof_nodes: vec![vec![0xCC; 32]], // Mock proof nodes
         confirmations: Some(10),
         tip_block_number: Some(block_number + 10),
@@ -228,12 +230,10 @@ fn header_arrives_then_proof_can_verify() {
         .unwrap();
 
     // Verify header is not finalized yet
-    assert!(
-        !lc_api
-            .storage()
-            .is_execution_header_finalized(&proof_header.block_hash)
-            .unwrap()
-    );
+    assert!(!lc_api
+        .storage()
+        .is_execution_header_finalized(&proof_header.block_hash)
+        .unwrap());
 
     // Submit the execution header via bulk API
     let bulk_request = BulkExecutionHeadersRequest {

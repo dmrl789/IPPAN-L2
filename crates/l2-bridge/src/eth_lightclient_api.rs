@@ -1072,7 +1072,11 @@ mod tests {
         assert_eq!(response.rejected_count, 0);
         for result in &response.results {
             assert!(!result.accepted);
-            assert!(result.reason.as_ref().unwrap().contains("not yet finalized"));
+            assert!(result
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("not yet finalized"));
         }
     }
 
@@ -1123,7 +1127,10 @@ mod tests {
         let request = BulkExecutionHeadersRequest { headers };
 
         let result = api.submit_execution_headers(request);
-        assert!(matches!(result, Err(LightClientApiError::InvalidRequest(_))));
+        assert!(matches!(
+            result,
+            Err(LightClientApiError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -1134,7 +1141,7 @@ mod tests {
         let storage = Arc::new(EthLightClientStorage::new(&db, 1).expect("storage"));
         let config = LightClientApiConfig {
             chain_id: 1,
-            devnet_enabled: false, // This is the key - prod mode
+            devnet_enabled: false,   // This is the key - prod mode
             skip_verification: true, // Skip verification for test data
         };
         let api = LightClientApi::with_default_verifier(storage, config);
@@ -1151,7 +1158,10 @@ mod tests {
             headers: vec![test_execution_header(18_000_000)],
         };
         let result = api.submit_execution_headers(request);
-        assert!(matches!(result, Err(LightClientApiError::InvalidRequest(_))));
+        assert!(matches!(
+            result,
+            Err(LightClientApiError::InvalidRequest(_))
+        ));
         if let Err(LightClientApiError::InvalidRequest(msg)) = result {
             assert!(msg.contains("devnet"), "error should mention devnet");
         }
