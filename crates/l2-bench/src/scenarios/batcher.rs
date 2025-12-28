@@ -3,9 +3,9 @@
 //! Measures the performance of building batches from synthetic transactions.
 
 use crate::{BenchConfig, BenchError, LatencyCollector};
+use l2_core::batch_envelope::{compute_tx_root, BatchEnvelope, BatchPayload};
 use l2_core::bench::{CustomMetric, ScenarioConfig, ScenarioResult};
 use l2_core::canonical::{canonical_encode, canonical_hash, Batch, ChainId, Hash32, Tx};
-use l2_core::batch_envelope::{compute_tx_root, BatchEnvelope, BatchPayload};
 use std::time::Instant;
 
 /// Run the batcher throughput benchmark.
@@ -52,7 +52,9 @@ pub fn run_batcher_throughput(config: &BenchConfig) -> Result<ScenarioResult, Be
     }
 
     let total_duration_us = overall_start.elapsed().as_micros() as u64;
-    let total_ops = config.ops_count.saturating_mul(config.measure_iterations as u64);
+    let total_ops = config
+        .ops_count
+        .saturating_mul(config.measure_iterations as u64);
 
     result = result.with_timing(total_ops, total_duration_us);
     result = result.with_latency(latencies.stats());
@@ -90,27 +92,27 @@ pub fn run_batcher_throughput(config: &BenchConfig) -> Result<ScenarioResult, Be
 /// Generate synthetic transactions deterministically.
 fn generate_synthetic_txs(count: u64, seed: u64) -> Vec<Tx> {
     let mut txs = Vec::with_capacity(count as usize);
-    
+
     // Deterministic PRNG using seed
     let mut state = seed;
-    
+
     for i in 0..count {
         // Simple LCG for determinism
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        
+
         let nonce = i;
         let from = format!("user-{:08x}", (state >> 32) as u32);
-        
+
         // Variable payload size (deterministic)
         let payload_size = 64 + ((state >> 40) as usize % 192); // 64-256 bytes
         let mut payload = vec![0u8; payload_size];
-        
+
         // Fill payload deterministically
         for byte in payload.iter_mut() {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             *byte = (state >> 56) as u8;
         }
-        
+
         txs.push(Tx {
             chain_id: ChainId(1337),
             nonce,
@@ -118,7 +120,7 @@ fn generate_synthetic_txs(count: u64, seed: u64) -> Vec<Tx> {
             payload,
         });
     }
-    
+
     txs
 }
 
@@ -127,7 +129,7 @@ fn build_batches(txs: &[Tx], batch_size: u32) -> Vec<BatchEnvelope> {
     let mut batches = Vec::new();
     let batch_size = batch_size as usize;
     let mut prev_hash = Hash32([0u8; 32]);
-    
+
     for (batch_number, chunk) in txs.chunks(batch_size).enumerate() {
         let batch_number = batch_number as u64;
         let batch = Batch {
@@ -136,21 +138,21 @@ fn build_batches(txs: &[Tx], batch_size: u32) -> Vec<BatchEnvelope> {
             txs: chunk.to_vec(),
             created_ms: 1_700_000_000_000 + batch_number * 1000,
         };
-        
+
         // Compute tx hashes for root
         let tx_hashes: Vec<Hash32> = chunk
             .iter()
             .filter_map(|tx| canonical_hash(tx).ok())
             .collect();
         let tx_root = compute_tx_root(&tx_hashes);
-        
+
         // Compute batch hash
         let batch_hash = canonical_hash(&batch).unwrap_or(Hash32([0u8; 32]));
-        
+
         // Create payload
         let payload_bytes = canonical_encode(&batch).unwrap_or_default();
         let tx_bytes = payload_bytes.len() as u64;
-        
+
         let payload = BatchPayload::new(
             ChainId(1337),
             batch_hash,
@@ -161,15 +163,15 @@ fn build_batches(txs: &[Tx], batch_size: u32) -> Vec<BatchEnvelope> {
             tx_root,
             payload_bytes,
         );
-        
+
         // Create envelope
         if let Ok(envelope) = BatchEnvelope::new_unsigned(payload) {
             batches.push(envelope);
         }
-        
+
         prev_hash = batch_hash;
     }
-    
+
     batches
 }
 
@@ -181,7 +183,7 @@ mod tests {
     fn synthetic_txs_deterministic() {
         let txs1 = generate_synthetic_txs(100, 42);
         let txs2 = generate_synthetic_txs(100, 42);
-        
+
         assert_eq!(txs1.len(), txs2.len());
         for (t1, t2) in txs1.iter().zip(txs2.iter()) {
             assert_eq!(t1.nonce, t2.nonce);
@@ -194,7 +196,7 @@ mod tests {
     fn synthetic_txs_different_seeds() {
         let txs1 = generate_synthetic_txs(10, 42);
         let txs2 = generate_synthetic_txs(10, 43);
-        
+
         // Different seeds should produce different txs
         assert_ne!(txs1[0].from, txs2[0].from);
     }
@@ -203,7 +205,7 @@ mod tests {
     fn build_batches_correct_count() {
         let txs = generate_synthetic_txs(100, 42);
         let batches = build_batches(&txs, 25);
-        
+
         assert_eq!(batches.len(), 4); // 100 / 25 = 4 batches
     }
 

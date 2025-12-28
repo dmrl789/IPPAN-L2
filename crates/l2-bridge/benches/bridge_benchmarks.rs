@@ -48,7 +48,7 @@ fn bench_validate_proof_limits(c: &mut Criterion) {
         contract: generate_address(3),
         topic0: generate_hash(4),
         data_hash: generate_hash(5),
-        header_rlp: vec![0; 512], // Small header
+        header_rlp: vec![0; 512],  // Small header
         receipt_rlp: vec![0; 256], // Small receipt
         proof_nodes: (0..4).map(|i| vec![0; 200 + i * 10]).collect(),
         confirmations: Some(12),
@@ -70,7 +70,7 @@ fn bench_validate_proof_limits(c: &mut Criterion) {
         contract: generate_address(3),
         topic0: generate_hash(4),
         data_hash: generate_hash(5),
-        header_rlp: vec![0; 7000], // Near max header
+        header_rlp: vec![0; 7000],   // Near max header
         receipt_rlp: vec![0; 30000], // Near max receipt
         proof_nodes: (0..30).map(|i| vec![0; 2000 + i * 10]).collect(), // Many nodes
         confirmations: Some(100),
@@ -92,7 +92,7 @@ fn bench_verification_limits(c: &mut Criterion) {
     let mut group = c.benchmark_group("verification_limits");
 
     group.bench_function("default", |b| {
-        b.iter(|| VerificationLimits::default());
+        b.iter(VerificationLimits::default);
     });
 
     group.finish();
@@ -163,7 +163,8 @@ fn bench_deposit_id_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("deposit_event");
 
     let deposit = DepositEvent {
-        l1_tx_hash: "0xabc123def456789012345678901234567890123456789012345678901234567890".to_string(),
+        l1_tx_hash: "0xabc123def456789012345678901234567890123456789012345678901234567890"
+            .to_string(),
         from_l1: "0x1234567890123456789012345678901234567890".to_string(),
         to_l2: "alice".to_string(),
         asset: "IPN".to_string(),

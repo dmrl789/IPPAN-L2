@@ -46,17 +46,41 @@ pub fn print_summary(output: &BenchmarkOutput) {
 
     for scenario in &output.scenarios {
         let status = if scenario.success { "✓" } else { "✗" };
-        println!("│ {} {:<30}                              │", status, scenario.name);
-        println!("│   Description: {:<47} │", truncate(&scenario.description, 47));
-        println!("│   Operations:  {:>15}                              │", format_number(scenario.total_ops));
-        println!("│   Duration:    {:>12} µs                              │", format_number(scenario.duration_us));
-        println!("│   Throughput:  {:>12} ops/sec                        │", format_number(scenario.ops_per_sec));
-        
+        println!(
+            "│ {} {:<30}                              │",
+            status, scenario.name
+        );
+        println!(
+            "│   Description: {:<47} │",
+            truncate(&scenario.description, 47)
+        );
+        println!(
+            "│   Operations:  {:>15}                              │",
+            format_number(scenario.total_ops)
+        );
+        println!(
+            "│   Duration:    {:>12} µs                              │",
+            format_number(scenario.duration_us)
+        );
+        println!(
+            "│   Throughput:  {:>12} ops/sec                        │",
+            format_number(scenario.ops_per_sec)
+        );
+
         if scenario.latency.sample_count > 0 {
             println!("│   Latency:                                                       │");
-            println!("│     p50:       {:>12} µs                              │", format_number(scenario.latency.p50_us));
-            println!("│     p95:       {:>12} µs                              │", format_number(scenario.latency.p95_us));
-            println!("│     p99:       {:>12} µs                              │", format_number(scenario.latency.p99_us));
+            println!(
+                "│     p50:       {:>12} µs                              │",
+                format_number(scenario.latency.p50_us)
+            );
+            println!(
+                "│     p95:       {:>12} µs                              │",
+                format_number(scenario.latency.p95_us)
+            );
+            println!(
+                "│     p99:       {:>12} µs                              │",
+                format_number(scenario.latency.p99_us)
+            );
         }
 
         // Custom metrics
@@ -72,17 +96,29 @@ pub fn print_summary(output: &BenchmarkOutput) {
         if let Some(ref error) = scenario.error {
             println!("│   Error: {:<53} │", truncate(error, 53));
         }
-        
+
         println!("├──────────────────────────────────────────────────────────────────┤");
     }
 
     // Summary
     println!("│                          SUMMARY                                 │");
     println!("├──────────────────────────────────────────────────────────────────┤");
-    println!("│   Total Scenarios:   {:>10}                                 │", output.summary.total_scenarios);
-    println!("│   Total Operations:  {:>10}                                 │", format_number(output.summary.total_ops));
-    println!("│   Total Duration:    {:>10} µs                             │", format_number(output.summary.total_duration_us));
-    println!("│   Aggregate Rate:    {:>10} ops/sec                        │", format_number(output.summary.aggregate_ops_per_sec));
+    println!(
+        "│   Total Scenarios:   {:>10}                                 │",
+        output.summary.total_scenarios
+    );
+    println!(
+        "│   Total Operations:  {:>10}                                 │",
+        format_number(output.summary.total_ops)
+    );
+    println!(
+        "│   Total Duration:    {:>10} µs                             │",
+        format_number(output.summary.total_duration_us)
+    );
+    println!(
+        "│   Aggregate Rate:    {:>10} ops/sec                        │",
+        format_number(output.summary.aggregate_ops_per_sec)
+    );
     println!("└──────────────────────────────────────────────────────────────────┘\n");
 }
 

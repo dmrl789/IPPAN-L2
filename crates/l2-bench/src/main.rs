@@ -145,7 +145,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::List => {
             println!("Available benchmark scenarios:\n");
-            println!("  batcher_throughput      - Measures batch building from synthetic transactions");
+            println!(
+                "  batcher_throughput      - Measures batch building from synthetic transactions"
+            );
             println!("  organiser_overhead      - Measures organiser decide() performance");
             println!("  m2m_accounting          - Measures M2M reserve/finalise with ledger");
             println!("  reconciler_scan         - Measures reconciler batch scanning");

@@ -31,8 +31,8 @@ pub fn run_m2m_accounting(config: &BenchConfig) -> Result<ScenarioResult, BenchE
     // Setup temp storage
     let temp_dir = TempDir::new().map_err(|e| BenchError::Storage(e.to_string()))?;
     let db = sled::open(temp_dir.path()).map_err(|e| BenchError::Storage(e.to_string()))?;
-    let storage =
-        M2mStorage::open(&db, FeeSchedule::default()).map_err(|e| BenchError::Storage(e.to_string()))?;
+    let storage = M2mStorage::open(&db, FeeSchedule::default())
+        .map_err(|e| BenchError::Storage(e.to_string()))?;
 
     // Generate deterministic transaction data
     let tx_data = generate_tx_data(config.ops_count, config.seed);
@@ -60,13 +60,19 @@ pub fn run_m2m_accounting(config: &BenchConfig) -> Result<ScenarioResult, BenchE
             h[2] = i as u8;
             h
         };
-        let _ = storage.reserve_fee(machine_id, warmup_hash, *amount, breakdown.clone(), false, 0);
+        let _ = storage.reserve_fee(
+            machine_id,
+            warmup_hash,
+            *amount,
+            breakdown.clone(),
+            false,
+            0,
+        );
         let _ = storage.finalise_fee(machine_id, warmup_hash, *amount / 2, 1000);
     }
 
     // Measurement: Reserve phase
-    let mut reserve_latencies =
-        LatencyCollector::with_capacity(config.ops_count as usize);
+    let mut reserve_latencies = LatencyCollector::with_capacity(config.ops_count as usize);
     let reserve_start = Instant::now();
 
     for (i, (tx_hash, amount, breakdown)) in tx_data.iter().enumerate() {
@@ -89,8 +95,7 @@ pub fn run_m2m_accounting(config: &BenchConfig) -> Result<ScenarioResult, BenchE
     let reserve_duration_us = reserve_start.elapsed().as_micros() as u64;
 
     // Measurement: Finalise phase
-    let mut finalise_latencies =
-        LatencyCollector::with_capacity(config.ops_count as usize);
+    let mut finalise_latencies = LatencyCollector::with_capacity(config.ops_count as usize);
     let finalise_start = Instant::now();
 
     for (i, (tx_hash, amount, _)) in tx_data.iter().enumerate() {

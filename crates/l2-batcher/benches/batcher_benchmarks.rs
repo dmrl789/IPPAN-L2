@@ -22,7 +22,7 @@ fn generate_inputs(count: usize, seed: u64) -> Vec<OrganiserInputs> {
         let in_flight_batches = ((state >> 32) % 10) as u32;
 
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let recent_forced_used_bytes = ((state >> 16) % 500_000) as u64;
+        let recent_forced_used_bytes = (state >> 16) % 500_000;
 
         inputs.push(OrganiserInputs {
             now_ms: 1_700_000_000_000 + i as u64 * 100,
@@ -111,6 +111,7 @@ fn bench_gbdt_organiser_with_clamp(c: &mut Criterion) {
 }
 
 /// Benchmark organiser throughput (decisions per second).
+#[allow(clippy::cast_possible_truncation)]
 fn bench_gbdt_organiser_throughput(c: &mut Criterion) {
     let organiser = GbdtOrganiserV1::new();
     let bounds = OrganiserPolicyBounds::default();
@@ -118,6 +119,7 @@ fn bench_gbdt_organiser_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("gbdt_organiser_throughput");
 
     for batch_size in [100u64, 1000, 10000] {
+        // batch_size is small, cast is safe
         let inputs = generate_inputs(batch_size as usize, 42);
 
         group.throughput(Throughput::Elements(batch_size));
@@ -151,9 +153,9 @@ fn bench_policy_bounds(c: &mut Criterion) {
 
     // Clamp decision
     let decision = l2_core::organiser::OrganiserDecision {
-        sleep_ms: 5, // Below min
-        max_txs: 2000, // Above max
-        max_bytes: 100, // Below min
+        sleep_ms: 5,           // Below min
+        max_txs: 2000,         // Above max
+        max_bytes: 100,        // Below min
         forced_drain_max: 500, // Above max
     };
     group.bench_function("clamp_out_of_bounds", |b| {

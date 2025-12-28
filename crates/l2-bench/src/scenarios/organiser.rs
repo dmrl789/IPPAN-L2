@@ -101,16 +101,16 @@ fn generate_input_variations(count: u64, seed: u64) -> Vec<OrganiserInputs> {
         // Generate varied inputs
         let queue_depth = ((state >> 32) % 1000) as u32;
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        
+
         let forced_queue_depth = ((state >> 32) % 100) as u32;
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        
+
         let in_flight_batches = ((state >> 32) % 10) as u32;
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        
+
         let recent_forced_used_bytes = (state >> 16) % 500_000;
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        
+
         let avg_tx_bytes_est = (128 + ((state >> 32) % 384)) as u32;
 
         inputs.push(OrganiserInputs {

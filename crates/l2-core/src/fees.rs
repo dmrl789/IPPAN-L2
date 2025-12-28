@@ -300,7 +300,10 @@ pub struct FeeScheduleSummary {
 ///
 /// # Returns
 /// A breakdown of the fee calculation, or an error if overflow would occur.
-#[cfg_attr(feature = "profiling", tracing::instrument(skip(schedule), level = "debug", name = "compute_m2m_fee"))]
+#[cfg_attr(
+    feature = "profiling",
+    tracing::instrument(skip(schedule), level = "debug", name = "compute_m2m_fee")
+)]
 pub fn compute_m2m_fee(
     schedule: &FeeSchedule,
     exec_units: u64,

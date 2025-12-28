@@ -192,7 +192,10 @@ impl Organiser for GbdtOrganiserV1 {
         OrganiserVersion::GbdtV1
     }
 
-    #[cfg_attr(feature = "profiling", tracing::instrument(skip(self), level = "debug", name = "gbdt_organiser_decide"))]
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self), level = "debug", name = "gbdt_organiser_decide")
+    )]
     fn decide(&self, inputs: &OrganiserInputs) -> OrganiserDecision {
         OrganiserDecision {
             sleep_ms: self.compute_sleep_ms(inputs),

@@ -56,7 +56,9 @@ pub fn run_attestation_verify(config: &BenchConfig) -> Result<ScenarioResult, Be
     }
 
     let total_duration_us = overall_start.elapsed().as_micros() as u64;
-    let total_ops = config.ops_count.saturating_mul(config.measure_iterations as u64);
+    let total_ops = config
+        .ops_count
+        .saturating_mul(config.measure_iterations as u64);
 
     result = result.with_timing(total_ops, total_duration_us);
     result = result.with_latency(latencies.stats());
@@ -94,10 +96,7 @@ pub fn run_merkle_verify(config: &BenchConfig) -> Result<ScenarioResult, BenchEr
     // Generate synthetic Merkle proof vectors
     let proofs = generate_merkle_proof_vectors(config.ops_count, config.seed);
 
-    tracing::debug!(
-        proof_count = proofs.len(),
-        "generated Merkle proof vectors"
-    );
+    tracing::debug!(proof_count = proofs.len(), "generated Merkle proof vectors");
 
     // Warmup
     for _ in 0..config.warmup_iterations {
@@ -119,7 +118,9 @@ pub fn run_merkle_verify(config: &BenchConfig) -> Result<ScenarioResult, BenchEr
     }
 
     let total_duration_us = overall_start.elapsed().as_micros() as u64;
-    let total_ops = config.ops_count.saturating_mul(config.measure_iterations as u64);
+    let total_ops = config
+        .ops_count
+        .saturating_mul(config.measure_iterations as u64);
 
     result = result.with_timing(total_ops, total_duration_us);
     result = result.with_latency(latencies.stats());

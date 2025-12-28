@@ -76,8 +76,7 @@ pub fn run_reconciler_scan(config: &BenchConfig) -> Result<ScenarioResult, Bench
         LatencyCollector::with_capacity(config.measure_iterations as usize);
     let mut list_included_latencies =
         LatencyCollector::with_capacity(config.measure_iterations as usize);
-    let mut transition_latencies =
-        LatencyCollector::with_capacity(config.ops_count as usize);
+    let mut transition_latencies = LatencyCollector::with_capacity(config.ops_count as usize);
 
     let overall_start = Instant::now();
 

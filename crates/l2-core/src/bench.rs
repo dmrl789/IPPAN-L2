@@ -467,8 +467,7 @@ mod tests {
 
     #[test]
     fn scenario_result_ops_per_sec() {
-        let result = ScenarioResult::new("test", "test scenario")
-            .with_timing(1_000_000, 1_000_000); // 1M ops in 1s
+        let result = ScenarioResult::new("test", "test scenario").with_timing(1_000_000, 1_000_000); // 1M ops in 1s
 
         assert_eq!(result.ops_per_sec, 1_000_000);
     }
@@ -477,12 +476,10 @@ mod tests {
     fn benchmark_output_summary() {
         let mut output = BenchmarkOutput::new(BenchmarkMetadata::default());
 
-        output.add_scenario(
-            ScenarioResult::new("scenario1", "first").with_timing(100_000, 500_000),
-        );
-        output.add_scenario(
-            ScenarioResult::new("scenario2", "second").with_timing(200_000, 500_000),
-        );
+        output
+            .add_scenario(ScenarioResult::new("scenario1", "first").with_timing(100_000, 500_000));
+        output
+            .add_scenario(ScenarioResult::new("scenario2", "second").with_timing(200_000, 500_000));
 
         assert_eq!(output.summary.total_scenarios, 2);
         assert_eq!(output.summary.total_ops, 300_000);

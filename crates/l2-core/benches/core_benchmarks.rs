@@ -4,9 +4,11 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use l2_core::batch_envelope::{compute_tx_root, BatchEnvelope, BatchPayload};
-use l2_core::canonical::{canonical_decode, canonical_encode, canonical_hash, Batch, ChainId, Hash32, Tx};
+use l2_core::canonical::{
+    canonical_decode, canonical_encode, canonical_hash, Batch, ChainId, Hash32, Tx,
+};
 use l2_core::fees::{compute_m2m_fee, FeeSchedule};
-use l2_core::organiser::{Organiser, OrganiserInputs, NoopOrganiser};
+use l2_core::organiser::{NoopOrganiser, Organiser, OrganiserInputs};
 
 /// Benchmark `compute_m2m_fee` with various input sizes.
 fn bench_compute_m2m_fee(c: &mut Criterion) {
@@ -29,7 +31,12 @@ fn bench_compute_m2m_fee(c: &mut Criterion) {
             &(exec_units, data_bytes, writes),
             |b, &(eu, db, w)| {
                 b.iter(|| {
-                    compute_m2m_fee(black_box(&schedule), black_box(eu), black_box(db), black_box(w))
+                    compute_m2m_fee(
+                        black_box(&schedule),
+                        black_box(eu),
+                        black_box(db),
+                        black_box(w),
+                    )
                 });
             },
         );
@@ -86,8 +93,9 @@ fn bench_canonical_encode_decode(c: &mut Criterion) {
 }
 
 /// Benchmark BatchEnvelope operations.
+#[allow(clippy::cast_possible_truncation)]
 fn bench_batch_envelope(c: &mut Criterion) {
-    let tx_count = 100;
+    let tx_count: u32 = 100;
     let payload_bytes: Vec<u8> = (0..tx_count * 256).map(|i| (i % 256) as u8).collect();
 
     let payload = BatchPayload::new(
@@ -95,7 +103,7 @@ fn bench_batch_envelope(c: &mut Criterion) {
         Hash32([0xAA; 32]),
         Hash32([0x00; 32]),
         1_700_000_000_000,
-        tx_count as u32,
+        tx_count,
         payload_bytes.len() as u64,
         Hash32([0xBB; 32]),
         payload_bytes,

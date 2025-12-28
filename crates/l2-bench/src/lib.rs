@@ -179,7 +179,9 @@ fn get_git_commit() -> Option<String> {
         .ok()
         .and_then(|o| {
             if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -194,7 +196,9 @@ fn get_git_branch() -> Option<String> {
         .ok()
         .and_then(|o| {
             if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -209,7 +213,9 @@ fn get_rustc_version() -> Option<String> {
         .ok()
         .and_then(|o| {
             if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -219,25 +225,25 @@ fn get_rustc_version() -> Option<String> {
 /// Simple ISO 8601 timestamp without chrono dependency.
 fn chrono_lite_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    
+
     let secs = duration.as_secs();
-    
+
     // Convert to UTC components (simplified, doesn't handle leap seconds)
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
-    
+
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
-    
+
     // Calculate year, month, day from days since epoch (1970-01-01)
     let mut remaining_days = days_since_epoch as i64;
     let mut year = 1970i32;
-    
+
     loop {
         let days_in_year = if is_leap_year(year) { 366 } else { 365 };
         if remaining_days < days_in_year {
@@ -246,13 +252,13 @@ fn chrono_lite_timestamp() -> String {
         remaining_days -= days_in_year;
         year += 1;
     }
-    
+
     let days_in_months: [i64; 12] = if is_leap_year(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
-    
+
     let mut month = 1u32;
     for &days in &days_in_months {
         if remaining_days < days {
@@ -261,9 +267,9 @@ fn chrono_lite_timestamp() -> String {
         remaining_days -= days;
         month += 1;
     }
-    
+
     let day = remaining_days as u32 + 1;
-    
+
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
