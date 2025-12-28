@@ -940,6 +940,7 @@ fn main() {
                 cfg.as_ref()
                     .map(|c| c.rate_limit.clone())
                     .unwrap_or_default(),
+                cfg.as_ref().map(|c| c.security.clone()).unwrap_or_default(),
                 cfg.as_ref().map(|c| c.cors.clone()).unwrap_or_default(),
                 cfg.as_ref()
                     .map(|c| c.server.max_inflight_requests)

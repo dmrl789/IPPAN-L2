@@ -17,6 +17,8 @@ pub struct FinNodeConfig {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -46,6 +48,203 @@ pub struct FinNodeConfig {
     pub snapshots: SnapshotsConfig,
     #[serde(default)]
     pub bootstrap: BootstrapConfig,
+}
+
+// ============================================================
+// Security mode configuration for endpoint gating
+// ============================================================
+
+/// Node security mode determines which endpoints are available.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMode {
+    /// Development mode: all endpoints enabled, no auth required.
+    #[default]
+    Devnet,
+    /// Staging mode: some ops endpoints require auth.
+    Staging,
+    /// Production mode: strict endpoint gating, auth required for sensitive ops.
+    Prod,
+}
+
+#[allow(dead_code)] // Methods reserved for future use
+impl SecurityMode {
+    /// Check if this mode allows devnet-only endpoints (e.g., `/m2m/topup`).
+    pub fn allows_devnet_endpoints(&self) -> bool {
+        matches!(self, Self::Devnet)
+    }
+
+    /// Check if this mode allows unauthenticated admin/ops endpoints.
+    pub fn allows_unauthenticated_ops(&self) -> bool {
+        matches!(self, Self::Devnet)
+    }
+
+    /// Check if this mode requires auth for list proofs endpoints.
+    pub fn requires_auth_for_list_proofs(&self) -> bool {
+        matches!(self, Self::Prod)
+    }
+
+    /// Check if this mode requires auth for eth header submission.
+    pub fn requires_auth_for_eth_headers(&self) -> bool {
+        matches!(self, Self::Staging | Self::Prod)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Devnet => "devnet",
+            Self::Staging => "staging",
+            Self::Prod => "prod",
+        }
+    }
+}
+
+/// Security configuration for endpoint gating and authentication.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecurityConfig {
+    /// Security mode (devnet/staging/prod).
+    #[serde(default)]
+    pub mode: SecurityMode,
+    /// Admin ops token (HMAC-based, simple MVP auth).
+    /// Required in staging/prod for ops endpoints.
+    #[serde(default)]
+    pub admin_token: String,
+    /// Allowlisted bridge proof submitter public keys (hex-encoded ed25519).
+    #[serde(default)]
+    pub bridge_submitters: Vec<String>,
+    /// Allowlisted attestor public keys (hex-encoded ed25519).
+    #[serde(default)]
+    pub attestor_keys: Vec<String>,
+    /// Request timeout in milliseconds.
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Maximum query string length (bytes).
+    #[serde(default = "default_max_query_string_bytes")]
+    pub max_query_string_bytes: usize,
+}
+
+fn default_request_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_max_query_string_bytes() -> usize {
+    4096
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: SecurityMode::Devnet,
+            admin_token: String::new(),
+            bridge_submitters: Vec::new(),
+            attestor_keys: Vec::new(),
+            request_timeout_ms: default_request_timeout_ms(),
+            max_query_string_bytes: default_max_query_string_bytes(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        // In prod/staging, admin_token should be set
+        if matches!(self.mode, SecurityMode::Prod | SecurityMode::Staging) {
+            if self.admin_token.trim().is_empty() {
+                return Err(
+                    "[security].admin_token is empty (required for staging/prod mode)".to_string(),
+                );
+            }
+            if self.admin_token.len() < 32 {
+                return Err(
+                    "[security].admin_token is too short (min 32 chars for staging/prod)"
+                        .to_string(),
+                );
+            }
+        }
+
+        // Validate bridge submitter keys
+        for (i, k) in self.bridge_submitters.iter().enumerate() {
+            if k.trim().is_empty() {
+                return Err(format!("[security].bridge_submitters[{i}] is empty"));
+            }
+            let raw = hex::decode(k)
+                .map_err(|e| format!("[security].bridge_submitters[{i}] invalid hex: {e}"))?;
+            if raw.len() != 32 {
+                return Err(format!(
+                    "[security].bridge_submitters[{i}] must be 32 bytes (got {})",
+                    raw.len()
+                ));
+            }
+        }
+
+        // Validate attestor keys
+        for (i, k) in self.attestor_keys.iter().enumerate() {
+            if k.trim().is_empty() {
+                return Err(format!("[security].attestor_keys[{i}] is empty"));
+            }
+            let raw = hex::decode(k)
+                .map_err(|e| format!("[security].attestor_keys[{i}] invalid hex: {e}"))?;
+            if raw.len() != 32 {
+                return Err(format!(
+                    "[security].attestor_keys[{i}] must be 32 bytes (got {})",
+                    raw.len()
+                ));
+            }
+        }
+
+        if self.request_timeout_ms == 0 {
+            return Err("[security].request_timeout_ms must be >= 1".to_string());
+        }
+
+        if self.max_query_string_bytes == 0 {
+            return Err("[security].max_query_string_bytes must be >= 1".to_string());
+        }
+
+        Ok(())
+    }
+
+    /// Check if a given admin token matches.
+    pub fn verify_admin_token(&self, token: &str) -> bool {
+        if self.admin_token.is_empty() {
+            return false;
+        }
+        // Constant-time comparison for security
+        constant_time_eq(self.admin_token.as_bytes(), token.as_bytes())
+    }
+
+    /// Check if a bridge submitter pubkey is allowlisted.
+    #[allow(dead_code)] // Reserved for future use
+    pub fn is_bridge_submitter_allowed(&self, pubkey_hex: &str) -> bool {
+        // Empty list means allow all (devnet behavior)
+        if self.bridge_submitters.is_empty() {
+            return true;
+        }
+        self.bridge_submitters
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(pubkey_hex))
+    }
+
+    /// Check if an attestor pubkey is allowlisted.
+    #[allow(dead_code)] // Reserved for future use
+    pub fn is_attestor_allowed(&self, pubkey_hex: &str) -> bool {
+        // Empty list means allow all (devnet behavior)
+        if self.attestor_keys.is_empty() {
+            return true;
+        }
+        self.attestor_keys
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(pubkey_hex))
+    }
+}
+
+/// Constant-time byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ============================================================
@@ -153,10 +352,14 @@ impl Default for ServerConfig {
 
 /// Admission/abuse-resistance limits.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Some fields are reserved for future use
 pub struct LimitsConfig {
     /// Max HTTP request body size (bytes). Oversized bodies return HTTP 413.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Max body size for bridge proof endpoints (bytes).
+    #[serde(default = "default_max_bridge_proof_bytes")]
+    pub max_bridge_proof_bytes: usize,
     /// Max string size for user-provided fields (UTF-8 bytes).
     #[serde(default = "default_max_string_bytes")]
     pub max_string_bytes: usize,
@@ -175,10 +378,25 @@ pub struct LimitsConfig {
     /// Best-effort JSON depth limit for request bodies.
     #[serde(default = "default_max_json_depth")]
     pub max_json_depth: usize,
+    /// Max number of MPT proof nodes in merkle proofs.
+    #[serde(default = "default_max_mpt_proof_nodes")]
+    pub max_mpt_proof_nodes: usize,
+    /// Max total bytes for all MPT proof nodes combined.
+    #[serde(default = "default_max_mpt_proof_bytes")]
+    pub max_mpt_proof_bytes: usize,
+    /// Max RLP-encoded header size (bytes).
+    #[serde(default = "default_max_header_rlp_bytes")]
+    pub max_header_rlp_bytes: usize,
+    /// Max RLP-encoded receipt size (bytes).
+    #[serde(default = "default_max_receipt_rlp_bytes")]
+    pub max_receipt_rlp_bytes: usize,
 }
 
 fn default_max_body_bytes() -> usize {
     256 * 1024
+}
+fn default_max_bridge_proof_bytes() -> usize {
+    512 * 1024
 }
 fn default_max_string_bytes() -> usize {
     1024
@@ -198,17 +416,34 @@ fn default_max_receipt_bytes() -> usize {
 fn default_max_json_depth() -> usize {
     64
 }
+fn default_max_mpt_proof_nodes() -> usize {
+    32
+}
+fn default_max_mpt_proof_bytes() -> usize {
+    64 * 1024
+}
+fn default_max_header_rlp_bytes() -> usize {
+    8 * 1024
+}
+fn default_max_receipt_rlp_bytes() -> usize {
+    32 * 1024
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_body_bytes: default_max_body_bytes(),
+            max_bridge_proof_bytes: default_max_bridge_proof_bytes(),
             max_string_bytes: default_max_string_bytes(),
             max_tags: default_max_tags(),
             max_tag_bytes: default_max_tag_bytes(),
             max_batch_items: default_max_batch_items(),
             max_receipt_bytes: default_max_receipt_bytes(),
             max_json_depth: default_max_json_depth(),
+            max_mpt_proof_nodes: default_max_mpt_proof_nodes(),
+            max_mpt_proof_bytes: default_max_mpt_proof_bytes(),
+            max_header_rlp_bytes: default_max_header_rlp_bytes(),
+            max_receipt_rlp_bytes: default_max_receipt_rlp_bytes(),
         }
     }
 }
@@ -847,6 +1082,10 @@ impl FinNodeConfig {
             return Err("l1.retry.max_attempts must be >= 1".to_string());
         }
 
+        self.security
+            .validate()
+            .map_err(|e| format!("invalid [security] config: {e}"))?;
+
         self.ha
             .validate()
             .map_err(|e| format!("invalid [ha] config: {e}"))?;
@@ -856,6 +1095,12 @@ impl FinNodeConfig {
             .map_err(|e| format!("invalid [encryption] config: {e}"))?;
 
         Ok(())
+    }
+
+    /// Get the security mode.
+    #[allow(dead_code)] // Reserved for future use
+    pub fn security_mode(&self) -> SecurityMode {
+        self.security.mode
     }
 }
 

@@ -28,7 +28,18 @@ mod implementation {
     use l2_core::EthReceiptMerkleProofV1;
     use thiserror::Error;
 
+    // ============================================================
+    // Proof Rejection Taxonomy (explicit error classification)
+    // ============================================================
+
     /// Errors from Ethereum Merkle proof verification.
+    ///
+    /// These errors are classified into categories for stable API responses:
+    /// - `ProofRejected::Malformed` - Structural/parsing errors
+    /// - `ProofRejected::TooLarge` - Size limit violations
+    /// - `ProofRejected::InvalidTriePath` - MPT traversal failures
+    /// - `ProofRejected::LogMismatch` - Event filter mismatches
+    /// - `ProofRejected::HeaderMismatch` - Block hash/header issues
     #[derive(Debug, Error)]
     pub enum EthMerkleVerifyError {
         #[error("block hash mismatch: expected {expected}, got {got}")]
@@ -63,6 +74,168 @@ mod implementation {
 
         #[error("empty proof nodes")]
         EmptyProofNodes,
+
+        #[error("proof too large: {0}")]
+        ProofTooLarge(String),
+
+        #[error("header RLP too large: {size} bytes (max {max})")]
+        HeaderRlpTooLarge { size: usize, max: usize },
+
+        #[error("receipt RLP too large: {size} bytes (max {max})")]
+        ReceiptRlpTooLarge { size: usize, max: usize },
+
+        #[error("too many proof nodes: {count} (max {max})")]
+        TooManyProofNodes { count: usize, max: usize },
+
+        #[error("proof nodes total bytes too large: {size} bytes (max {max})")]
+        ProofNodesTooLarge { size: usize, max: usize },
+
+        #[error("MPT recursion depth exceeded: {depth} (max {max})")]
+        RecursionDepthExceeded { depth: usize, max: usize },
+    }
+
+    impl EthMerkleVerifyError {
+        /// Get the rejection category for stable API responses.
+        pub fn rejection_category(&self) -> ProofRejected {
+            match self {
+                // Malformed errors
+                Self::HeaderDecodeFailed(_)
+                | Self::ReceiptDecodeFailed(_)
+                | Self::RlpDecode(_)
+                | Self::EmptyProofNodes
+                | Self::ReceiptsRootNotFound => ProofRejected::Malformed,
+
+                // Size limit errors
+                Self::ProofTooLarge(_)
+                | Self::HeaderRlpTooLarge { .. }
+                | Self::ReceiptRlpTooLarge { .. }
+                | Self::TooManyProofNodes { .. }
+                | Self::ProofNodesTooLarge { .. }
+                | Self::RecursionDepthExceeded { .. } => ProofRejected::TooLarge,
+
+                // MPT path errors
+                Self::MptProofFailed(_) => ProofRejected::InvalidTriePath,
+
+                // Log mismatch errors
+                Self::LogIndexOutOfBounds { .. }
+                | Self::ContractMismatch { .. }
+                | Self::Topic0Mismatch { .. }
+                | Self::DataHashMismatch { .. } => ProofRejected::LogMismatch,
+
+                // Header mismatch errors
+                Self::BlockHashMismatch { .. } => ProofRejected::HeaderMismatch,
+            }
+        }
+
+        /// Get a stable error code for API responses.
+        pub fn error_code(&self) -> &'static str {
+            match self.rejection_category() {
+                ProofRejected::Malformed => "proof_malformed",
+                ProofRejected::TooLarge => "proof_too_large",
+                ProofRejected::InvalidTriePath => "invalid_trie_path",
+                ProofRejected::LogMismatch => "log_mismatch",
+                ProofRejected::HeaderMismatch => "header_mismatch",
+            }
+        }
+    }
+
+    /// Proof rejection categories for stable API error responses.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProofRejected {
+        /// Structural or parsing error.
+        Malformed,
+        /// Size limit violation.
+        TooLarge,
+        /// MPT traversal failure.
+        InvalidTriePath,
+        /// Event filter mismatch (contract, topic, data).
+        LogMismatch,
+        /// Block hash or header mismatch.
+        HeaderMismatch,
+    }
+
+    impl ProofRejected {
+        pub fn name(&self) -> &'static str {
+            match self {
+                Self::Malformed => "malformed",
+                Self::TooLarge => "too_large",
+                Self::InvalidTriePath => "invalid_trie_path",
+                Self::LogMismatch => "log_mismatch",
+                Self::HeaderMismatch => "header_mismatch",
+            }
+        }
+    }
+
+    // ============================================================
+    // Verification Limits
+    // ============================================================
+
+    /// Default limits for proof verification (safe defaults).
+    #[derive(Debug, Clone)]
+    pub struct VerificationLimits {
+        /// Maximum number of MPT proof nodes.
+        pub max_proof_nodes: usize,
+        /// Maximum total bytes for all proof nodes combined.
+        pub max_proof_bytes: usize,
+        /// Maximum header RLP size in bytes.
+        pub max_header_rlp_bytes: usize,
+        /// Maximum receipt RLP size in bytes.
+        pub max_receipt_rlp_bytes: usize,
+        /// Maximum MPT recursion depth.
+        pub max_recursion_depth: usize,
+    }
+
+    impl Default for VerificationLimits {
+        fn default() -> Self {
+            Self {
+                max_proof_nodes: 32,
+                max_proof_bytes: 64 * 1024,       // 64 KiB
+                max_header_rlp_bytes: 8 * 1024,   // 8 KiB
+                max_receipt_rlp_bytes: 32 * 1024, // 32 KiB
+                max_recursion_depth: 64,
+            }
+        }
+    }
+
+    /// Validate proof sizes against limits.
+    pub fn validate_proof_limits(
+        proof: &EthReceiptMerkleProofV1,
+        limits: &VerificationLimits,
+    ) -> Result<(), EthMerkleVerifyError> {
+        // Check header RLP size
+        if proof.header_rlp.len() > limits.max_header_rlp_bytes {
+            return Err(EthMerkleVerifyError::HeaderRlpTooLarge {
+                size: proof.header_rlp.len(),
+                max: limits.max_header_rlp_bytes,
+            });
+        }
+
+        // Check receipt RLP size
+        if proof.receipt_rlp.len() > limits.max_receipt_rlp_bytes {
+            return Err(EthMerkleVerifyError::ReceiptRlpTooLarge {
+                size: proof.receipt_rlp.len(),
+                max: limits.max_receipt_rlp_bytes,
+            });
+        }
+
+        // Check number of proof nodes
+        if proof.proof_nodes.len() > limits.max_proof_nodes {
+            return Err(EthMerkleVerifyError::TooManyProofNodes {
+                count: proof.proof_nodes.len(),
+                max: limits.max_proof_nodes,
+            });
+        }
+
+        // Check total proof nodes size
+        let total_proof_bytes: usize = proof.proof_nodes.iter().map(|n| n.len()).sum();
+        if total_proof_bytes > limits.max_proof_bytes {
+            return Err(EthMerkleVerifyError::ProofNodesTooLarge {
+                size: total_proof_bytes,
+                max: limits.max_proof_bytes,
+            });
+        }
+
+        Ok(())
     }
 
     /// Result of successful Merkle proof verification.
@@ -597,9 +770,23 @@ mod implementation {
     /// Verify an Ethereum receipt Merkle proof.
     ///
     /// This is the main entry point for verifying `EthReceiptMerkleProofV1` proofs.
+    /// Uses default verification limits.
     pub fn verify_eth_receipt_merkle_proof(
         proof: &EthReceiptMerkleProofV1,
     ) -> Result<MerkleVerifiedEvent, EthMerkleVerifyError> {
+        verify_eth_receipt_merkle_proof_with_limits(proof, &VerificationLimits::default())
+    }
+
+    /// Verify an Ethereum receipt Merkle proof with custom limits.
+    ///
+    /// This version allows specifying custom size limits for hardened deployments.
+    pub fn verify_eth_receipt_merkle_proof_with_limits(
+        proof: &EthReceiptMerkleProofV1,
+        limits: &VerificationLimits,
+    ) -> Result<MerkleVerifiedEvent, EthMerkleVerifyError> {
+        // Step 0: Validate proof sizes against limits (DoS protection)
+        validate_proof_limits(proof, limits)?;
+
         // Step 1: Verify block hash matches keccak256(header_rlp)
         let computed_hash = keccak256(&proof.header_rlp);
         if computed_hash.as_slice() != proof.block_hash {
@@ -614,11 +801,12 @@ mod implementation {
 
         // Step 3: Verify receipt inclusion using MPT proof
         let key = rlp_encode_tx_index(proof.tx_index);
-        verify_mpt_proof(
+        verify_mpt_proof_bounded(
             &header.receipts_root,
             &key,
             &proof.receipt_rlp,
             &proof.proof_nodes,
+            limits.max_recursion_depth,
         )?;
 
         // Step 4: Decode receipt and get the log
@@ -673,6 +861,23 @@ mod implementation {
             topic0: proof.topic0,
             data_hash: proof.data_hash,
         })
+    }
+
+    /// Verify a Merkle Patricia Trie proof with recursion depth bounds.
+    fn verify_mpt_proof_bounded(
+        root: &[u8; 32],
+        key: &[u8],
+        value: &[u8],
+        proof: &[Vec<u8>],
+        max_depth: usize,
+    ) -> Result<(), EthMerkleVerifyError> {
+        if proof.len() > max_depth {
+            return Err(EthMerkleVerifyError::RecursionDepthExceeded {
+                depth: proof.len(),
+                max: max_depth,
+            });
+        }
+        verify_mpt_proof(root, key, value, proof)
     }
 }
 
