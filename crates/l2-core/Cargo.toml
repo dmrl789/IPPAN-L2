@@ -41,7 +41,14 @@ signed-envelopes = ["dep:ed25519-dalek"]
 encryption-at-rest = ["dep:chacha20poly1305", "dep:getrandom"]
 ## Enable Ethereum header hashing (keccak256 + RLP encoding/decoding).
 keccak-headers = ["dep:alloy-rlp", "dep:alloy-primitives"]
+## Enable profiling spans for flamegraph-friendly tracing.
+profiling = []
 
 [dev-dependencies]
 serde_json = "1"
 ed25519-dalek = "2"
+criterion = "0.5"
+
+[[bench]]
+name = "core_benchmarks"
+harness = false

@@ -231,6 +231,14 @@ async fn run_settlement_reconciler<C>(
 }
 
 /// Execute a single reconciliation cycle.
+#[cfg_attr(
+    feature = "profiling",
+    tracing::instrument(
+        skip(config, storage, l1_client),
+        level = "debug",
+        name = "reconcile_iteration"
+    )
+)]
 async fn run_reconcile_cycle<C>(
     config: &SettlementReconcilerConfig,
     storage: &Storage,

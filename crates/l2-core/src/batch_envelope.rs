@@ -54,6 +54,10 @@ pub struct BatchPayload {
 impl BatchPayload {
     /// Create a new batch payload.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(payload), level = "debug")
+    )]
     pub fn new(
         l2_chain_id: ChainId,
         batch_hash: Hash32,
@@ -77,11 +81,19 @@ impl BatchPayload {
     }
 
     /// Compute the canonical hash of this payload.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self), level = "debug")
+    )]
     pub fn hash(&self) -> Result<Hash32, BatchEnvelopeError> {
         canonical_hash(self).map_err(BatchEnvelopeError::from)
     }
 
     /// Encode this payload to canonical bytes.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self), level = "debug")
+    )]
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, BatchEnvelopeError> {
         canonical_encode(self).map_err(BatchEnvelopeError::from)
     }
@@ -115,6 +127,10 @@ impl BatchEnvelope {
     pub const VERSION: &'static str = "v1";
 
     /// Create an unsigned envelope (for testing or later signing).
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(payload), level = "debug", name = "envelope_build")
+    )]
     pub fn new_unsigned(payload: BatchPayload) -> Result<Self, BatchEnvelopeError> {
         let envelope_hash = payload.hash()?.0;
         Ok(Self {
@@ -129,6 +145,10 @@ impl BatchEnvelope {
     /// Get the canonical bytes to sign.
     ///
     /// Format: BATCH_SIGNING_DOMAIN_V1 || canonical_bytes(payload)
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self), level = "debug")
+    )]
     pub fn signing_bytes(&self) -> Result<Vec<u8>, BatchEnvelopeError> {
         let payload_bytes = self.payload.to_canonical_bytes()?;
         let mut out = Vec::with_capacity(BATCH_SIGNING_DOMAIN_V1.len() + payload_bytes.len());
@@ -138,6 +158,10 @@ impl BatchEnvelope {
     }
 
     /// Compute the envelope hash from the payload.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self), level = "debug")
+    )]
     pub fn compute_hash(&self) -> Result<Hash32, BatchEnvelopeError> {
         self.payload.hash()
     }
@@ -225,6 +249,7 @@ pub fn verify_envelope(_envelope: &BatchEnvelope) -> Result<bool, BatchEnvelopeE
 /// Compute transaction root from a list of transaction hashes.
 ///
 /// For simplicity, uses hash-of-concat: hash(h1 || h2 || ... || hn)
+#[cfg_attr(feature = "profiling", tracing::instrument(skip(tx_hashes), level = "debug", fields(tx_count = tx_hashes.len())))]
 pub fn compute_tx_root(tx_hashes: &[Hash32]) -> Hash32 {
     if tx_hashes.is_empty() {
         return Hash32([0u8; 32]);

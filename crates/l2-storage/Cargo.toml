@@ -26,6 +26,8 @@ default = []
 eth-headers = ["l2-core/keccak-headers"]
 ## Enable Ethereum PoS light client storage.
 eth-lightclient = []
+## Enable profiling spans for flamegraph-friendly tracing.
+profiling = ["l2-core/profiling"]
 
 [dev-dependencies]
 tempfile = "3"

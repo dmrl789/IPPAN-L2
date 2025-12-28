@@ -11,6 +11,7 @@ members = [
   "crates/l2-bridge",
   "crates/l2-leader",
   "crates/ippan-rpc",
+  "crates/l2-bench",
 ]
 exclude = ["fuzz"]
 resolver = "2"

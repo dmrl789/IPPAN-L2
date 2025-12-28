@@ -707,6 +707,10 @@ impl M2mStorage {
     ///
     /// This is the primary reservation method that uses the ledger for idempotency.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self, breakdown), level = "debug", name = "m2m_reserve_fee")
+    )]
     pub fn reserve_fee_by_tx_id(
         &self,
         machine_id: &str,
@@ -869,6 +873,10 @@ impl M2mStorage {
     }
 
     /// Finalise fee by tx_id (idempotent via ledger).
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip(self), level = "debug", name = "m2m_finalise_fee")
+    )]
     pub fn finalise_fee_by_tx_id(
         &self,
         machine_id: &str,
