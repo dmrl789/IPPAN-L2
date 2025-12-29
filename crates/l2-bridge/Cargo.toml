@@ -25,7 +25,7 @@ hex = "0.4"
 ed25519-dalek = { version = "2", optional = true }
 # Ethereum RLP and Merkle Patricia Trie verification
 alloy-rlp = { version = "0.3", optional = true }
-alloy-primitives = { version = "0.8", optional = true }
+alloy-primitives = { version = "1.5", optional = true }
 sha3 = { version = "0.10", optional = true }
 blake3 = { version = "1", optional = true }
 # BLS signature verification for Ethereum PoS light client
