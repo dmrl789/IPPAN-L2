@@ -1,0 +1,10 @@
+[package]
+name = "hub-fin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+l2-core = { path = "../l2-core" }
+l2-hub = { path = "../l2-hub" }
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"

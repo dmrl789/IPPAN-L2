@@ -4,6 +4,9 @@ use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
+/// Current version of the canonical encoding (u16).
+pub const CANONICAL_ENCODING_VERSION: u16 = 1;
+
 /// Chain identifier for IPPAN deployments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainId(pub u64);
@@ -59,6 +62,8 @@ pub enum CanonicalError {
     Serialization(#[from] bincode::Error),
     #[error("hash decode error: {0}")]
     FromHex(String),
+    #[error("encoding version mismatch: expected {1}, got {0}")]
+    VersionMismatch(u16, u16),
 }
 
 impl CanonicalError {
@@ -76,13 +81,30 @@ fn encoder() -> impl Options {
 }
 
 /// Serialize using canonical encoding.
+/// Serialize using canonical encoding (includes version header).
 pub fn canonical_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
-    encoder().serialize(value).map_err(CanonicalError::from)
+    let mut bytes = Vec::new();
+    // Prepend version (u16 little-endian)
+    bytes.extend_from_slice(&CANONICAL_ENCODING_VERSION.to_le_bytes());
+    // Append bincode serialization
+    encoder()
+        .serialize_into(&mut bytes, value)
+        .map_err(CanonicalError::from)?;
+    Ok(bytes)
 }
 
 /// Decode canonical bytes back into the target structure.
+/// Decode canonical bytes back into the target structure (verifies version).
 pub fn canonical_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CanonicalError> {
-    encoder().deserialize(bytes).map_err(CanonicalError::from)
+    if bytes.len() < 2 {
+        return Err(CanonicalError::Serialization(bincode::ErrorKind::SizeLimit.into()));
+    }
+    let (ver_bytes, payload) = bytes.split_at(2);
+    let ver = u16::from_le_bytes(ver_bytes.try_into().unwrap());
+    if ver != CANONICAL_ENCODING_VERSION {
+        return Err(CanonicalError::VersionMismatch(ver, CANONICAL_ENCODING_VERSION));
+    }
+    encoder().deserialize(payload).map_err(CanonicalError::from)
 }
 
 /// Hash any serializable value using canonical encoding and BLAKE3.

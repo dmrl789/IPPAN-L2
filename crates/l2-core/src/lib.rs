@@ -84,6 +84,21 @@ pub struct L2TransactionEnvelope<T> {
     pub payload: T,
 }
 
+impl<T: Serialize> L2TransactionEnvelope<T> {
+    /// Serialize to canonical bytes.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_encode(self)
+    }
+
+    /// Compute the stable hash of this transaction.
+    pub fn canonical_hash(&self) -> Result<crate::Hash32, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_hash(self)
+    }
+}
+
+/// Opaque L2 transaction with raw byte payload.
+pub type L2Tx = L2TransactionEnvelope<Vec<u8>>;
+
 /// Logical identifier for an IPPAN L2 Hub.
 ///
 /// The ordering is stable and deterministic for tie-breaking in scheduling:
@@ -265,6 +280,18 @@ pub struct L2Batch {
     pub commitment: Option<String>,
 }
 
+impl L2Batch {
+    /// Serialize to canonical bytes.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_encode(self)
+    }
+
+    /// Compute the stable hash of this batch.
+    pub fn canonical_hash(&self) -> Result<crate::Hash32, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_hash(self)
+    }
+}
+
 /// Minimal proof structure to be verified by IPPAN CORE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2Proof {
@@ -274,6 +301,37 @@ pub struct L2Proof {
     pub batch_id: L2BatchId,
     /// The committed state root after applying the batch.
     pub state_root: String,
+}
+
+/// The commitment summary of a batch, submitted to L1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchCommitment {
+    /// Contract version (e.g. "v1").
+    pub version: String,
+    /// Origin Hub.
+    pub hub_id: L2HubId,
+    /// Batch identifier.
+    pub batch_id: L2BatchId,
+    /// Monotonic sequence number.
+    pub sequence: u64,
+    /// Merkle root of the Hub state after usage.
+    pub state_root: String,
+    /// Merkle root of the included transactions.
+    pub tx_root: String,
+    /// Merkle root of execution results.
+    pub receipts_root: String,
+}
+
+impl BatchCommitment {
+    /// Serialize to canonical bytes.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CanonicalError> {
+        canonical_encode(self)
+    }
+
+    /// Compute the stable hash of this commitment.
+    pub fn commitment_hash(&self) -> Result<Hash32, CanonicalError> {
+        canonical_hash(self)
+    }
 }
 
 /// Opaque identifier for an account at L2 (hub-specific semantics).
@@ -355,6 +413,13 @@ pub struct SettlementRequest {
     pub fee: FixedAmount,
 }
 
+impl SettlementRequest {
+    /// Serialize to canonical bytes.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_encode(self)
+    }
+}
+
 /// Result of L1 settlement for an L2 batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettlementResult {
@@ -364,6 +429,13 @@ pub struct SettlementResult {
     pub l1_reference: String,
     /// True if settlement reached finality.
     pub finalised: bool,
+}
+
+impl SettlementResult {
+    /// Serialize to canonical bytes.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_encode(self)
+    }
 }
 
 /// Configuration for talking to an IPPAN CORE node.
@@ -380,11 +452,17 @@ pub struct L1EndpointConfig {
 /// In production this will be backed by RPC calls to an L1 node;
 /// in tests it can be mocked.
 pub trait L1SettlementClient {
+    /// Get current L1 status (height, time).
+    fn chain_status(&self) -> Result<l1_contract::L1ChainStatus, SettlementError>;
+
     /// Submit a settlement request and receive a settlement result.
     fn submit_settlement(
         &self,
         request: SettlementRequest,
     ) -> Result<SettlementResult, SettlementError>;
+
+    /// Check inclusion/finality of a previous submission.
+    fn get_finality(&self, tx_id: &str) -> Result<l1_contract::L1InclusionProof, SettlementError>;
 }
 
 /// Errors that may occur when attempting L1 settlement.

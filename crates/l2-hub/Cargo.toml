@@ -1,0 +1,9 @@
+[package]
+name = "l2-hub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+l2-core = { path = "../l2-core" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"

@@ -1,0 +1,13 @@
+[package]
+name = "l2-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+l2-core = { path = "../l2-core" }
+l2-hub = { path = "../l2-hub" }
+hub-fin = { path = "../hub-fin" }
+hub-data = { path = "../hub-data" }
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+anyhow = "1.0"
