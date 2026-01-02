@@ -109,6 +109,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  forbid-floats-unsafe:
+    name: Forbid Floats/Unsafe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep for forbidden terms
+        run: |
+          # Define directories to check
+          DIRS="crates/l2-core crates/l2-hub crates/hub-fin crates/hub-data crates/l2-engine"
+          
+          # Check for f32/f64 (excluding comments/tests if possible, but simple grep for now)
+          if grep -rE "f32|f64" $DIRS; then
+            echo "Error: Floating point types found!"
+            exit 1
+          fi
+          
+          # Check for unsafe (excluding explicit allow/forbid attributes, but strictly flagging usage)
+          # We exclude "forbid(unsafe_code)" strings themselves to avoid false positives on the attribute
+          if grep -r "unsafe" $DIRS | grep -v "forbid(unsafe_code)" | grep -v "deny(unsafe_code)"; then
+            echo "Error: Unsafe code found!"
+            exit 1
+          fi
+
   solidity:
     name: Solidity Tests
     runs-on: ubuntu-latest
