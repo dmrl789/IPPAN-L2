@@ -1110,7 +1110,7 @@ mod tests {
         // This hash should remain stable across versions
         assert_eq!(
             id.to_hex(),
-            "7c43c787dc2c6c39366b9394ddba1d8b3ea3b927c1f53f294afcb2119cbc7fe2"
+            "3d6bfa8b217bf978df12cc89f6be2a22eda5a0b4cbc2665c9a8411ff5836f64d"
         );
     }
 

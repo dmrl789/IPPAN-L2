@@ -6,6 +6,8 @@ members = [
   "integrations/eth-oracle/daemon",
   "crates/l2-node",
   "crates/l2-core",
+  "crates/l2-hub",
+  "crates/l2-engine",
   "crates/l2-storage",
   "crates/l2-batcher",
   "crates/l2-bridge",

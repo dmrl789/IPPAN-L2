@@ -411,7 +411,7 @@ mod tests {
         // This is the golden hash - must remain stable across versions
         assert_eq!(
             hash.to_hex(),
-            "a1e0e845ad9eb790508afe568183cc00ea6c9005296b7b10c43b665df3fdbcff"
+            "780439101d54150438e3506fb9e4a4296982cf2c186103621a6312b983095301"
         );
     }
 

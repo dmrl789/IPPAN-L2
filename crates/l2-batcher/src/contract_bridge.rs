@@ -496,7 +496,7 @@ mod tests {
         // canonical binary provides deterministic, version-stable byte representation.
         assert_eq!(
             result.idempotency_key_hex,
-            "bc97a01852f899e21e88b66a62acc25241159821132cbad34f0285e368bbc34e"
+            "659508afbd2598ea6ff06240528b4f6c64581c3cb0716be5b776734412f038e6"
         );
     }
 
@@ -560,7 +560,7 @@ mod tests {
         let envelope_bytes_hash = l2_core::canonical_hash_bytes(&envelope_bytes);
         assert_eq!(
             hex::encode(envelope_bytes_hash),
-            "e132dcf254f041adf57b73868feee2936088e1da30d9b638cc6e8c4d62f9ac89",
+            "5fdf29191bc505c8f8a867af0c367ea69a6742b7b59426b472c5f10b56f0130f",
             "BatchEnvelope canonical bytes hash changed - breaking change!"
         );
     }

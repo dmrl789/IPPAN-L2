@@ -774,7 +774,7 @@ mod tests {
         // This hash should remain stable across versions
         assert_eq!(
             intent_id.to_hex(),
-            "b4236ab9ff0057b3d72772c9edca94a7a6b1f0a50058ee47a79951be0de7de41"
+            "b954b0c45d5d821832fc2103db379693c78481949daf41adde3af56e78e9ce9c"
         );
     }
 
@@ -794,7 +794,7 @@ mod tests {
 
         assert_eq!(
             intent_id.to_hex(),
-            "34f39db9189117d8435a1e265aecae741c631f4a78f3ca4b9cf2a24ab4fd2625"
+            "b6f74a38a21fb70d58ca16f853a12ae9fc2e175a4936b638444d3680502f515c"
         );
     }
 
@@ -814,7 +814,7 @@ mod tests {
 
         assert_eq!(
             intent_id.to_hex(),
-            "3fb1f4e5eb53b885bc7f4fa12fc822caa7d380a23c7c19889fa5e85c609f8eb8"
+            "d688231751c1093ba60843c547765834775724f34ac1e898ce7300e0b0d987c1"
         );
     }
 

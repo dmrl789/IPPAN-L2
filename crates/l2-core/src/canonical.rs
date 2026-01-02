@@ -4,6 +4,9 @@ use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
+/// Current version of the canonical encoding (u16).
+pub const CANONICAL_ENCODING_VERSION: u16 = 1;
+
 /// Chain identifier for IPPAN deployments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainId(pub u64);
@@ -59,6 +62,8 @@ pub enum CanonicalError {
     Serialization(#[from] bincode::Error),
     #[error("hash decode error: {0}")]
     FromHex(String),
+    #[error("encoding version mismatch: expected {1}, got {0}")]
+    VersionMismatch(u16, u16),
 }
 
 impl CanonicalError {
@@ -76,13 +81,35 @@ fn encoder() -> impl Options {
 }
 
 /// Serialize using canonical encoding.
+/// Serialize using canonical encoding (includes version header).
 pub fn canonical_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
-    encoder().serialize(value).map_err(CanonicalError::from)
+    let mut bytes = Vec::new();
+    // Prepend version (u16 little-endian)
+    bytes.extend_from_slice(&CANONICAL_ENCODING_VERSION.to_le_bytes());
+    // Append bincode serialization
+    encoder()
+        .serialize_into(&mut bytes, value)
+        .map_err(CanonicalError::from)?;
+    Ok(bytes)
 }
 
 /// Decode canonical bytes back into the target structure.
+/// Decode canonical bytes back into the target structure (verifies version).
 pub fn canonical_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CanonicalError> {
-    encoder().deserialize(bytes).map_err(CanonicalError::from)
+    if bytes.len() < 2 {
+        return Err(CanonicalError::Serialization(
+            bincode::ErrorKind::SizeLimit.into(),
+        ));
+    }
+    let (ver_bytes, payload) = bytes.split_at(2);
+    let ver = u16::from_le_bytes(ver_bytes.try_into().unwrap());
+    if ver != CANONICAL_ENCODING_VERSION {
+        return Err(CanonicalError::VersionMismatch(
+            ver,
+            CANONICAL_ENCODING_VERSION,
+        ));
+    }
+    encoder().deserialize(payload).map_err(CanonicalError::from)
 }
 
 /// Hash any serializable value using canonical encoding and BLAKE3.
@@ -111,7 +138,7 @@ mod tests {
         let encoded = canonical_encode(&tx).expect("encode");
         assert_eq!(
             hex::encode(&encoded),
-            "39050000000000002a000000000000000600000000000000757365722d310300000000000000aabbcc"
+            "010039050000000000002a000000000000000600000000000000757365722d310300000000000000aabbcc"
         );
     }
 
@@ -131,7 +158,7 @@ mod tests {
         let hash = canonical_hash(&batch).expect("hash");
         assert_eq!(
             hash.to_hex(),
-            "cec12e2979f5daef8010bfcec615f02f5158bca069e27f3de6a906d7215972c2"
+            "1f796b97c85e643d8f017aa862ddefe5a0e9dc9012655fd0a14506db4ecfb02d"
         );
     }
 
@@ -143,7 +170,7 @@ mod tests {
             message: Some("accepted".to_string()),
         };
         let encoded = canonical_encode(&receipt).expect("encode");
-        let decoded: Receipt = encoder().deserialize(&encoded).expect("decode");
+        let decoded: Receipt = canonical_decode(&encoded).expect("decode");
         assert_eq!(decoded, receipt);
     }
 }
