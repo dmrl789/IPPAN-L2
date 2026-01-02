@@ -9,6 +9,8 @@
 //! - Test B: Header arrives → proof verifies
 //! - Test C: Restart safety (store persists, reconciler results identical)
 
+#![cfg(feature = "eth-lightclient")]
+
 use l2_bridge::eth_lightclient_api::{
     BootstrapRequest, BulkExecutionHeadersRequest, LightClientApi, LightClientApiConfig,
     UpdateRequest,

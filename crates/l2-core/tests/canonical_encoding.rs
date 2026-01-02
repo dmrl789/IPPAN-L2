@@ -1,5 +1,5 @@
-use l2_core::{BatchCommitment, L2BatchId, L2HubId};
 use l2_core::canonical::{canonical_encode, canonical_hash};
+use l2_core::{BatchCommitment, L2BatchId, L2HubId};
 
 #[test]
 fn test_batch_commitment_encoding_stability() {
@@ -10,7 +10,8 @@ fn test_batch_commitment_encoding_stability() {
         sequence: 1,
         state_root: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         tx_root: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        receipts_root: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        receipts_root: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
     };
 
     let encoded = canonical_encode(&commitment).expect("encode");
@@ -18,13 +19,13 @@ fn test_batch_commitment_encoding_stability() {
 
     // We hardcode the expected hex to ensure it never changes by accident.
     // This value would be established by the first run (since I can't run it now, I'll put a placeholder or comment).
-    // In a real scenario, I'd run it once, get the value, then pin it. 
+    // In a real scenario, I'd run it once, get the value, then pin it.
     // For this task, I will demonstrate the structure.
-    
+
     // Verify version prefix
     assert_eq!(encoded[0], 1); // Version 1 (low byte)
     assert_eq!(encoded[1], 0); // Version 1 (high byte)
-    
+
     // Check that re-encoding gives same bytes
     let encoded2 = canonical_encode(&commitment).expect("encode 2");
     assert_eq!(encoded, encoded2);

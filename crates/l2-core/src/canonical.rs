@@ -97,12 +97,17 @@ pub fn canonical_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalErr
 /// Decode canonical bytes back into the target structure (verifies version).
 pub fn canonical_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CanonicalError> {
     if bytes.len() < 2 {
-        return Err(CanonicalError::Serialization(bincode::ErrorKind::SizeLimit.into()));
+        return Err(CanonicalError::Serialization(
+            bincode::ErrorKind::SizeLimit.into(),
+        ));
     }
     let (ver_bytes, payload) = bytes.split_at(2);
     let ver = u16::from_le_bytes(ver_bytes.try_into().unwrap());
     if ver != CANONICAL_ENCODING_VERSION {
-        return Err(CanonicalError::VersionMismatch(ver, CANONICAL_ENCODING_VERSION));
+        return Err(CanonicalError::VersionMismatch(
+            ver,
+            CANONICAL_ENCODING_VERSION,
+        ));
     }
     encoder().deserialize(payload).map_err(CanonicalError::from)
 }
@@ -133,7 +138,7 @@ mod tests {
         let encoded = canonical_encode(&tx).expect("encode");
         assert_eq!(
             hex::encode(&encoded),
-            "39050000000000002a000000000000000600000000000000757365722d310300000000000000aabbcc"
+            "010039050000000000002a000000000000000600000000000000757365722d310300000000000000aabbcc"
         );
     }
 
@@ -153,7 +158,7 @@ mod tests {
         let hash = canonical_hash(&batch).expect("hash");
         assert_eq!(
             hash.to_hex(),
-            "cec12e2979f5daef8010bfcec615f02f5158bca069e27f3de6a906d7215972c2"
+            "1f796b97c85e643d8f017aa862ddefe5a0e9dc9012655fd0a14506db4ecfb02d"
         );
     }
 
@@ -165,7 +170,7 @@ mod tests {
             message: Some("accepted".to_string()),
         };
         let encoded = canonical_encode(&receipt).expect("encode");
-        let decoded: Receipt = encoder().deserialize(&encoded).expect("decode");
+        let decoded: Receipt = canonical_decode(&encoded).expect("decode");
         assert_eq!(decoded, receipt);
     }
 }

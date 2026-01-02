@@ -1,8 +1,8 @@
 [workspace]
 members = [
-  "crates/hub-fin",
+  "hub-fin",
   "fin-node",
-  "crates/hub-data",
+  "hub-data",
   "integrations/eth-oracle/daemon",
   "crates/l2-node",
   "crates/l2-core",

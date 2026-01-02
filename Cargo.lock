@@ -3000,6 +3000,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "l2-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hub-data",
+ "hub-fin",
+ "l2-core",
+ "l2-hub",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "l2-hub"
+version = "0.1.0"
+dependencies = [
+ "l2-core",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "l2-leader"
 version = "0.1.0"
 dependencies = [
